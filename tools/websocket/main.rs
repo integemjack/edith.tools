@@ -24,8 +24,10 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 static NEXT_CLIENT: AtomicU64 = AtomicU64::new(1);
 
+/// 写不出去（起它的大脑已经没了、管子断了）就算了：eprintln! 写失败会 panic，那条线程一死进程就挂在那里
 fn log(text: &str) {
-    eprintln!("{text}");
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "{text}");
 }
 
 /// 大脑的套接字：地址、令牌

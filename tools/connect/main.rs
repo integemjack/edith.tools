@@ -64,7 +64,7 @@ fn main() {
         _ => Err("用法：edith-connect <设备名>（启动器，大脑起它）；edith-connect --hub <设备名>（设备服务）".into()),
     };
     if let Err(message) = result {
-        eprintln!("edith-connect：{message}");
+        let _ = writeln!(std::io::stderr(), "edith-connect：{message}");
         std::process::exit(1);
     }
 }

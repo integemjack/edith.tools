@@ -75,6 +75,23 @@ impl FakeBrain {
         self.links.recv_timeout(Duration::from_secs(seconds)).ok()
     }
 
+    /// 同 spawn，但它的标准错误接到一根马上关掉的管子上（像大脑被强行结束后那样：日志写不出去）
+    pub fn spawn_with_broken_stderr(&self, program: &str, args: &[&str], home: &Path, name: &str) -> Child {
+        let mut child = Command::new(program)
+            .args(args)
+            .env("EDITH_HOME", home)
+            .env("EDITH_ACCESS", &self.address)
+            .env("EDITH_ACCESS_TOKEN", &self.token)
+            .env("EDITH_CAPABILITY", name)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        drop(child.stderr.take());
+        child
+    }
+
     /// 像大脑那样起一个工具：给它接入地址、令牌、能力名
     pub fn spawn(&self, program: &str, args: &[&str], home: &Path, name: &str) -> Child {
         Command::new(program)

@@ -20,8 +20,10 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const CONNECT_TIMEOUT_MS: u64 = 60_000;
 const CALL_TIMEOUT_MS: u64 = 10 * 60_000;
 
+/// 写不出去（起它的大脑已经没了、管子断了）就算了：eprintln! 写失败会 panic，那条线程一死进程就挂在那里
 fn log(text: &str) {
-    eprintln!("{text}");
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "{text}");
 }
 
 fn main() {

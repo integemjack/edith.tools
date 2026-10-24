@@ -66,3 +66,15 @@ fn relays_remote_capabilities_into_the_brain() {
     control.send(json!({ "jsonrpc": "2.0", "method": "shutdown", "params": {} }));
     assert!(common::wait_until(10, || matches!(child.try_wait(), Ok(Some(_)))));
 }
+
+#[test]
+fn exits_when_the_brain_goes_away() {
+    // 大脑被强行结束：它那条连接断了、日志也写不出去（标准错误的管子关了）——照样要退出，不能挂在那里
+    let home = scratch("websocket-gone");
+    let brain = FakeBrain::new();
+    let mut child = brain.spawn_with_broken_stderr(env!("CARGO_BIN_EXE_edith-websocket"), &[], &home, "ws");
+    let mut control = brain.accept(20).expect("edith-websocket 没连进来");
+    control.handshake(json!({ "id": "b", "workspace": "/w" }));
+    drop(control);
+    assert!(common::wait_until(10, || matches!(child.try_wait(), Ok(Some(_)))), "大脑没了它还开着");
+}
