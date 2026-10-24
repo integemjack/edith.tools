@@ -190,6 +190,20 @@ fn stored_session(id: &str) -> Option<Stored> {
     None
 }
 
+/// EDITH 里藏起来的另一支（改一条重发、切分支时存的，记在 #branch 名下）
+const ARCHIVED: &str = "#branch";
+
+fn archived_session(id: &str) -> Option<Stored> {
+    let id = lower(id);
+    for project in std::fs::read_dir(edith_home().join("projects")).into_iter().flatten().flatten() {
+        let path = project.path().join("sessions").join(format!("{id}.jsonl"));
+        if path.is_file() {
+            return read_session(&path).filter(|session| session.owner == ARCHIVED);
+        }
+    }
+    None
+}
+
 /// 这台上全部会话：EDITH 存着的（主人的）+ 空白的，新的在前
 fn all_sessions() -> Vec<Stored> {
     let mut sessions = Vec::new();
@@ -417,6 +431,73 @@ impl Meta {
         });
     }
 
+    /// 最近一轮怎么结束的：{at（那时存档有几条）, error?, stopped?}（出错、被停下存档里不记）
+    fn ended(&self, id: &str) -> Option<Value> {
+        let ended = self.value()["ended"][lower(id)].clone();
+        ended.is_object().then_some(ended)
+    }
+
+    fn set_ended(&self, id: &str, at: usize, error: &str, stopped: bool) {
+        let current = self.ended(id);
+        if error.is_empty() && !stopped && current.is_none() {
+            return;
+        }
+        self.update(|value| {
+            let entries = Self::object(value, "ended");
+            if error.is_empty() && !stopped {
+                entries.remove(&lower(id));
+            } else {
+                entries.insert(lower(id), json!({ "at": at, "error": (!error.is_empty()).then_some(error), "stopped": stopped }));
+            }
+        });
+    }
+
+    /// 分出去的各支：(主干的先后, [(藏起来的会话, 分出来的先后)])
+    fn branches(&self, id: &str) -> (u64, Vec<(String, u64)>) {
+        let entry = &self.value()["branches"][lower(id)];
+        let paths = entry["paths"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|path| Some((path["id"].as_str()?.to_string(), path["rank"].as_u64()?)))
+            .collect();
+        (entry["main"].as_u64().unwrap_or(0), paths)
+    }
+
+    fn set_branches(&self, id: &str, main: u64, paths: &[(String, u64)]) {
+        self.update(|value| {
+            let paths: Vec<Value> = paths.iter().map(|(path, rank)| json!({ "id": path, "rank": rank })).collect();
+            Self::object(value, "branches").insert(lower(id), json!({ "main": main, "paths": paths }));
+        });
+    }
+
+    /// 跟着消息走的（卡片的增删行数、最近一轮的用量、怎么结束的）：主干整个存成另一支时抄一份过去，
+    /// 切分支时主干的给存起来的那支、换上来的那支的给主干
+    fn move_with_branch(&self, main: &str, archive: &str, picked: Option<&str>) {
+        self.update(|value| {
+            for key in ["lines", "stats", "ended"] {
+                let entries = Self::object(value, key);
+                let current = entries.get(&lower(main)).cloned();
+                match picked {
+                    Some(picked) => {
+                        entries.remove(&lower(main));
+                        if let Some(entry) = entries.remove(&lower(picked)) {
+                            entries.insert(lower(main), entry);
+                        }
+                    }
+                    // 改一条重发：主干截短了，用量、结束的样子不再是它的（行数还对得上共同的开头）
+                    None if key != "lines" => {
+                        entries.remove(&lower(main));
+                    }
+                    None => {}
+                }
+                if let Some(current) = current {
+                    entries.insert(lower(archive), current);
+                }
+            }
+        });
+    }
+
     /// 删会话：它的这些都不要了
     fn forget(&self, id: &str) {
         self.update(|value| {
@@ -424,7 +505,7 @@ impl Meta {
             if let Some(ids) = value["pinned"].as_array_mut() {
                 ids.retain(|item| item.as_str() != Some(id.as_str()));
             }
-            for key in ["drafts", "settings", "blank", "stats", "lines"] {
+            for key in ["drafts", "settings", "blank", "stats", "lines", "ended", "branches"] {
                 if let Some(entries) = value[key].as_object_mut() {
                     entries.remove(&id);
                 }
@@ -477,10 +558,12 @@ struct Card<'a> {
     lines: Option<[i64; 2]>,
 }
 
-/// 卡片在哪：主会话的第几条消息（agent 是 None），或哪个子智能体的运行记录里；team：这台上知道的子智能体
+/// 卡片在哪：主会话的第几条消息（agent 是 None），或哪个子智能体的运行记录里；team：这台上知道的子智能体。
+/// session 算 id 用（分出去的另一支用那一支的 id，卡片不和这段的撞），owner 是子智能体记在哪段会话名下
 #[derive(Clone, Copy)]
 struct Place<'a> {
     session: &'a str,
+    owner: &'a str,
     node: usize,
     agent: Option<&'a str>,
     team: &'a Team,
@@ -537,9 +620,7 @@ fn attach_agents(place: Place, call: &str, name: &str, event: &mut Value) {
     let mut agents: Vec<&AgentView> = place
         .team
         .values()
-        .filter(|agent| {
-            agent.session() == place.session && agent.meta["call"] == json!(call) && agent.meta["parent"].as_str() == place.agent
-        })
+        .filter(|agent| agent.session() == place.owner && agent.meta["call"] == json!(call) && agent.meta["parent"].as_str() == place.agent)
         .collect();
     if agents.is_empty() {
         return;
@@ -691,10 +772,20 @@ struct Node {
     notice: Vec<String>,
     from_agent: Option<String>,
     interjected: bool,
+    /// 这条消息到历史的第几条为止（不含）：截短、分叉按它
+    end: usize,
+    /// 这一轮出错了 / 被用户停下（存档里不记，网关记在 friday.json）
+    error: Option<String>,
+    stopped: bool,
 }
 
 /// EDITH 的历史 → 一条条消息（用户的一条；一轮里模型说的话、调的工具合成一条助手消息）
 fn group(session: &str, history: &[Value], team: &Team) -> Vec<Node> {
+    group_in(session, session, history, team)
+}
+
+/// 同 group；owner：子智能体记在哪段会话名下（分出去的另一支的卡片照样装上它派的子智能体）
+fn group_in(session: &str, owner: &str, history: &[Value], team: &Team) -> Vec<Node> {
     let mut nodes: Vec<Node> = Vec::new();
     // 调用 id → 它的卡片在哪（第几条消息、第几块）：结果按顺序配给最近一次这个 id 的调用
     let mut open: HashMap<String, (usize, usize)> = HashMap::new();
@@ -750,15 +841,38 @@ fn group(session: &str, history: &[Value], team: &Team) -> Vec<Node> {
                     open.insert(id.to_string(), (position, node.blocks.len()));
                     let nth = uses.entry((position, id.to_string())).or_insert(0);
                     let card = Card { call: id, nth: *nth, name, arguments: &arguments, status: "failed", result: "", lines: None };
-                    let place = Place { session, node: position, agent: None, team };
+                    let place = Place { session, owner, node: position, agent: None, team };
                     node.blocks.push(tool_block(place, card));
                     *nth += 1;
                 }
             }
             _ => {}
         }
+        if let Some(last) = nodes.last_mut() {
+            last.end = index + 1;
+        }
     }
     nodes
+}
+
+/// 每条消息连同它前面全部历史的指纹：分出去的几支里同样的几条（共同的开头）指纹一样，按它认出是同一条
+fn chain(history: &[Value], nodes: &[Node]) -> Vec<String> {
+    let mut previous = String::new();
+    let mut start = 0;
+    nodes
+        .iter()
+        .map(|node| {
+            let mut digest = sha2::Sha256::new();
+            digest.update(previous.as_bytes());
+            for message in &history[start..node.end.max(start)] {
+                digest.update(message.to_string().as_bytes());
+                digest.update(b"\n");
+            }
+            start = node.end.max(start);
+            previous = digest.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
+            previous.clone()
+        })
+        .collect()
 }
 
 /// 存档里有几条消息（正在干的那一轮接在后面）
@@ -771,9 +885,20 @@ fn message_uuid(session: &str, node: usize) -> String {
 }
 
 fn message_json(session: &str, index: usize, node: Node, created: &str) -> Value {
-    let mut message = json!({ "id": message_uuid(session, index), "role": node.role, "blocks": node.blocks, "createdAt": created });
-    if index > 0 {
-        message["parentID"] = json!(message_uuid(session, index - 1));
+    let parent = (index > 0).then(|| message_uuid(session, index - 1));
+    message_with(&message_uuid(session, index), parent.as_deref(), node, created)
+}
+
+fn message_with(id: &str, parent: Option<&str>, node: Node, created: &str) -> Value {
+    let mut message = json!({ "id": id, "role": node.role, "blocks": node.blocks, "createdAt": created });
+    if let Some(parent) = parent {
+        message["parentID"] = json!(parent);
+    }
+    if let Some(error) = node.error {
+        message["error"] = json!(error);
+    }
+    if node.stopped {
+        message["stoppedByUser"] = json!(true);
     }
     if !node.notice.is_empty() {
         message["notice"] = json!(node.notice.join("；"));
@@ -790,11 +915,13 @@ fn message_json(session: &str, index: usize, node: Node, created: &str) -> Value
 /// 一段会话的消息（含正在干的那一轮）→ Friday 的 nodes 和 selectedChildren；没在干时最后一条回复挂上最近一轮的用量（进度环）
 fn messages(session: &Stored, live: Option<&Live>, team: &Team) -> (Vec<Value>, Map<String, Value>) {
     let created = session.updated_at();
-    let mut out: Vec<Value> = group(&session.id, &session.history, team)
-        .into_iter()
-        .enumerate()
-        .map(|(index, node)| message_json(&session.id, index, node, &created))
-        .collect();
+    let mut nodes = group(&session.id, &session.history, team);
+    let branches = META.branches(&session.id);
+    let hashes = if branches.1.is_empty() { Vec::new() } else { chain(&session.history, &nodes) };
+    if live.is_none() {
+        mark_ended(session, &mut nodes);
+    }
+    let mut out: Vec<Value> = nodes.into_iter().enumerate().map(|(index, node)| message_json(&session.id, index, node, &created)).collect();
     match live {
         Some(live) => {
             // 存档里还没有这一轮（做完才存）：接在后面，序号同存档后的
@@ -814,7 +941,121 @@ fn messages(session: &Stored, live: Option<&Live>, team: &Team) -> (Vec<Value>, 
         let parent = message["parentID"].as_str().unwrap_or(ROOT).to_string();
         selected.insert(parent, message["id"].clone());
     }
+    if !branches.1.is_empty() {
+        add_branches(session, &branches, &hashes, team, &mut out, &mut selected);
+    }
     (out, selected)
+}
+
+/// 最近一轮出错了 / 被停下（存档里不记）：标在最后一条回复上；出错时一个字还没回的补一条空的回复。
+/// 只认那之后存档没变过的（又说了话、重试、换了分支就不是它了）
+fn mark_ended(session: &Stored, nodes: &mut Vec<Node>) {
+    let Some(ended) = META.ended(&session.id).filter(|ended| ended["at"].as_u64() == Some(session.history.len() as u64)) else {
+        return;
+    };
+    let error = ended["error"].as_str().filter(|error| !error.is_empty()).map(str::to_string);
+    if error.is_some() && nodes.last().is_none_or(|node| node.role != "assistant") {
+        nodes.push(Node { role: "assistant", end: session.history.len(), ..Default::default() });
+    }
+    if let Some(last) = nodes.last_mut().filter(|node| node.role == "assistant") {
+        last.stopped = ended["stopped"] == true && error.is_none();
+        last.error = error;
+    }
+}
+
+/// 停在一条出错的回复上：它的 id（Friday 的 failedMessageID，有它才能重试）
+fn failed_message(session: &Stored) -> Option<String> {
+    META.ended(&session.id).filter(|ended| ended["at"].as_u64() == Some(session.history.len() as u64) && ended["error"].is_string())?;
+    let mut nodes = group(&session.id, &session.history, &Team::new());
+    mark_ended(session, &mut nodes);
+    nodes.last().filter(|node| node.error.is_some()).map(|_| message_uuid(&session.id, nodes.len() - 1))
+}
+
+/// 分出去的一支（EDITH 里藏起来的会话）：它的消息，和这段共同的那几条用这段的 id
+struct BranchPath {
+    archive: Stored,
+    rank: u64,
+    nodes: Vec<Node>,
+    ids: Vec<String>,
+}
+
+fn branch_uuid(session: &str, hash: &str) -> String {
+    stable_uuid(&[session, "branch", hash])
+}
+
+/// 这段会话分出去的各支（新分出来的在前）。hashes：这段（主干）每条消息的指纹
+fn branch_paths(session: &Stored, paths: &[(String, u64)], hashes: &[String], team: &Team) -> Vec<BranchPath> {
+    let known: HashMap<&str, String> =
+        hashes.iter().enumerate().map(|(index, hash)| (hash.as_str(), message_uuid(&session.id, index))).collect();
+    let mut ordered = paths.to_vec();
+    ordered.sort_by_key(|(_, rank)| std::cmp::Reverse(*rank));
+    ordered
+        .into_iter()
+        .filter_map(|(id, rank)| {
+            let archive = archived_session(&id)?;
+            let nodes = group_in(&archive.id, &session.id, &archive.history, team);
+            let ids = chain(&archive.history, &nodes)
+                .iter()
+                .map(|hash| known.get(hash.as_str()).cloned().unwrap_or_else(|| branch_uuid(&session.id, hash)))
+                .collect();
+            Some(BranchPath { archive, rank, nodes, ids })
+        })
+        .collect()
+}
+
+/// 分出去的各支接进消息树（同 Friday 的分叉树）：共同的开头不重复，从分开的那条起接在共同的最后一条下面；
+/// 同一处的几支按分出来的先后排（切分支的箭头「1/2」「2/2」不乱），没选过的地方选新分出来的
+fn add_branches(
+    session: &Stored,
+    (main_rank, paths): &(u64, Vec<(String, u64)>),
+    hashes: &[String],
+    team: &Team,
+    out: &mut Vec<Value>,
+    selected: &mut Map<String, Value>,
+) {
+    let main_rank = *main_rank;
+    let mut rank_of: HashMap<String, u64> =
+        out.iter().filter_map(|message| message["id"].as_str()).map(|id| (id.to_string(), main_rank)).collect();
+    for path in branch_paths(session, paths, hashes, team) {
+        let created = path.archive.updated_at();
+        let mut parent: Option<String> = None;
+        for (node, id) in path.nodes.into_iter().zip(path.ids) {
+            match rank_of.get(&id) {
+                Some(rank) => {
+                    let rank = (*rank).min(path.rank);
+                    rank_of.insert(id.clone(), rank);
+                }
+                None => {
+                    rank_of.insert(id.clone(), path.rank);
+                    selected.entry(parent.clone().unwrap_or_else(|| ROOT.into())).or_insert(json!(id));
+                    out.push(message_with(&id, parent.as_deref(), node, &created));
+                }
+            }
+            parent = Some(id);
+        }
+    }
+    // 从根往下排：上一条在下一条前面，同一处的几支按先后
+    let mut children: HashMap<String, Vec<(u64, usize)>> = HashMap::new();
+    for (index, message) in out.iter().enumerate() {
+        let id = message["id"].as_str().unwrap_or("");
+        let parent = message["parentID"].as_str().unwrap_or(ROOT).to_string();
+        children.entry(parent).or_default().push((rank_of.get(id).copied().unwrap_or(main_rank), index));
+    }
+    let mut order = Vec::with_capacity(out.len());
+    let mut stack = vec![ROOT.to_string()];
+    while let Some(parent) = stack.pop() {
+        let Some(mut kids) = children.remove(&parent) else { continue };
+        kids.sort();
+        for (_, index) in kids.iter().rev() {
+            stack.push(out[*index]["id"].as_str().unwrap_or("").to_string());
+        }
+        // 一条进 order 时它的上一条早就在里面了（上一条处理时才轮到它）
+        order.extend(kids.iter().map(|(_, index)| *index));
+    }
+    if order.len() == out.len() {
+        let mut taken: Vec<Option<Value>> = std::mem::take(out).into_iter().map(Some).collect();
+        *out = order.into_iter().filter_map(|index| taken[index].take()).collect();
+    }
 }
 
 // MARK: - 正在干的一轮
@@ -1028,7 +1269,7 @@ impl Live {
                 Piece::Thinking(text) => text_block(session, &format!("live.{}.{segment}.{index}", self.turn), "thinking", text),
                 Piece::Tool { call, name, arguments, status, result, lines } => {
                     let nth = uses.entry(call.as_str()).or_insert(0);
-                    let place = Place { session, node, agent: None, team };
+                    let place = Place { session, owner: session, node, agent: None, team };
                     let block = tool_block(place, Card { call, nth: *nth, name, arguments, status, result, lines: *lines });
                     *nth += 1;
                     block
@@ -1440,6 +1681,12 @@ fn runtime(session: &Stored, state: &State) -> Value {
     if !session.cwd.is_empty() {
         value["workingDirectory"] = json!(session.cwd);
     }
+    if !state.generating.contains(&session.id)
+        && let Some(failed) = failed_message(session)
+    {
+        value["failedMessageID"] = json!(failed);
+        value["canRetry"] = json!(true);
+    }
     value
 }
 
@@ -1531,6 +1778,7 @@ fn on_brain_event(params: &Value) {
     let known = STATE.lock().unwrap().live.get(&session).is_some_and(|live| live.turn == turn);
     let fresh = (kind != "done" && !known)
         .then(|| Live::start(&session, &turn, if kind == "turn.started" { data["text"].as_str().unwrap_or("") } else { "" }));
+    let mut ended = None;
     let structure = {
         let mut state = STATE.lock().unwrap();
         if let Some(fresh) = fresh {
@@ -1568,6 +1816,7 @@ fn on_brain_event(params: &Value) {
                 if let Some(live) = state.live.remove(&session) {
                     META.set_stats(&session, live.stats_json(false));
                 }
+                ended = Some((data["error"].as_str().unwrap_or("").to_string(), data["stopped"] == true));
                 state.generating.remove(&session);
                 state.stopping.remove(&session);
                 state.dirty.remove(&session);
@@ -1611,6 +1860,11 @@ fn on_brain_event(params: &Value) {
             }
         }
     };
+    // 出错、被停下：存档里不记，记下那时存档有几条（之后变了就不算了）
+    if let Some((error, stopped)) = ended {
+        let at = stored_session(&session).map_or(0, |stored| stored.history.len());
+        META.set_ended(&session, at, &error, stopped);
+    }
     if structure {
         changed(&session, true);
     }
@@ -2278,6 +2532,10 @@ fn submit(params: &Value) -> Reply {
         return Err((-32602, "text 是空的".into()));
     }
     let (brain, session) = materialize(&session)?;
+    // 改了一条重发：这段先整个存成另一支，截到那条之前
+    if let Some(replacing) = params["replacing"].as_str().filter(|id| !id.is_empty()) {
+        branch_off(&brain, &session, replacing)?;
+    }
     // 忙的时候：默认同输入框（补充进这一轮），whenBusy: queue 排到下一轮
     let queue = params["whenBusy"].as_str() == Some("queue");
     let urgency = if queue { "queue" } else { "interject" };
@@ -2300,6 +2558,125 @@ fn submit(params: &Value) -> Reply {
     }
     changed(&session.id, true);
     Ok(json!({}))
+}
+
+fn busy(session: &Stored) -> Result<(), (i64, String)> {
+    if STATE.lock().unwrap().generating.contains(&session.id) {
+        return Err((NOT_ALLOWED, "这段会话在干活：先停下".into()));
+    }
+    Ok(())
+}
+
+fn request_on(brain: &Brain, method: &str, params: Value) -> Reply {
+    brain.request(method, params, Duration::from_secs(30)).map_err(|error| (NOT_ALLOWED, error))
+}
+
+/// 改一条重发（runner.submit 带 replacing）：这段整个存成藏起来的另一支，主干截到那条之前（同 Friday 的 Conversation::fork：
+/// 新的那条和原来那条同一个上级，切分支的箭头能切回去）
+fn branch_off(brain: &Brain, session: &Stored, replacing: &str) -> Result<(), (i64, String)> {
+    busy(session)?;
+    let nodes = group(&session.id, &session.history, &Team::new());
+    let index = (0..nodes.len())
+        .find(|index| message_uuid(&session.id, *index) == upper(replacing))
+        .ok_or((NOT_FOUND, "没有这条消息".to_string()))?;
+    let keep = if index == 0 { 0 } else { nodes[index - 1].end };
+    let archive = request_on(brain, "sessions.fork", json!({ "id": session.id, "hidden": true }))?;
+    let archive = archive["id"].as_str().unwrap_or("").to_string();
+    request_on(brain, "sessions.truncate", json!({ "id": session.id, "keep": keep }))?;
+    let (main, mut paths) = META.branches(&session.id);
+    let next = paths.iter().map(|(_, rank)| *rank).chain([main]).max().unwrap_or(0) + 1;
+    paths.push((archive.clone(), main));
+    META.set_branches(&session.id, next, &paths);
+    META.move_with_branch(&session.id, &archive, None);
+    Ok(())
+}
+
+/// 切到另一支（runner.selectBranch）：主干整个存成藏起来的一支，选中的那支换上来当主干（EDITH 接着它往下做）
+fn select_branch(session: &Stored, child: &str) -> Reply {
+    let (main, paths) = META.branches(&session.id);
+    let nodes = group(&session.id, &session.history, &Team::new());
+    if (0..nodes.len()).any(|index| message_uuid(&session.id, index) == child) || paths.is_empty() {
+        return Ok(json!({}));
+    }
+    let hashes = chain(&session.history, &nodes);
+    let picked = branch_paths(session, &paths, &hashes, &Team::new())
+        .into_iter()
+        .find(|path| path.ids.iter().any(|id| id == child))
+        .ok_or((NOT_FOUND, "没有这一支".to_string()))?;
+    busy(session)?;
+    let brain = brain_for(&session.cwd).map_err(|error| (NOT_ALLOWED, error))?;
+    let archive = request_on(&brain, "sessions.fork", json!({ "id": session.id, "hidden": true }))?;
+    let archive = archive["id"].as_str().unwrap_or("").to_string();
+    request_on(&brain, "sessions.copy", json!({ "id": session.id, "from": picked.archive.id }))?;
+    let _ = request_on(&brain, "sessions.remove", json!({ "id": picked.archive.id }));
+    let paths: Vec<(String, u64)> =
+        paths.into_iter().map(|(id, rank)| if id == picked.archive.id { (archive.clone(), main) } else { (id, rank) }).collect();
+    META.set_branches(&session.id, picked.rank, &paths);
+    META.move_with_branch(&session.id, &archive, Some(&picked.archive.id));
+    changed(&session.id, true);
+    Ok(json!({}))
+}
+
+/// 重试（runner.retry，最后一条回复出错了才能）：从这一轮用户说的那句起重做——截到它之前、再发一遍
+/// （消息 id 和原来的一样，出错的那条换成新的回复）
+fn retry(session: &Stored) -> Reply {
+    busy(session)?;
+    failed_message(session).ok_or((NOT_ALLOWED, "最后一条回复没出错".to_string()))?;
+    let index = session
+        .history
+        .iter()
+        .rposition(|message| {
+            let text = user_text(message);
+            message["role"] == "user" && !is_framework(&text) && report_from(&text).is_none() && !is_interjection(&text)
+        })
+        .ok_or((NOT_ALLOWED, "找不到这一轮说的话".to_string()))?;
+    let text = shown_user_text(&user_text(&session.history[index]));
+    let brain = brain_for(&session.cwd).map_err(|error| (NOT_ALLOWED, error))?;
+    request_on(&brain, "sessions.truncate", json!({ "id": session.id, "keep": index }))?;
+    META.set_ended(&session.id, 0, "", false);
+    request_on(&brain, "sense", json!({ "session": session.id, "text": text, "urgency": "interject", "kind": "user" }))?;
+    changed(&session.id, true);
+    Ok(json!({}))
+}
+
+/// 从某条消息分叉成一段新会话（conversation.fork）：那条和它之前的抄过去，标题加「（fork）」（同 Friday 的 ConversationStore::fork）
+fn fork(params: &Value) -> Reply {
+    let session = session_param(params, "id")?;
+    let message = upper(&text_param(params, "messageID")?);
+    if session.blank() {
+        return Err((NOT_FOUND, "没有这条消息".into()));
+    }
+    let nodes = group(&session.id, &session.history, &Team::new());
+    let mut source =
+        (0..nodes.len()).find(|index| message_uuid(&session.id, *index) == message).map(|index| (session.id.clone(), nodes[index].end));
+    // 在另一支上的消息：从那一支抄
+    if source.is_none() {
+        let (_, paths) = META.branches(&session.id);
+        let hashes = chain(&session.history, &nodes);
+        source = branch_paths(&session, &paths, &hashes, &Team::new()).into_iter().find_map(|path| {
+            let index = path.ids.iter().position(|id| *id == message)?;
+            Some((path.archive.id.clone(), path.nodes[index].end))
+        });
+    }
+    let (from, keep) = source.ok_or((NOT_FOUND, "没有这条消息（正在写的这一轮做完再分叉）".to_string()))?;
+    let brain = brain_for(&session.cwd).map_err(|error| (NOT_ALLOWED, error))?;
+    let mut request = json!({ "id": from, "keep": keep });
+    if let Some(new) = params["newID"].as_str().filter(|id| !id.is_empty()) {
+        request["newID"] = json!(lower(new));
+    }
+    let created = request_on(&brain, "sessions.fork", request)?;
+    let id = created["id"].as_str().unwrap_or("").to_string();
+    let title = format!("{}（fork）", if session.title.is_empty() { "新对话" } else { &session.title });
+    if let Some(path) = stored_session(&id).and_then(|stored| stored.path) {
+        append_title(&path, &title);
+    }
+    for key in ["permissionMode", "thinking", "teamMode"] {
+        if let Some(value) = META.setting(&session.id, key) {
+            META.set_setting(&id, key, &value);
+        }
+    }
+    changed(&id, true);
+    Ok(json!({ "id": upper(&id) }))
 }
 
 fn handle(method: &str, params: &Value) -> Reply {
@@ -2358,9 +2735,14 @@ fn handle(method: &str, params: &Value) -> Reply {
         "conversation.remove" => {
             let session = session_param(params, "id")?;
             if let Some(path) = &session.path {
-                // 交给大脑删（停下、存档、改动基线、子智能体的运行记录一起）；旧版的 EDITH 没有 sessions.remove：停下后这里删
-                let removed = brain_for(&session.cwd)
-                    .ok()
+                // 交给大脑删（停下、存档、改动基线、子智能体的运行记录一起，分出去的各支也删）；旧版的 EDITH 没有 sessions.remove：停下后这里删
+                let brain = brain_for(&session.cwd).ok();
+                for (archive, _) in META.branches(&session.id).1 {
+                    if let Some(brain) = &brain {
+                        let _ = brain.request("sessions.remove", json!({ "id": archive }), Duration::from_secs(30));
+                    }
+                }
+                let removed = brain
                     .is_some_and(|brain| brain.request("sessions.remove", json!({ "id": session.id }), Duration::from_secs(30)).is_ok());
                 if !removed {
                     if let Some(brain) = connected_brain(&session) {
@@ -2586,8 +2968,11 @@ fn handle(method: &str, params: &Value) -> Reply {
             });
             Ok(json!({}))
         }
-        "conversation.fork" => Err(not_allowed("从某条消息分叉")),
-        "runner.retry" | "runner.resetSession" | "runner.selectBranch" => Err(not_allowed("重试、分支")),
+        "conversation.fork" => fork(params),
+        "runner.retry" => retry(&session_param(params, "conversationID")?),
+        "runner.selectBranch" => select_branch(&session_param(params, "conversationID")?, &upper(&text_param(params, "child")?)),
+        // Friday 丢掉缓存的模型会话、下一轮按存档重建：EDITH 每轮本来就按存档来
+        "runner.resetSession" => Ok(json!({})),
         "runner.removeQueued" => {
             let session = session_param(params, "conversationID")?;
             let item = upper(&text_param(params, "itemID")?);

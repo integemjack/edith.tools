@@ -86,6 +86,13 @@ impl Client {
         reply["result"].clone()
     }
 
+    /// 之前收到的都不要了（接着等的是这之后的）
+    fn drain(&mut self) {
+        std::thread::sleep(Duration::from_millis(300));
+        while self.messages.try_recv().is_ok() {}
+        self.backlog.clear();
+    }
+
     fn event(&mut self, method: &str, mut wanted: impl FnMut(&Value) -> bool) -> Value {
         self.wait_for(15, method, |message| message["method"] == method && wanted(&message["params"]))
     }
@@ -687,4 +694,176 @@ fn sub_agents_and_file_changes() {
     reply(&mut link, &request, json!({ "failed": [] }));
     assert_eq!(client.reply(revert)["result"]["failed"], json!([]));
     let _ = std::fs::remove_dir_all(&home);
+}
+
+/// 存档里的历史（同 EDITH 的只追加格式：reset 之前的作废）
+fn read_history(home: &Path, session: &str) -> Vec<Value> {
+    let text = std::fs::read_to_string(sessions_dir(home).join(format!("{session}.jsonl"))).unwrap();
+    let mut history = Vec::new();
+    for line in text.lines() {
+        let entry: Value = serde_json::from_str(line).unwrap();
+        match entry["type"].as_str() {
+            Some("message") => history.push(entry["message"].clone()),
+            Some("reset") => history.clear(),
+            _ => {}
+        }
+    }
+    history
+}
+
+/// 替大脑写一整段会话（分叉、藏起来的另一支）
+fn write_history(home: &Path, work: &Path, session: &str, owner: &str, history: &[Value]) {
+    let mut lines = vec![
+        json!({ "type": "meta", "id": session, "cwd": work.to_string_lossy(), "created": "2026-10-24T10:00:00+08:00", "owner": owner }),
+        json!({ "type": "title", "title": "写个文件" }),
+    ];
+    lines.extend(history.iter().map(|message| json!({ "type": "message", "message": message })));
+    let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+    std::fs::write(sessions_dir(home).join(format!("{session}.jsonl")), text).unwrap();
+}
+
+/// 大脑做完一轮：开始 → 存档追加 stored → 做完，等整段重发（最后一条是 last）
+fn finish_turn(client: &mut Client, link: &mut Link, home: &Path, turn: &str, stored: &[Value], end: Value, last: &str) -> Value {
+    client.drain();
+    // 这一轮交来的那句：存档里这一轮的第一条
+    push(link, SESSION, turn, "turn.started", json!({ "text": stored[0]["content"] }));
+    client.event("runner", |params| has(&params["generating"], SESSION));
+    append(home, SESSION, stored);
+    push(link, SESSION, turn, "done", end);
+    client.event("conversation", |params| {
+        params["conversation"]["nodes"].as_array().unwrap().last().is_some_and(|node| {
+            node["stats"].get("live").is_none() && (node["blocks"][0]["kind"]["text"]["_0"] == last || node["error"] == last)
+        })
+    })
+}
+
+fn texts(conversation: &Value) -> Vec<String> {
+    // 选中的那条路上用户说的
+    let nodes = conversation["nodes"].as_array().unwrap();
+    let mut out = Vec::new();
+    let mut key = "00000000-0000-0000-0000-000000000000".to_string();
+    while let Some(child) = conversation["selectedChildren"][&key].as_str() {
+        let node = nodes.iter().find(|node| node["id"] == child).unwrap();
+        if node["role"] == "user" {
+            out.push(node["blocks"][0]["kind"]["text"]["_0"].as_str().unwrap().to_string());
+        }
+        key = child.to_string();
+    }
+    out
+}
+
+#[test]
+fn errors_retry_branches_and_fork() {
+    let home = scratch("friday-branches");
+    let work = home.join("work");
+    std::fs::create_dir_all(work.join(".git")).unwrap();
+    write_session(&home, &work);
+    let brain = FakeBrain::new();
+    register(&home, &brain, &work);
+    let mut client = Client::start(&home, &work);
+    let hello = client.send("hello", json!({ "protocol": 1, "client": { "name": "test" } }));
+    let mut link = accept(&brain);
+    let list = link.wait_for(10, |message| message["method"] == "sessions.list").unwrap();
+    reply(&mut link, &list, json!([]));
+    let agents = link.wait_for(10, |message| message["method"] == "agents.list").unwrap();
+    reply(&mut link, &agents, json!([]));
+    client.reply(hello);
+    client.request("conversation.subscribe", json!({ "id": SESSION }));
+
+    // 一轮出错：最后一条回复带错误，能重试（failedMessageID 是它）
+    let stored = [json!({ "role": "user", "content": "再来" })];
+    let end = json!({ "answer": "", "stopped": false, "error": "HTTP 400：坏了" });
+    let done = finish_turn(&mut client, &mut link, &home, "t1", &stored, end, "HTTP 400：坏了");
+    let failed = nodes(&done).last().unwrap()["id"].clone();
+    let opened = client.request("conversation.subscribe", json!({ "id": SESSION }));
+    assert_eq!((opened["runtime"]["failedMessageID"].clone(), opened["runtime"]["canRetry"].clone()), (failed.clone(), json!(true)));
+
+    // 重试：截到这一轮那句之前、再发一遍
+    let retry = client.send("runner.retry", json!({ "conversationID": SESSION }));
+    let truncate = link.wait_for(10, |message| message["method"] == "sessions.truncate").expect("重试没截短");
+    assert_eq!(truncate["params"]["keep"], 10, "{truncate}");
+    let history = read_history(&home, SESSION);
+    write_history(&home, &work, SESSION, "", &history[..10]);
+    reply(&mut link, &truncate, json!({}));
+    let sense = link.wait_for(10, |message| message["method"] == "sense").expect("重试没再发");
+    assert_eq!(sense["params"]["text"], "再来");
+    reply(&mut link, &sense, json!({ "disposition": "started", "turn": "t2" }));
+    client.reply(retry);
+    let stored = [json!({ "role": "user", "content": "再来" }), json!({ "role": "assistant", "content": "这次好了" })];
+    let end = json!({ "answer": "这次好了", "stopped": false, "error": null });
+    let done = finish_turn(&mut client, &mut link, &home, "t2", &stored, end, "这次好了");
+    assert_eq!(nodes(&done).last().unwrap()["id"], failed, "重做的回复用出错那条的 id");
+    assert!(nodes(&done).last().unwrap().get("error").is_none());
+
+    // 改第二句重发：整段藏成另一支，主干截到那句之前
+    let second = nodes(&done)[2]["id"].clone();
+    let submit =
+        client.send("runner.submit", json!({ "conversationID": SESSION, "text": "换个说法", "attachments": [], "replacing": second }));
+    let fork = link.wait_for(10, |message| message["method"] == "sessions.fork").expect("没存另一支");
+    assert_eq!(fork["params"]["hidden"], true);
+    let archive = "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d";
+    let full = read_history(&home, SESSION);
+    write_history(&home, &work, archive, "#branch", &full);
+    reply(&mut link, &fork, json!({ "id": archive }));
+    let truncate = link.wait_for(10, |message| message["method"] == "sessions.truncate").unwrap();
+    assert_eq!(truncate["params"]["keep"], 8, "截到第二句之前：{truncate}");
+    write_history(&home, &work, SESSION, "", &full[..8]);
+    reply(&mut link, &truncate, json!({}));
+    let sense = link.wait_for(10, |message| message["method"] == "sense").unwrap();
+    reply(&mut link, &sense, json!({ "disposition": "started", "turn": "t3" }));
+    client.reply(submit);
+    let stored = [json!({ "role": "user", "content": "换个说法" }), json!({ "role": "assistant", "content": "收到" })];
+    let end = json!({ "answer": "收到", "stopped": false, "error": null });
+    finish_turn(&mut client, &mut link, &home, "t3", &stored, end, "收到");
+    let opened = client.request("conversation.subscribe", json!({ "id": SESSION }));
+    let conversation = &opened["conversation"];
+    assert_eq!(texts(conversation), ["帮我写个文件", "换个说法"]);
+    let all = conversation["nodes"].as_array().unwrap();
+    let parent = all[1]["id"].clone();
+    let siblings: Vec<&Value> = all.iter().filter(|node| node["parentID"] == parent).collect();
+    assert_eq!(siblings.len(), 2, "第二句那里两支");
+    assert_eq!(siblings[0]["blocks"][0]["kind"]["text"]["_0"], "顺便看看 b.txt", "旧的在前");
+    // 藏起来的那支不在会话列表里
+    let summaries = client.request("hello", json!({ "protocol": 1 }))["state"]["summaries"].clone();
+    assert_eq!(summaries.as_array().unwrap().len(), 1);
+
+    // 切回旧的那支：主干存成另一支，旧的换上来
+    let old = siblings[0]["id"].clone();
+    let select = client.send("runner.selectBranch", json!({ "conversationID": SESSION, "child": old, "parentKey": parent }));
+    let fork = link.wait_for(10, |message| message["method"] == "sessions.fork").unwrap();
+    let swapped = "1b2c3d4e-5f6a-4b7c-8d9e-0f1a2b3c4d5e";
+    write_history(&home, &work, swapped, "#branch", &read_history(&home, SESSION));
+    reply(&mut link, &fork, json!({ "id": swapped }));
+    let copy = link.wait_for(10, |message| message["method"] == "sessions.copy").unwrap();
+    assert_eq!(copy["params"]["from"], archive);
+    write_history(&home, &work, SESSION, "", &full);
+    reply(&mut link, &copy, json!({}));
+    let remove = link.wait_for(10, |message| message["method"] == "sessions.remove").unwrap();
+    assert_eq!(remove["params"]["id"], archive);
+    std::fs::remove_file(sessions_dir(&home).join(format!("{archive}.jsonl"))).unwrap();
+    reply(&mut link, &remove, json!({ "removed": true }));
+    client.reply(select);
+    let opened = client.request("conversation.subscribe", json!({ "id": SESSION }));
+    assert_eq!(texts(&opened["conversation"]), ["帮我写个文件", "顺便看看 b.txt", "再来"]);
+    let siblings: Vec<String> = opened["conversation"]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|node| node["parentID"] == parent)
+        .map(|node| node["blocks"][0]["kind"]["text"]["_0"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(siblings, ["顺便看看 b.txt", "换个说法"], "切了顺序不变");
+
+    // 从第一条回复分叉
+    let first = opened["conversation"]["nodes"][1]["id"].clone();
+    let new = "2c3d4e5f-6a7b-4c8d-9e0f-1a2b3c4d5e6f";
+    let request = client.send("conversation.fork", json!({ "id": SESSION, "messageID": first, "newID": new.to_uppercase() }));
+    let fork = link.wait_for(10, |message| message["method"] == "sessions.fork").unwrap();
+    assert_eq!((fork["params"]["keep"].clone(), fork["params"]["newID"].clone()), (json!(8), json!(new)));
+    write_history(&home, &work, new, "", &full[..8]);
+    reply(&mut link, &fork, json!({ "id": new }));
+    assert_eq!(client.reply(request)["result"]["id"], new.to_uppercase());
+    let listed = client.event("summaries", |params| params["summaries"].as_array().unwrap().len() == 2);
+    let forked = listed["params"]["summaries"].as_array().unwrap().iter().find(|item| item["id"] == new.to_uppercase()).unwrap().clone();
+    assert_eq!(forked["title"], "写个文件（fork）");
 }
