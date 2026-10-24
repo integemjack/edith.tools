@@ -8,7 +8,6 @@ import sys
 DESCRIPTIONS = {
     "edith-websocket": "远程能力的中转：设备、网页、手机连它的 WebSocket，每个客户端经大脑的套接字成为一个能力",
     "edith-connect": "共享设备：麦克风、摄像头、串口这类独占设备整台机器一个设备服务，几个大脑共用",
-    "edith-mcp": "MCP 服务的桥：把一个 MCP 服务的工具当成能力的动作接进大脑",
 }
 
 tag, repository, folder = sys.argv[1], sys.argv[2], sys.argv[3]

@@ -3,7 +3,6 @@
 # 大脑（edith tools）读 https://github.com/integemjack/edith.tools/releases/latest/download/index.json 知道有什么、从哪下、校验值。
 # 版本号 v<Cargo.toml 版本的前两位>.<这个工作流的运行序号>。
 # Linux 一律用 zig（cargo-zigbuild）编成 musl 静态程序：不挑发行版、不挑 glibc 版本（s390x 没有 musl 的标准库，用 glibc 2.17）。
-# core/ 是子模块 integemjack/friday.core（公开，edith-mcp 用它的 MCP 客户端），按钉住的提交拉。
 name: build
 
 on:
@@ -47,13 +46,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          submodules: true
-
-      - name: Pinned friday.core commit
-        id: core
-        shell: bash
-        run: echo "sha=$(git -C core rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Version
         id: version
@@ -87,7 +79,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: cargo-${{ matrix.key }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ steps.core.outputs.sha }}
+          key: cargo-${{ matrix.key }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ matrix.key }}-
 
       # zig 编的（musl 静态）测试在这台机器原生的 glibc 目标上跑，打出来的程序再跑一下 --version

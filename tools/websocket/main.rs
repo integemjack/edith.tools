@@ -2,6 +2,8 @@
 //! 远程的设备、网页、手机连这个工具的 WebSocket，它替**每个客户端另开一条连接到大脑的套接字**，之后 WebSocket 文本帧和 JSON 行原样双向转：
 //! 远程客户端自己讲完整的能力协议（回 initialize、报自己的感知和动作、推 sense、收 event、做 act），在大脑那里就是一个一级能力。
 //! 它不懂协议内容，只在客户端回 initialize 没写 name 时补上连接时给的 ?name=。
+//! 替客户端开的连接用 auth 的 `as` 报客户端名：大脑把它叫 `<这个能力的名字>-<客户端名>`，权限按能力配置的 permissions.relay
+//! （默认只读的工具、只看会话）——远程客户端拿不到本机全部的权力。
 //!
 //! 它自己也用一条连接连进大脑（名字是 EDITH_CAPABILITY），报对外的入口（endpoints），`edith instances` 看得到。
 //! 大脑起它时给 EDITH_ACCESS / EDITH_ACCESS_TOKEN / EDITH_CAPABILITY；自己跑时用 `--brain <目录>` 从 ~/.edith/instances/ 找那个大脑。
@@ -38,11 +40,14 @@ struct Access {
 }
 
 impl Access {
-    /// 连上去、报令牌
-    fn connect(&self) -> Result<TcpStream, String> {
+    /// 连上去、报令牌；relay_as：替哪个客户端连（中转的子连接）
+    fn connect(&self, relay_as: Option<&str>) -> Result<TcpStream, String> {
         let mut stream = TcpStream::connect(&self.address).map_err(|error| format!("连不上大脑 {}：{error}", self.address))?;
-        writeln!(stream, "{}", json!({ "jsonrpc": "2.0", "method": "auth", "params": { "token": self.token } }))
-            .map_err(|error| error.to_string())?;
+        let mut params = json!({ "token": self.token });
+        if let Some(name) = relay_as {
+            params["as"] = json!(name);
+        }
+        writeln!(stream, "{}", json!({ "jsonrpc": "2.0", "method": "auth", "params": params })).map_err(|error| error.to_string())?;
         Ok(stream)
     }
 }
@@ -125,7 +130,7 @@ fn run() -> Result<(), String> {
     let listener = TcpListener::bind(&settings.listen).map_err(|error| format!("开不了 {}：{error}", settings.listen))?;
     let url = format!("ws://{}", listener.local_addr().map(|address| address.to_string()).unwrap_or(settings.listen.clone()));
     // 自己的那条连接：握手、报入口；它断了（大脑退出）就退出
-    let control = access.connect()?;
+    let control = access.connect(None)?;
     {
         let url = url.clone();
         std::thread::spawn(move || control_loop(control, &name, &url));
@@ -231,8 +236,8 @@ fn serve_client(stream: TcpStream, token: &Option<String>, access: &Access) {
     if name.is_empty() {
         name = format!("remote-{}", NEXT_CLIENT.fetch_add(1, Ordering::Relaxed));
     }
-    // 替它另开一条连接到大脑
-    let brain = match access.connect() {
+    // 替它另开一条连接到大脑（as：大脑据此定名字、收窄权限）
+    let brain = match access.connect(Some(&name)) {
         Ok(brain) => brain,
         Err(error) => {
             log(&format!("{name}：{error}"));

@@ -16,16 +16,10 @@ path = "tools/websocket/main.rs"
 name = "edith-connect"
 path = "tools/connect/main.rs"
 
-[[bin]]
-name = "edith-mcp"
-path = "tools/mcp/main.rs"
-
-# 自己是一个工作区（core/ 是 friday.core 子模块：edith-mcp 用它的 MCP 客户端）
+# 自己是一个工作区
 [workspace]
-exclude = ["core"]
 
 [dependencies]
-friday-core = { path = "core/crates/friday-core" }
 ureq = "3"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 serde_json = "1"

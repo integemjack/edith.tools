@@ -33,6 +33,9 @@ fn relays_remote_capabilities_into_the_brain() {
     // 远程客户端：替它另开一条连接，原样转
     let (mut socket, _) = tungstenite::connect(format!("{url}/?token=secret&name=phone")).unwrap();
     let mut link = brain.accept(20).expect("没替客户端连进来");
+    // 替客户端连的报 as（大脑据此定名字、收窄权限）；它自己那条不报
+    assert_eq!(link.relay_as.as_deref(), Some("phone"));
+    assert_eq!(control.relay_as, None);
     let id = link.start("initialize", json!({ "protocolVersion": "1", "brain": { "id": "b" }, "name": "", "focus": "s1" }));
     let initialize = read(&mut socket);
     assert_eq!(initialize["method"], "initialize");

@@ -56,13 +56,14 @@ impl FakeBrain {
                 let Ok(reading) = stream.try_clone() else { continue };
                 let mut reader = BufReader::new(reading);
                 let mut line = String::new();
-                let authorized = reader.read_line(&mut line).is_ok()
-                    && serde_json::from_str::<Value>(&line)
-                        .is_ok_and(|message| message["method"] == "auth" && message["params"]["token"] == wanted);
-                if !authorized {
-                    continue;
-                }
-                if sender.send(Link::new(stream, reader)).is_err() {
+                let auth = (reader.read_line(&mut line).is_ok())
+                    .then(|| serde_json::from_str::<Value>(&line).ok())
+                    .flatten()
+                    .filter(|message| message["method"] == "auth" && message["params"]["token"] == wanted);
+                let Some(auth) = auth else { continue };
+                let mut link = Link::new(stream, reader);
+                link.relay_as = auth["params"]["as"].as_str().map(str::to_string);
+                if sender.send(link).is_err() {
                     break;
                 }
             }
@@ -110,6 +111,8 @@ impl FakeBrain {
 
 /// 大脑这边的一条连接（一个能力）
 pub struct Link {
+    /// auth 里的 as（中转替谁连的）
+    pub relay_as: Option<String>,
     writer: TcpStream,
     messages: Receiver<Value>,
     backlog: Vec<Value>,
@@ -133,7 +136,7 @@ impl Link {
                 }
             }
         });
-        Link { writer, messages, backlog: Vec::new(), next: 100 }
+        Link { relay_as: None, writer, messages, backlog: Vec::new(), next: 100 }
     }
 
     pub fn send(&mut self, message: Value) {

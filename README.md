@@ -7,9 +7,8 @@
 |---|---|---|
 | `edith-websocket` | 远程能力的中转：设备、网页、手机连它的 WebSocket，每个客户端经大脑的套接字成为一个能力 | [docs/WEBSOCKET.md](docs/WEBSOCKET.md) |
 | `edith-connect` | 共享设备：麦克风、摄像头、串口这类独占设备整台机器一个设备服务，几个大脑共用 | [docs/DEVICES.md](docs/DEVICES.md) |
-| `edith-mcp` | MCP 服务的桥：把一个 MCP 服务的工具当成能力的动作接进大脑 | [docs/MCP.md](docs/MCP.md) |
 
-它们只讲能力协议、不用大脑的代码（`edith-mcp` 用 [friday.core](https://github.com/integemjack/friday.core) 的 MCP 客户端，子模块 `core/`）。
+它们只讲能力协议、不用大脑的代码。MCP 服务不用这里的工具：大脑直接读 `.mcp.json` 连（能力协议 §9）。
 
 ## 下载
 
@@ -27,18 +26,21 @@ musl 静态程序，不挑发行版）。每个包里只有那一个程序。
 
 ## 大脑怎么起它们
 
-能力配置（`~/.edith/capabilities.json` 或目录的 `.edith/capabilities.json`）里写命令，大脑起它时给三个环境变量，它自己连进大脑的套接字：
+能力配置（`~/.edith/capabilities.json`、项目的 `.edith/capabilities.json` 或本地的 `.edith/capabilities.local.json`）里写命令，
+大脑起它时给三个环境变量，它自己连进大脑的套接字：
 
 | 环境变量 | 内容 |
 |---|---|
 | `EDITH_ACCESS` | 大脑套接字的地址（`127.0.0.1:端口`） |
-| `EDITH_ACCESS_TOKEN` | 令牌：连上后第一行发 `{"jsonrpc": "2.0", "method": "auth", "params": {"token": "…"}}` |
-| `EDITH_CAPABILITY` | 在大脑那里叫什么（回 `initialize` 时的 `name`） |
+| `EDITH_ACCESS_TOKEN` | 这个能力专用的令牌：连上后第一行发 `{"jsonrpc": "2.0", "method": "auth", "params": {"token": "…"}}`；替别人开连接时加 `"as": "<名字>"` |
+| `EDITH_CAPABILITY` | 在大脑那里叫什么（令牌定的，回 `initialize` 时报别的也不管） |
+
+令牌定了每条连接能做什么（能力配置的 `permissions`，能力协议 §8.1）；替别人开的（`as`）叫 `<能力名>-<as>`，权限按 `permissions.relay`。
 
 ## 开发
 
 ```bash
-git clone --recursive https://github.com/integemjack/edith.tools.git
+git clone https://github.com/integemjack/edith.tools.git
 cargo test            # 要 python3；测试自己扮大脑（tests/common）
 cargo build --release
 ```
