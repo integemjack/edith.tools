@@ -172,8 +172,15 @@ fn push(link: &mut Link, session: &str, turn: &str, kind: &str, data: Value) {
     link.send(json!({ "jsonrpc": "2.0", "method": "event", "params": { "session": session, "turn": turn, "type": kind, "data": data } }));
 }
 
-/// 连上来时大脑被问开着哪些终端：没有
+/// 连上来时大脑被问浏览器开着哪些标签：没有
+fn answer_browser(link: &mut Link) {
+    let browser = link.wait_for(10, |message| message["method"] == "browser.state").expect("连上来没问浏览器");
+    reply(link, &browser, json!({ "available": true, "tabs": [] }));
+}
+
+/// 连上来时大脑被问浏览器、开着哪些终端：都没有
 fn answer_terminals(link: &mut Link) {
+    answer_browser(link);
     let terminals = link.wait_for(10, |message| message["method"] == "terminals.list").expect("连上来没问终端");
     reply(link, &terminals, json!({ "terminals": [] }));
 }
@@ -1087,6 +1094,7 @@ fn terminals_live_in_the_brain() {
     let list = link.wait_for(10, |message| message["method"] == "sessions.list").unwrap();
     reply(&mut link, &list, json!([]));
     // 连上来问它开着哪些终端（之前开的、客户端断了还在跑的）
+    answer_browser(&mut link);
     let terminals = link.wait_for(10, |message| message["method"] == "terminals.list").unwrap();
     let running = json!({ "id": "T0", "conversationID": SESSION, "title": "zsh", "shell": "zsh", "running": true, "cols": 80, "rows": 24 });
     reply(&mut link, &terminals, json!({ "terminals": [running] }));
@@ -1127,4 +1135,56 @@ fn terminals_live_in_the_brain() {
     client.event("terminals", |params| params["terminals"].as_array().unwrap().len() == 1);
     let missing = client.send("term.write", json!({ "id": "T1", "data": "" }));
     assert_eq!(client.reply(missing)["error"]["code"], 3);
+}
+
+#[test]
+fn browser_tabs_live_in_the_brain() {
+    let home = scratch("friday-browser");
+    let work = home.join("work");
+    std::fs::create_dir_all(work.join(".git")).unwrap();
+    write_session(&home, &work);
+    let brain = FakeBrain::new();
+    register(&home, &brain, &work);
+    let mut client = Client::start(&home, &work);
+    let hello = client.send("hello", json!({ "protocol": 1 }));
+    let mut link = accept(&brain);
+    let list = link.wait_for(10, |message| message["method"] == "sessions.list").unwrap();
+    reply(&mut link, &list, json!([]));
+    // 连上来问它开着哪些标签（客户端断了还在的）
+    let browser = link.wait_for(10, |message| message["method"] == "browser.state").unwrap();
+    let old = json!({ "id": "B0", "conversationID": SESSION, "title": "旧的", "url": "https://a.example/", "loading": false, "current": true, "viewport": [1280, 800], "fixed": false });
+    reply(&mut link, &browser, json!({ "available": true, "tabs": [old] }));
+    let terminals = link.wait_for(10, |message| message["method"] == "terminals.list").unwrap();
+    reply(&mut link, &terminals, json!({ "terminals": [] }));
+    let agents = link.wait_for(10, |message| message["method"] == "agents.list").unwrap();
+    reply(&mut link, &agents, json!([]));
+    let hello = client.reply(hello)["result"].clone();
+    let state = &hello["state"]["browser"];
+    assert_eq!((state["available"].as_bool(), state["tabs"][0]["conversationID"].clone()), (Some(true), json!(SESSION.to_uppercase())));
+
+    // 开一个：交给会话所在目录的大脑；之后的请求按标签转给它（刚开的还没等到 browser 通知也行）
+    let open = client.send("browser.open", json!({ "conversationID": SESSION, "url": "example.com" }));
+    let asked = link.wait_for(10, |message| message["method"] == "browser.open").unwrap();
+    assert_eq!((asked["params"]["session"].as_str(), asked["params"]["url"].as_str()), (Some(SESSION), Some("example.com")));
+    reply(&mut link, &asked, json!({ "tab": "B1" }));
+    assert_eq!(client.reply(open)["result"]["tab"], "B1");
+    let watch = client.send("browser.watch", json!({ "tab": "B1", "width": 800, "height": 600 }));
+    let asked = link.wait_for(10, |message| message["method"] == "browser.watch").unwrap();
+    assert_eq!((asked["params"]["tab"].as_str(), asked["params"]["width"].as_u64()), (Some("B1"), Some(800)));
+    reply(&mut link, &asked, json!({}));
+    client.reply(watch);
+    // 画面原样转；标签变了推 browser
+    link.send(json!({ "jsonrpc": "2.0", "method": "browser.frame", "params": { "tab": "B1", "data": "/9j/", "viewport": [800, 600] } }));
+    assert_eq!(client.event("browser.frame", |params| params["tab"] == "B1")["params"]["data"], "/9j/");
+    let new = json!({ "id": "B1", "conversationID": SESSION, "title": "Example", "url": "https://example.com/", "loading": false, "current": true, "viewport": [800, 600], "fixed": false });
+    link.send(json!({ "jsonrpc": "2.0", "method": "browser", "params": { "available": true, "tabs": [old, new] } }));
+    client.event("browser", |params| params["tabs"].as_array().unwrap().len() == 2);
+    let input = client.send("browser.input", json!({ "tab": "B0", "kind": "text", "text": "你好" }));
+    let asked = link.wait_for(10, |message| message["method"] == "browser.input").unwrap();
+    assert_eq!(asked["params"]["text"], "你好");
+    reply(&mut link, &asked, json!({}));
+    client.reply(input);
+    // 没有的标签不理
+    let unknown = client.send("browser.select", json!({ "tab": "nope" }));
+    assert!(client.reply(unknown).get("error").is_none());
 }

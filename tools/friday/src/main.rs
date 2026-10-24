@@ -1600,6 +1600,9 @@ struct State {
     memory: Option<usize>,
     /// 各个大脑开着的终端（工作目录 → TerminalInfo 们）
     terminals: HashMap<String, Vec<Value>>,
+    /// 各个大脑的浏览器（工作目录 → BrowserState），标签在哪个大脑里（刚开的还没等到 browser 通知）
+    browsers: HashMap<String, Value>,
+    browser_tabs: HashMap<String, String>,
 }
 
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| Mutex::new(State::default()));
@@ -2465,6 +2468,61 @@ fn terminal_request(method: &str, params: &Value) -> Reply {
     Ok(if method == "term.attach" { reply } else { json!({}) })
 }
 
+// MARK: - 浏览器（browser.*：EDITH 大脑起的无头 Chrome，标签断了照常在）
+
+/// BrowserState：全部大脑的标签（会话 id 换成 Friday 的大写）；有一个大脑能用就算能用，都还没连上时先说能用（开的时候才知道）
+fn browser_state_of(state: &State) -> Value {
+    let mut tabs = Vec::new();
+    let mut reason = None;
+    let mut available = state.browsers.is_empty();
+    for browser in state.browsers.values() {
+        if browser["available"] == true {
+            available = true;
+        } else if reason.is_none() {
+            reason = browser["reason"].as_str().map(str::to_string);
+        }
+        for tab in browser["tabs"].as_array().into_iter().flatten() {
+            let mut tab = tab.clone();
+            tab["conversationID"] = json!(upper(tab["conversationID"].as_str().unwrap_or("")));
+            tabs.push(tab);
+        }
+    }
+    let mut value = json!({ "available": available, "tabs": tabs });
+    if !available && let Some(reason) = reason {
+        value["reason"] = json!(reason);
+    }
+    value
+}
+
+fn browser_state() -> Value {
+    browser_state_of(&STATE.lock().unwrap())
+}
+
+fn browser_request(method: &str, params: &Value) -> Reply {
+    if method == "browser.open" {
+        // 在这段会话所在目录的大脑里开
+        let session = session_param(params, "conversationID")?;
+        let directory = if session.cwd.is_empty() { default_directory() } else { session.cwd.clone() };
+        let brain = brain_for(&directory).map_err(|error| (NOT_ALLOWED, error))?;
+        let opened = brain
+            .request("browser.open", json!({ "session": session.id, "url": params["url"].as_str().unwrap_or("") }), Duration::from_secs(60))
+            .map_err(|error| (NOT_ALLOWED, error))?;
+        if let Some(tab) = opened["tab"].as_str() {
+            STATE.lock().unwrap().browser_tabs.insert(tab.to_string(), brain.workspace.clone());
+        }
+        return Ok(opened);
+    }
+    // 找不到标签的不理（多半刚关了，同 Friday）
+    let tab = params["tab"].as_str().unwrap_or("");
+    let brain = {
+        let state = STATE.lock().unwrap();
+        state.browser_tabs.get(tab).and_then(|workspace| state.brains.get(workspace)).cloned()
+    };
+    let Some(brain) = brain else { return Ok(json!({})) };
+    brain.request(method, params.clone(), Duration::from_secs(30)).map_err(|error| (NOT_ALLOWED, error))?;
+    Ok(json!({}))
+}
+
 // MARK: - 设置页（config.*、settings.*、tools.*、mcp.*：改的是 EDITH 的 config.json、mcp.json、技能目录）
 
 /// SettingsState（设置 › 智能体）
@@ -3053,6 +3111,18 @@ fn handle_brain_message(brain: &Arc<Brain>, message: Value) {
         (Some("approve.cancel"), None) => on_approve_cancel(&message["params"]),
         // 终端：接着的有输出（原样转）、开了关了（这个大脑的全部终端）
         (Some("terminal.output"), None) => event("term.output", message["params"].clone()),
+        // 浏览器：看着的标签的画面、下载（原样转）、标签变了（这个大脑的全部标签）
+        (Some("browser.frame"), None) | (Some("browser.download"), None) => event(method.unwrap_or(""), message["params"].clone()),
+        (Some("browser"), None) => {
+            {
+                let mut state = STATE.lock().unwrap();
+                for tab in message["params"]["tabs"].as_array().into_iter().flatten().filter_map(|tab| tab["id"].as_str()) {
+                    state.browser_tabs.insert(tab.to_string(), brain.workspace.clone());
+                }
+                state.browsers.insert(brain.workspace.clone(), message["params"].clone());
+            }
+            event("browser", browser_state());
+        }
         (Some("terminals"), None) => {
             let list = message["params"]["terminals"].as_array().cloned().unwrap_or_default();
             STATE.lock().unwrap().terminals.insert(brain.workspace.clone(), list);
@@ -3141,9 +3211,13 @@ fn disconnected(brain: &Arc<Brain>) {
         }
         state.approvals.retain(|_, pending| !Arc::ptr_eq(&pending.brain, brain));
         state.terminals.remove(&brain.workspace);
+        state.browsers.remove(&brain.workspace);
+        let workspace = brain.workspace.clone();
+        state.browser_tabs.retain(|_, owner| *owner != workspace);
         state.live.keys().cloned().collect()
     };
     event("terminals", terminals_state());
+    event("browser", browser_state());
     let ended: Vec<String> =
         live.into_iter().filter(|id| stored_session(id).is_some_and(|session| workspace_key(&session.cwd) == brain.workspace)).collect();
     {
@@ -3201,6 +3275,14 @@ fn attach_brain(entry: &Value, wait: Duration) -> Result<Arc<Brain>, String> {
                 state.queue_revision += 1;
             }
         }
+    }
+    // 它的浏览器标签（旧版的 EDITH 没有）
+    if let Ok(listed) = brain.request("browser.state", json!({}), Duration::from_secs(10)) {
+        let mut state = STATE.lock().unwrap();
+        for tab in listed["tabs"].as_array().into_iter().flatten().filter_map(|tab| tab["id"].as_str()) {
+            state.browser_tabs.insert(tab.to_string(), brain.workspace.clone());
+        }
+        state.browsers.insert(brain.workspace.clone(), listed);
     }
     // 它开着的终端（旧版的 EDITH 没有）
     if let Ok(listed) = brain.request("terminals.list", json!({}), Duration::from_secs(10)) {
@@ -3550,7 +3632,7 @@ fn hello(params: &Value) -> Reply {
             "secrets": secret_names(),
             "directories": directories_state(),
             "terminals": terminals_state_of(&state),
-            "browser": { "tabs": [], "available": false, "reason": "这一版的 EDITH 还没有内置浏览器" },
+            "browser": browser_state_of(&state),
         },
     }))
 }
@@ -4069,6 +4151,7 @@ fn handle(method: &str, params: &Value) -> Reply {
         }
         "assistant.status" => Ok(json!({ "enabled": false, "reacting": false })),
         method if method.starts_with("term.") => terminal_request(method, params),
+        method if method.starts_with("browser.") => browser_request(method, params),
         method
             if method.starts_with("config.")
                 || method.starts_with("settings.")
