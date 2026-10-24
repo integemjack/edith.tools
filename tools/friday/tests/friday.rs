@@ -964,6 +964,9 @@ fn activity_for_the_assistant() {
     let hello = client.reply(hello)["result"].clone();
     assert!(hello["server"]["features"].as_array().unwrap().contains(&json!("activity")), "助手那一行不再说版本太旧");
     assert_eq!(client.request("assistant.status", json!({}))["enabled"], false);
+    // 助手页看这台：说没开（不是「版本太旧」）
+    let assistant = client.request("assistant.subscribe", json!({ "count": 100 }));
+    assert_eq!((assistant["state"]["enabled"].as_bool(), assistant["entries"].clone()), (Some(false), json!([])));
 
     // 快照：有内容的会话现在的样子
     let snapshot = client.request("activity.subscribe", json!({}));

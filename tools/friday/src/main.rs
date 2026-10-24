@@ -537,6 +537,8 @@ fn tool_look(name: &str) -> Option<(&'static str, &'static str)> {
         "delegate_task" | "run_parallel_tasks" | "run_workflow" => ("派子智能体", "person.2"),
         "load_tools" => ("取回工具", "wrench.and.screwdriver"),
         "use_skill" => ("用技能", "book"),
+        "save_memory" => ("记住", "brain"),
+        "search_memory" => ("查记忆", "brain"),
         _ => return None,
     })
 }
@@ -4150,6 +4152,16 @@ fn handle(method: &str, params: &Value) -> Reply {
             Ok(json!({}))
         }
         "assistant.status" => Ok(json!({ "enabled": false, "reacting": false })),
+        // 这台没有助手（EDITH 是大脑、助手在客户端那台上）：助手页看这台时说没开，不说版本太旧
+        "assistant.subscribe" => Ok(json!({
+            "state": { "enabled": false, "reacting": false, "config": { "enabled": false }, "engines": [] },
+            "board": { "machines": [] }, "entries": [], "channels": [],
+        })),
+        // 客户端前台在看哪段（presence）只是告诉一声
+        "assistant.unsubscribe" | "assistant.presence" => Ok(json!({})),
+        "assistant.history" => Ok(json!({ "entries": [], "hasOlder": false })),
+        "assistant.channels.list" => Ok(json!({ "channels": [] })),
+        method if method.starts_with("assistant.") => Err((NOT_ALLOWED, "这台的 EDITH 没有助手：助手开在客户端那台上".into())),
         method if method.starts_with("term.") => terminal_request(method, params),
         method if method.starts_with("browser.") => browser_request(method, params),
         method
