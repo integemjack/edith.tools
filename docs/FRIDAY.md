@@ -22,6 +22,12 @@ Friday 客户端 ──SSH──▶ edith-friday --attach（一条连接一个�
 - **批准**：网关连大脑时说自己能批准、是全权的连接。大脑要批准的事变成 Friday 的「待确认」（卡片上的「允许执行 / 拒绝」、
   侧边栏的手、`attention`），客户端点了回给大脑。卡片是连上之前出的，就按批准请求补一张。
 - **用户打的字**：交给大脑时说是 `kind: "user"`，模型看到的同终端里打的一样，不标「由能力传来」。
+- **子智能体**：EDITH 推的 `agent` / `agent.event` 拼成 Friday 的样子（同 Friday 的 SubAgentRunner）：`delegate_task` 那张卡片就是那个子智能体
+  （名字、运行记录、状态、交回的结果），并联 / 工作流的卡片里每个子智能体一张子卡片，往下派的照样嵌进去；在跑的进 Agent 树（`team` 事件，
+  id 是它的卡片 id，上级是派它的那张卡片、主智能体派的是会话）。做完的从 EDITH 存的运行记录（`agents/<会话>/<id>.json`）读回来。
+  子智能体交回给主智能体的那段话标 `fromAgent`（Friday 里不显示），用户干活时补充的标 `interjected`（「工作中补充」）。
+- **会话改动**：文件卡片的「本次会话改动」、改动视图、撤销转给 EDITH 的 `changes.*`（基线同 Friday 的 SessionChanges：写之前记原文，
+  命令改的到 git 里找原文）。删会话交给 EDITH 的 `sessions.remove`，基线、子智能体的运行记录一起删。
 
 ## 装上
 
@@ -60,12 +66,14 @@ cp edith ~/.friday-server/bin/                            # 或者 edith 在 PAT
 | 发话：闲着开始一轮，忙时补充进这一轮，或排到下一轮（显示在队列里） | `runner.submit`（`whenBusy: "queue"` 排队，特性 `submitFrom`） |
 | 附件、文件卡片预览 | `file.upload`（一块块传，回这台上的路径）、`fs.read` |
 | 流式看回复、速度和用量、上下文进度环 | `message` / `conversation` / `runtime` / `runner` 事件 |
-| 批准 | `runner.resolveApproval` |
+| 批准（主智能体的、子智能体的） | `runner.resolveApproval` |
 | 停下 | `runner.stop`（排着的也不干了）、`runner.stopAll` |
+| 子智能体：卡片里看它的运行记录、Agent 树、停掉、追加指示 | `team` 事件、`runner.backgroundAgents`、`agent.stop`、`agent.send` |
+| 文件卡片的「本次会话改动」、改动视图、撤销 | `fs.changes`、`fs.diff`、`fs.revert`（交给 EDITH 的 `changes.*`） |
 
 还不行的（回 `-32601` 没有，或错误 `4` 说明原因；`server.features` 只报上面那两个，客户端就不显示别的功能）：
 
-- 分叉、重试、切分支；把排着的话拿掉；在 Friday 里管子智能体（子智能体照样派，卡片在消息里，Agent 树是空的）。
+- 分叉、重试、切分支；把排着的话拿掉（主智能体的、子智能体的）。
 - 终端、浏览器（`available: false`）、本地模型、设置页、助手（助手页那一行显示「版本太旧」）。
 - 在这里改模型和密钥：模型只有一个「EDITH · <模型>」，读 `~/.edith/config.json`；界面上选的权限模式、思考档位只记下来显示，
   EDITH 按自己的审批规则（[EDITH.md](https://github.com/integemjack/edith/blob/main/docs/EDITH.md#信任与审批)）。
@@ -80,4 +88,5 @@ cd tools/friday && cargo test
 ```
 
 一头扮 Friday 客户端，一头扮大脑（登记一个假的大脑）：存档翻译、连上来接着看在干的那一轮、发话、流式、批准、干活时补充另起一段、
-排队、停下、改名、空白会话第一次发话才在 EDITH 里建、选目录、列目录、新建文件夹、附件上传、删。
+排队、停下、改名、空白会话第一次发话才在 EDITH 里建、选目录、列目录、新建文件夹、附件上传、删；子智能体的卡片和运行记录、Agent 树、
+子智能体要批准的、停掉 / 追加指示、交回的汇报不显示；会话改动、改动视图、撤销。

@@ -208,6 +208,8 @@ fn friday_client_through_gateway() {
         &list,
         json!([{ "id": SESSION, "cwd": work.to_string_lossy(), "working": true, "turn": { "id": "t0", "text": "之前发的" } }]),
     );
+    let agents = link.wait_for(10, |message| message["method"] == "agents.list").expect("连上来没问子智能体");
+    reply(&mut link, &agents, json!([]));
     let hello = client.reply(hello)["result"].clone();
     assert_eq!(hello["protocol"], 1);
     assert_eq!(hello["server"]["version"], "0.0.0", "不让客户端自动升级");
@@ -398,11 +400,12 @@ fn friday_client_through_gateway() {
     let id = client.send("terminal.open", json!({}));
     assert_eq!(client.reply(id)["error"]["code"], -32601);
 
-    // 删：停下、删存档
+    // 删：交给大脑删（这里替它删存档）
     let remove = client.send("conversation.remove", json!({ "id": upper }));
-    if let Some(request) = link.wait_for(10, |message| message["method"] == "sessions.stop") {
-        reply(&mut link, &request, json!({ "stopped": false }));
-    }
+    let request = link.wait_for(10, |message| message["method"] == "sessions.remove").expect("没让大脑删");
+    assert_eq!(request["params"]["id"], SESSION);
+    std::fs::remove_file(sessions_dir(&home).join(format!("{SESSION}.jsonl"))).unwrap();
+    reply(&mut link, &request, json!({ "removed": true }));
     assert!(client.reply(remove).get("error").is_none());
     assert!(!sessions_dir(&home).join(format!("{SESSION}.jsonl")).exists());
     client.event("summaries", |params| !params["summaries"].as_array().unwrap().iter().any(|item| item["id"] == json!(upper)));
@@ -461,5 +464,175 @@ fn directories_files_and_uploads() {
     );
     let id = client.send("file.upload", json!({ "uploadID": "../x", "name": "a", "offset": 0, "data": "", "last": true }));
     assert_eq!(client.reply(id)["error"]["code"], -32602);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// 子智能体：卡片里装它的运行记录、Agent 树、停掉 / 追加指示、它要批准的；会话改动交给大脑
+#[test]
+fn sub_agents_and_file_changes() {
+    let home = scratch("friday-agents");
+    let work = home.join("work");
+    std::fs::create_dir_all(work.join(".git")).unwrap();
+    // 主智能体派了一个（后台）、并联派了两个；第一个交回了一段汇报
+    let dir = sessions_dir(&home);
+    std::fs::create_dir_all(&dir).unwrap();
+    let lines = [
+        json!({ "type": "meta", "id": SESSION, "cwd": work.to_string_lossy(), "created": "2026-10-24T10:00:00+08:00" }),
+        json!({ "type": "message", "message": { "role": "user", "content": "派人去查" } }),
+        json!({ "type": "message", "message": { "role": "assistant", "content": "", "tool_calls": [
+            tool_call("call_d", "delegate_task", json!({ "task": "查一下", "name": "小助手" })),
+            tool_call("call_p", "run_parallel_tasks", json!({ "tasks": [{ "task": "甲" }, { "task": "乙" }] })),
+        ] } }),
+        json!({ "type": "message", "message": { "role": "tool", "tool_call_id": "call_d", "content": "已在后台派出子 Agent「小助手」" } }),
+        json!({ "type": "message", "message": { "role": "tool", "tool_call_id": "call_p", "content": "已在后台派出 2 个子 Agent" } }),
+        json!({ "type": "message", "message": { "role": "assistant", "content": "派出去了" } }),
+        json!({ "type": "message", "message": { "role": "user", "content": "子 Agent「甲」交回结果（运行记录 id：b1）：\n甲做完了" } }),
+        json!({ "type": "message", "message": { "role": "assistant", "content": "甲收到了" } }),
+    ];
+    std::fs::write(dir.join(format!("{SESSION}.jsonl")), lines.iter().map(|line| format!("{line}\n")).collect::<String>()).unwrap();
+    let brain = FakeBrain::new();
+    register(&home, &brain, &work);
+    let mut client = Client::start(&home, &work);
+    let upper = SESSION.to_uppercase();
+    let agent = |id: &str, name: &str, call: &str, slot: u64, kind: &str, state: &str, transcript: Value| {
+        json!({ "id": id, "name": name, "task": format!("{name}的任务"), "session": SESSION, "parent": null, "call": call, "slot": slot,
+                "kind": kind, "depth": 1, "state": state, "started": "2026-10-24T10:01:00Z", "steps": 1,
+                "activity": { "kind": "tool", "title": "run_shell" }, "reply": if state == "done" { "甲做完了" } else { "" }, "transcript": transcript })
+    };
+
+    let hello = client.send("hello", json!({ "protocol": 1 }));
+    let mut link = accept(&brain);
+    let list = link.wait_for(10, |message| message["method"] == "sessions.list").unwrap();
+    reply(&mut link, &list, json!([]));
+    let agents = link.wait_for(10, |message| message["method"] == "agents.list").unwrap();
+    reply(
+        &mut link,
+        &agents,
+        json!([
+            agent(
+                "a1",
+                "小助手",
+                "call_d",
+                0,
+                "delegate",
+                "running",
+                json!([
+                    { "type": "text", "text": "在查" },
+                    { "type": "tool", "call": "c1", "name": "run_shell", "arguments": { "command": "ls" }, "status": "running", "result": "" },
+                ])
+            ),
+            agent("b1", "甲", "call_p", 0, "parallel", "done", json!([{ "type": "text", "text": "甲做完了" }])),
+            agent("b2", "乙", "call_p", 1, "parallel", "running", json!([])),
+        ]),
+    );
+    let hello = client.reply(hello)["result"].clone();
+    // Agent 树：在跑的两个；id 是它的卡片 id，上级是这段会话
+    let runs = hello["state"]["team"]["runs"].as_array().unwrap().clone();
+    assert_eq!(runs.len(), 2, "{runs:?}");
+    let small = runs.iter().find(|run| run["name"] == "小助手").unwrap().clone();
+    assert_eq!((small["parentKey"].as_str(), small["conversationID"].as_str()), (Some(upper.as_str()), Some(upper.as_str())));
+    assert_eq!((small["activity"]["kind"].as_str(), small["activity"]["title"].as_str()), (Some("tool"), Some("执行命令")));
+    assert!(has(&hello["state"]["runner"]["backgroundAgents"], SESSION));
+
+    // 卡片：delegate_task 就是那个子智能体；并联的卡片里一个子智能体一张子卡片；交回的汇报标 fromAgent
+    let opened = client.request("conversation.subscribe", json!({ "id": upper }));
+    let nodes = opened["conversation"]["nodes"].as_array().unwrap().clone();
+    let cards = tools(&nodes[1]);
+    let delegate = &cards[0];
+    assert_eq!((delegate["agentName"].as_str(), delegate["status"].as_str()), (Some("小助手"), Some("running")));
+    assert_eq!(delegate["id"], small["id"], "卡片 id == Agent 树里的 id");
+    let transcript = delegate["transcript"].as_array().unwrap();
+    assert_eq!(transcript[0]["kind"]["text"]["_0"], "在查");
+    assert_eq!(transcript[1]["kind"]["tool"]["_0"]["name"], "run_shell");
+    let parallel = &cards[1];
+    assert_eq!((parallel["agentName"].as_str(), parallel["status"].as_str()), (Some("后台 ×2"), Some("running")));
+    let children: Vec<Value> = parallel["transcript"].as_array().unwrap().iter().map(|block| block["kind"]["tool"]["_0"].clone()).collect();
+    assert_eq!(children.iter().map(|child| child["agentName"].as_str().unwrap()).collect::<Vec<_>>(), ["甲", "乙"]);
+    assert_eq!((children[0]["status"].as_str(), children[0]["result"].as_str()), (Some("succeeded"), Some("甲做完了")));
+    assert_eq!(nodes[2]["fromAgent"], "甲", "交回的汇报不当用户消息显示");
+
+    // 它接着干：运行记录跟着变（推装着它的那条消息）
+    push(
+        &mut link,
+        SESSION,
+        "t0",
+        "agent.event",
+        json!({ "agent": "a1", "type": "result", "data": { "id": "c1", "name": "run_shell", "ok": true, "text": "a.txt" } }),
+    );
+    push(&mut link, SESSION, "t0", "agent.event", json!({ "agent": "a1", "type": "text", "data": { "text": "查到了" } }));
+    let updated = client.event("message", |params| {
+        tools(&params["message"]).first().is_some_and(|card| card["transcript"].as_array().is_some_and(|blocks| blocks.len() == 3))
+    });
+    let blocks = tools(&updated["params"]["message"])[0]["transcript"].as_array().unwrap().clone();
+    assert_eq!(blocks[1]["kind"]["tool"]["_0"]["status"], "succeeded");
+    assert_eq!(blocks[2]["kind"]["text"]["_0"], "查到了");
+
+    // 子智能体要批准：卡片在它的运行记录里
+    push(
+        &mut link,
+        SESSION,
+        "t0",
+        "agent.event",
+        json!({ "agent": "a1", "type": "tool", "data": { "id": "c2", "name": "write_file", "arguments": { "path": "x" } } }),
+    );
+    let approve = link.start("approve", json!({ "session": SESSION, "turn": "t0", "call": "c2", "tool": "write_file", "agent": "a1" }));
+    client.event("attention", |_| true);
+    let pending = |message: &Value| {
+        tools(message)
+            .first()
+            .and_then(|card| card["transcript"].as_array().cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|block| block["kind"]["tool"]["_0"].clone())
+            .find(|tool| tool["status"] == "awaitingApproval")
+    };
+    let waiting = client.event("message", |params| pending(&params["message"]).is_some());
+    let inner = pending(&waiting["params"]["message"]).unwrap();
+    client.event("team", |params| params["runs"].as_array().unwrap().iter().any(|run| run["activity"]["kind"] == "waitingApproval"));
+    client.request("runner.resolveApproval", json!({ "eventID": inner["id"], "approved": true }));
+    assert_eq!(link.reply_to(approve, 10)["result"]["decision"], "allow");
+
+    // Agent 树里追加指示、停掉：交给大脑
+    let card = small["id"].clone();
+    let send = client.send("agent.send", json!({ "agentID": card, "text": "顺便看看 b", "attachments": [] }));
+    let request = link.wait_for(10, |message| message["method"] == "agents.send").expect("没交给大脑");
+    assert_eq!((request["params"]["id"].as_str(), request["params"]["text"].as_str()), (Some("a1"), Some("顺便看看 b")));
+    reply(&mut link, &request, json!({ "name": "小助手" }));
+    assert!(client.reply(send).get("error").is_none());
+    let stop = client.send("agent.stop", json!({ "agentID": card }));
+    let request = link.wait_for(10, |message| message["method"] == "agents.stop").expect("没让大脑停");
+    assert_eq!(request["params"]["id"], "a1");
+    reply(&mut link, &request, json!({ "name": "小助手" }));
+    assert!(client.reply(stop).get("error").is_none());
+    // 停了：卡片标已停止、Agent 树里没有它了
+    let mut stopped = agent("a1", "小助手", "call_d", 0, "delegate", "stopped", Value::Null);
+    stopped.as_object_mut().unwrap().remove("transcript");
+    push(&mut link, SESSION, "t0", "agent", stopped);
+    client.event("team", |params| !params["runs"].as_array().unwrap().iter().any(|run| run["name"] == "小助手"));
+    client.event("message", |params| {
+        tools(&params["message"]).first().is_some_and(|card| card["stopped"] == true && card["status"] == "failed")
+    });
+
+    // 会话改动：交给大脑
+    let changes = client.send("fs.changes", json!({ "conversationID": upper }));
+    let request = link.wait_for(10, |message| message["method"] == "changes.list").expect("没问大脑改动");
+    assert_eq!(request["params"]["session"], SESSION);
+    let files = json!({ "files": [{ "path": "/w/a.txt", "status": "M", "known": true, "text": true, "added": 1, "removed": 0 }] });
+    reply(&mut link, &request, files.clone());
+    assert_eq!(client.reply(changes)["result"], files);
+    let diff = client.send("fs.diff", json!({ "conversationID": upper, "path": "/w/a.txt" }));
+    let request = link.wait_for(10, |message| message["method"] == "changes.diff").unwrap();
+    assert_eq!(request["params"]["path"], "/w/a.txt");
+    reply(
+        &mut link,
+        &request,
+        json!({ "path": "/w/a.txt", "status": "M", "known": true, "binary": false, "tooLarge": false, "old": "1\n", "new": "1\n2\n" }),
+    );
+    assert_eq!(client.reply(diff)["result"]["new"], "1\n2\n");
+    let revert = client.send("fs.revert", json!({ "conversationID": upper }));
+    let request = link.wait_for(10, |message| message["method"] == "changes.revert").unwrap();
+    assert!(request["params"].get("path").is_none());
+    reply(&mut link, &request, json!({ "failed": [] }));
+    assert_eq!(client.reply(revert)["result"]["failed"], json!([]));
     let _ = std::fs::remove_dir_all(&home);
 }
