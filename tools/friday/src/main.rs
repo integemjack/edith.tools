@@ -1618,6 +1618,9 @@ struct State {
     config: bool,
     /// 看过记住的事（memory.*）：之后推 memory 事件，按它要的最近几条截
     memory: Option<usize>,
+    /// 开着设置 › 能力（powers.subscribe）、订了本地模型（models.subscribe，客户端连上就订）
+    powers: bool,
+    models: bool,
     /// 常驻那份开着的终端（TerminalInfo 们）、浏览器（BrowserState；还没连上它时是 None）
     terminals: Vec<Value>,
     browser: Option<Value>,
@@ -3546,8 +3549,17 @@ fn server_info() -> Value {
         "host": "server",
         "clientDevices": { "power": false },
         // 选目录时新建文件夹；runner.submit 认 whenBusy；会话的动静（客户端的助手看这台）、助手开没开
-        "features": ["mkdir", "submitFrom", "activity", "assistant", "config", "memory", "memorySearch"],
+        "features": features(),
     })
+}
+
+/// 做了的（客户端只用报了的）；本地能力、本地模型、用户音色在常驻的那份里
+fn features() -> Vec<&'static str> {
+    let mut list = vec!["mkdir", "submitFrom", "activity", "assistant", "config", "memory", "memorySearch"];
+    if serve_mode() != "off" {
+        list.extend(["powers", "models", "userVoices"]);
+    }
+    list
 }
 
 fn directories_state() -> Value {
@@ -4113,6 +4125,7 @@ fn handle(method: &str, params: &Value) -> Reply {
         "assistant.channels.list" => Ok(json!({ "channels": [] })),
         method if method.starts_with("assistant.") => Err((NOT_ALLOWED, "这台的 EDITH 没有助手：助手开在客户端那台上".into())),
         method if method.starts_with("term.") => terminal_request(method, params),
+        method if method.starts_with("powers.") || method.starts_with("models.") => hub_forward(method, params),
         method if method.starts_with("browser.") => browser_request(method, params),
         method
             if method.starts_with("config.")
@@ -4184,6 +4197,20 @@ fn handle(method: &str, params: &Value) -> Reply {
 // 用 PreToolUse 钩子告诉大脑这些动作怎么批准（EDITH 的能力协议 §6.7），一轮结束（done）关掉智能体开的标签；
 // 报 resident，不算有人连着（大脑闲够了照样退）。网关（一个客户端一条）连它的控制口（`~/.edith/friday/serve.json`：地址、令牌），
 // 终端、浏览器的请求转给它，它推来的输出、画面、标签变化转给客户端。没有网关连着、没在跑的终端、没在干活的大脑，闲半小时自己退。
+
+/// 常驻那份发 HTTP 用的（下载本地能力、模型；走环境变量里的代理）
+static HTTP: LazyLock<ureq::Agent> = LazyLock::new(|| {
+    ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_connect(Some(Duration::from_secs(30)))
+        .timeout_recv_response(Some(Duration::from_secs(180)))
+        .build()
+        .into()
+});
+
+fn http_agent() -> &'static ureq::Agent {
+    &HTTP
+}
 
 fn serve_dir() -> PathBuf {
     edith_home().join("friday")
@@ -4275,6 +4302,8 @@ fn serve_initialize() -> Value {
         "receives": ["turn.started", "done"],
         "sessions": "all",
         "hooks": ["PreToolUse"],
+        // 本地模型（power://llm）的真地址由这里给（能力协议 §6.6）
+        "models": ["power://"],
         "resident": true,
     })
 }
@@ -4329,6 +4358,16 @@ fn serve_brain_message(brain: &Arc<Brain>, message: Value, ready: &mut Option<Se
         }
         (Some("hook"), Some(id)) => {
             brain.write(&json!({ "jsonrpc": "2.0", "id": id, "result": serve_hook(&message["params"]) }));
+        }
+        (Some("model.endpoint"), Some(id)) => {
+            let brain = brain.clone();
+            std::thread::spawn(move || {
+                let reply = match models::endpoint(&message["params"]) {
+                    Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+                    Err(error) => json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32603, "message": error } }),
+                };
+                brain.write(&reply);
+            });
         }
         (Some("event"), None) => {
             let params = &message["params"];
@@ -4466,8 +4505,56 @@ fn serve_request(client: &str, method: &str, params: &Value) -> Reply {
             };
             outcome.map_err(|message| (NOT_FOUND, message))
         }
+        method if method.starts_with("powers.") => powers_request(method, params),
+        method if method.starts_with("models.") => models::request(client, method, params),
         other => Err((-32601, format!("常驻的那份没有 {other}"))),
     }
+}
+
+/// powers.*（设置 › 能力看着这台时）
+fn powers_request(method: &str, params: &Value) -> Reply {
+    let id = || params["id"].as_str().filter(|id| !id.is_empty()).map(str::to_string).ok_or((-32602, "缺少参数 id".to_string()));
+    match method {
+        "powers.state" => return Ok(powers::state()),
+        "powers.refresh" => {
+            std::thread::spawn(powers::refresh);
+        }
+        "powers.install" => powers::install(&id()?, params["target"].as_str().unwrap_or("")),
+        "powers.cancel" => powers::cancel(&id()?),
+        "powers.uninstall" => powers::uninstall(&id()?),
+        "powers.setEnabled" => {
+            let enabled = params["enabled"].as_bool().ok_or((-32602, "缺少参数 enabled（布尔）".to_string()))?;
+            powers::set_enabled(&id()?, enabled);
+        }
+        "powers.setOption" => {
+            let key = params["key"].as_str().filter(|key| !key.is_empty()).ok_or((-32602, "缺少参数 key".to_string()))?;
+            powers::set_option(&id()?, key, &params["value"]);
+        }
+        "powers.start" => powers::start_power(&id()?),
+        "powers.stop" => powers::stop(&id()?),
+        // 用户音色：path 是先经 file.upload 传上来的文件（.gguf 导入，别的当录音克隆），做完连目录删掉
+        "powers.importVoice" => {
+            let path = PathBuf::from(params["path"].as_str().unwrap_or(""));
+            let uploads = canonical(&edith_home().join("uploads"));
+            let file = canonical(&path);
+            if !file.starts_with(&uploads) || !file.is_file() {
+                return Err((-32602, "只认 file.upload 传上来的文件".into()));
+            }
+            let name = params["name"].as_str().filter(|name| !name.is_empty()).ok_or((-32602, "缺少参数 name".to_string()))?;
+            let outcome =
+                powers::import_voice(&file, name, params["text"].as_str().unwrap_or(""), params["replace"].as_bool().unwrap_or(false));
+            if let Some(dir) = file.parent().filter(|dir| *dir != uploads) {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+            let (voice, transcript) = outcome.map_err(|error| (-32603, error))?;
+            return Ok(json!({ "voice": voice, "transcript": transcript }));
+        }
+        "powers.deleteVoice" => {
+            powers::delete_voice(params["name"].as_str().unwrap_or("")).map_err(|error| (-32603, error))?;
+        }
+        other => return Err((-32601, format!("没有这个方法：{other}"))),
+    }
+    Ok(json!({}))
 }
 
 fn serve_client(stream: TcpStream, token: &str) {
@@ -4499,7 +4586,10 @@ fn serve_client(stream: TcpStream, token: &str) {
             });
         };
         // 慢的（连大脑、起浏览器开标签）另起线程；别的按收到的顺序（打的字、鼠标键盘不能乱）
-        if matches!(method.as_str(), "attach" | "browser.open") {
+        if matches!(
+            method.as_str(),
+            "attach" | "browser.open" | "powers.importVoice" | "powers.deleteVoice" | "models.delete" | "powers.uninstall"
+        ) {
             let (client, name) = (client.clone(), name.clone());
             std::thread::spawn(move || answer(&client, serve_request(&name, &method, &params)));
         } else {
@@ -4537,6 +4627,8 @@ fn serve() -> Result<(), String> {
         let _ = std::fs::set_permissions(&registered, std::fs::Permissions::from_mode(0o600));
     }
     serve_log("serve", &format!("起来了：{address}（{VERSION}）"));
+    powers::start();
+    models::start();
     {
         let token = token.clone();
         std::thread::spawn(move || {
@@ -4561,7 +4653,12 @@ fn serve() -> Result<(), String> {
     let mut idle_since = Instant::now();
     loop {
         std::thread::sleep(Duration::from_secs(1));
-        if !CLIENTS.lock().unwrap().is_empty() || pty::any_running() || !TURNS.lock().unwrap().is_empty() {
+        if !CLIENTS.lock().unwrap().is_empty()
+            || pty::any_running()
+            || !TURNS.lock().unwrap().is_empty()
+            || powers::busy()
+            || models::busy()
+        {
             idle_since = Instant::now();
         } else if idle_since.elapsed() >= idle {
             break;
@@ -4570,6 +4667,7 @@ fn serve() -> Result<(), String> {
     serve_log("serve", "闲着没人用，退出");
     pty::close_all();
     browser::stop();
+    powers::stop_all();
     if read_json_file(&registered)["pid"] == json!(std::process::id()) {
         let _ = std::fs::remove_file(&registered);
     }
@@ -4634,6 +4732,17 @@ fn on_hub_message(hub: &Arc<Brain>, message: Value) {
         Some("browser") => {
             STATE.lock().unwrap().browser = Some(message["params"].clone());
             event("browser", browser_state());
+        }
+        // 本地能力、本地模型：订了的客户端收；下载 / 换上失败只给发起的那个
+        Some("powers") if STATE.lock().unwrap().powers => event("powers", message["params"].clone()),
+        Some("models") if STATE.lock().unwrap().models => event("models", message["params"].clone()),
+        Some("modelsFailed") => event("modelsFailed", message["params"].clone()),
+        // 本地模型下好了：建了本地引擎、给会话换上了（会话上选的记在 friday.json）
+        Some("engines.changed") => {
+            event("engines", engines_state());
+            if let Some(conversation) = message["params"]["conversationID"].as_str() {
+                changed(&lower(conversation), true);
+            }
         }
         Some(_) => {}
         None => {
@@ -4713,6 +4822,45 @@ fn hub() -> Result<Arc<Brain>, String> {
     Ok(hub)
 }
 
+/// 转给常驻的那份（本地能力、本地模型）；订阅记在这个网关
+fn hub_forward(method: &str, params: &Value) -> Reply {
+    let hub = hub().map_err(|error| (NOT_ALLOWED, error))?;
+    let (target, subscribe) = match method {
+        "powers.subscribe" => ("powers.state", Some(("powers", true))),
+        "powers.unsubscribe" => {
+            return {
+                STATE.lock().unwrap().powers = false;
+                Ok(json!({}))
+            };
+        }
+        "models.subscribe" => ("models.state", Some(("models", true))),
+        "models.unsubscribe" => {
+            return {
+                STATE.lock().unwrap().models = false;
+                Ok(json!({}))
+            };
+        }
+        other => (other, None),
+    };
+    // 慢的：等装好的音色、删模型（friday-llm 先停掉）
+    let wait = if matches!(method, "powers.importVoice" | "models.delete" | "powers.deleteVoice") { 660 } else { 30 };
+    let reply = hub.request(target, params.clone(), Duration::from_secs(wait)).map_err(|error| hub_error(&error))?;
+    if let Some((what, on)) = subscribe {
+        let mut state = STATE.lock().unwrap();
+        if what == "powers" {
+            state.powers = on;
+        } else {
+            state.models = on;
+        }
+    }
+    Ok(reply)
+}
+
+/// 常驻那份回的错误：没有这个模型回 3，别的原样
+fn hub_error(error: &str) -> (i64, String) {
+    if error.starts_with("这台机器上没有这个本地模型") { (NOT_FOUND, error.to_string()) } else { (-32603, error.to_string()) }
+}
+
 /// 让常驻的那份马上连上这个大脑（新起的大脑第一轮就要它的钩子、浏览器工具，不等它下一次看登记）
 fn hub_attach(entry: &Value) {
     if serve_mode() == "off" {
@@ -4724,6 +4872,3224 @@ fn hub_attach(entry: &Value) {
     });
     if let Err(error) = attached {
         log(&format!("常驻的那份没连上 {} 的大脑：{error}", entry["workspace"].as_str().unwrap_or("")));
+    }
+}
+
+// MARK: - 本地能力（Friday.Powers）
+
+mod powers {
+    //! 本地能力（照 Friday Qt 的 PowerManager，Friday 仓库的 qt/docs/POWERS.md）：按需下载的本地 GPU 程序（本地语音 voice、本地大模型 llm、
+    //! 生图 / 生视频 diffusion、设备 devices），装在常驻那份所在的这台、用这台的显卡。索引是 Friday.Powers 的 index-v2.json
+    //! （`FRIDAY_POWERS_INDEX` 可以指别的地址或本地文件），20 秒后取一次、之后每 6 小时；包下好比大小和 SHA-256、用系统的 tar 解开，
+    //! 要的模型、共用运行库（cuda13）一起下。进程：`<程序> serve …`（参数模板来自清单），从标准输出读 `{"event":"listening","url":…}`，
+    //! 关标准输入它自己退，闲 15 分钟停掉把显存还回去。目录 `~/.edith/friday/powers`（`FRIDAY_POWERS_DIR` 可以换）。
+
+    use std::collections::{BTreeMap, HashMap, VecDeque};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, ChildStdin, Command, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Condvar, LazyLock, Mutex};
+    use std::time::{Duration, Instant};
+
+    use serde_json::{Map, Value, json};
+    use sha2::Digest;
+
+    const INDEX: &str = "https://github.com/integemjack/Friday.Powers/releases/download/index/index-v2.json";
+    /// 闲置这么久（没有请求）就停掉，把显存还回去
+    const IDLE_STOP: Duration = Duration::from_secs(15 * 60);
+    /// 起来后这么久没报 listening 算失败
+    const START_TIMEOUT: Duration = Duration::from_secs(120);
+
+    pub fn root() -> PathBuf {
+        match std::env::var_os("FRIDAY_POWERS_DIR").filter(|dir| !dir.is_empty()) {
+            Some(dir) => PathBuf::from(dir),
+            None => crate::serve_dir().join("powers"),
+        }
+    }
+
+    fn power_dir(id: &str) -> PathBuf {
+        root().join(id)
+    }
+
+    pub fn models_dir(id: &str) -> PathBuf {
+        power_dir(id).join("models")
+    }
+
+    fn runtimes_dir() -> PathBuf {
+        root().join("runtimes")
+    }
+
+    fn downloads_dir() -> PathBuf {
+        root().join(".downloads")
+    }
+
+    fn executable_name(name: &str) -> String {
+        if cfg!(windows) { format!("{name}.exe") } else { name.to_string() }
+    }
+
+    fn simple(name: &str) -> bool {
+        let mut chars = name.chars();
+        chars.next().is_some_and(|first| first.is_ascii_alphanumeric())
+            && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    }
+
+    fn text(value: &Value, key: &str) -> String {
+        value[key].as_str().unwrap_or("").to_string()
+    }
+
+    fn strings(value: &Value) -> Vec<String> {
+        value.as_array().into_iter().flatten().filter_map(Value::as_str).filter(|text| !text.is_empty()).map(str::to_string).collect()
+    }
+
+    fn size_of(value: &Value) -> u64 {
+        value.as_f64().map(|size| size.max(0.0) as u64).unwrap_or(0)
+    }
+
+    pub fn human_size(bytes: u64) -> String {
+        if bytes >= 1 << 30 { format!("{:.1} GB", bytes as f64 / (1u64 << 30) as f64) } else { format!("{} MB", (bytes >> 20).max(1)) }
+    }
+
+    // MARK: 清单
+
+    #[derive(Clone)]
+    struct ModelFile {
+        id: String,
+        file: String,
+        url: String,
+        sha256: String,
+        size: u64,
+        purpose: String,
+    }
+
+    #[derive(Clone)]
+    struct Target {
+        id: String,
+        detail: String,
+        url: String,
+        sha256: String,
+        size: u64,
+        models: Vec<String>,
+        capabilities: Vec<String>,
+        runtime: String,
+    }
+
+    #[derive(Clone)]
+    struct Package {
+        url: String,
+        sha256: String,
+        size: u64,
+    }
+
+    #[derive(Clone)]
+    struct SharedRuntime {
+        id: String,
+        title: String,
+        version: String,
+        packages: HashMap<String, Package>,
+    }
+
+    #[derive(Clone)]
+    pub struct Spec {
+        pub id: String,
+        title: String,
+        detail: String,
+        version: String,
+        executable: String,
+        serve: Vec<String>,
+        capabilities: Vec<String>,
+        models: Vec<ModelFile>,
+        targets: Vec<Target>,
+        pub families: Value,
+        options: Vec<Value>,
+    }
+
+    impl Spec {
+        fn parse(value: &Value) -> Option<Spec> {
+            let models = value["models"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|model| {
+                    let file = ModelFile {
+                        id: text(model, "id"),
+                        file: text(model, "file"),
+                        url: text(model, "url"),
+                        sha256: text(model, "sha256").trim().to_lowercase(),
+                        size: size_of(&model["size"]),
+                        purpose: text(model, "purpose"),
+                    };
+                    // 文件名不能跳出 models 目录
+                    let bad = file.file.contains("..") || file.file.starts_with('/') || file.file.contains(':');
+                    (!file.id.is_empty() && !file.file.is_empty() && !file.url.is_empty() && !bad).then_some(file)
+                })
+                .collect();
+            let targets = value["targets"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .filter_map(|(id, target)| {
+                    let target = Target {
+                        id: id.clone(),
+                        detail: text(target, "detail"),
+                        url: text(target, "url"),
+                        sha256: text(target, "sha256").trim().to_lowercase(),
+                        size: size_of(&target["size"]),
+                        models: strings(&target["models"]),
+                        capabilities: strings(&target["capabilities"]),
+                        runtime: text(target, "runtime"),
+                    };
+                    (!target.url.is_empty() && !target.sha256.is_empty()).then_some(target)
+                })
+                .collect();
+            let spec = Spec {
+                id: text(value, "id"),
+                title: text(value, "title"),
+                detail: text(value, "detail"),
+                version: text(value, "version"),
+                executable: text(value, "executable"),
+                serve: strings(&value["serve"]),
+                capabilities: strings(&value["capabilities"]),
+                models,
+                targets,
+                families: value["families"].clone(),
+                options: value["options"].as_array().cloned().unwrap_or_default(),
+            };
+            // id、程序名拼进路径：只能是简单名字
+            if !simple(&spec.id) || !simple(&spec.executable) || spec.version.is_empty() || spec.serve.is_empty() {
+                return None;
+            }
+            Some(Spec { title: if spec.title.is_empty() { spec.id.clone() } else { spec.title.clone() }, ..spec })
+        }
+
+        fn target(&self, id: &str) -> Option<&Target> {
+            self.targets.iter().find(|target| target.id == id)
+        }
+
+        fn models_for(&self, target: &Target) -> Vec<ModelFile> {
+            self.models.iter().filter(|model| target.models.contains(&model.id)).cloned().collect()
+        }
+
+        fn capabilities_for(&self, target: &Target) -> Vec<String> {
+            if target.capabilities.is_empty() { self.capabilities.clone() } else { target.capabilities.clone() }
+        }
+    }
+
+    fn parse_runtimes(index: &Value) -> HashMap<String, SharedRuntime> {
+        let mut runtimes = HashMap::new();
+        for (id, item) in index["runtimes"].as_object().into_iter().flatten() {
+            let packages: HashMap<String, Package> = item["packages"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .filter_map(|(platform, package)| {
+                    let package = Package {
+                        url: text(package, "url"),
+                        sha256: text(package, "sha256").trim().to_lowercase(),
+                        size: size_of(&package["size"]),
+                    };
+                    (!package.url.is_empty() && !package.sha256.is_empty()).then(|| (platform.clone(), package))
+                })
+                .collect();
+            let version = text(item, "version");
+            if !simple(id) || !simple(&version) || packages.is_empty() {
+                continue;
+            }
+            let title = if text(item, "title").is_empty() { id.clone() } else { text(item, "title") };
+            runtimes.insert(id.clone(), SharedRuntime { id: id.clone(), title, version, packages });
+        }
+        runtimes
+    }
+
+    // MARK: 平台
+
+    /// 不用显卡的 Power（devices）的包：<系统>-<架构>
+    pub fn runtime_key() -> String {
+        let arch = match std::env::consts::ARCH {
+            "x86_64" => "x64",
+            "aarch64" => "arm64",
+            other => other,
+        };
+        let system = if cfg!(windows) {
+            "windows"
+        } else if cfg!(target_os = "macos") {
+            "macos"
+        } else {
+            "linux"
+        };
+        format!("{system}-{arch}")
+    }
+
+    /// 这台能用的平台包（加速的在前；同 Friday 的 PowerPlatform::candidates）
+    fn candidates() -> Vec<String> {
+        let arch = std::env::consts::ARCH;
+        let mut list: Vec<&str> = Vec::new();
+        if cfg!(windows) && arch == "x86_64" {
+            list.push("windows-x64-vulkan");
+            let system = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+            if Path::new(&system).join("System32").join("nvcuda.dll").exists() {
+                list.extend(["windows-x64-cuda13", "windows-x64-cuda"]);
+            }
+        } else if cfg!(target_os = "macos") && arch == "aarch64" {
+            list.push("macos-arm64-metal");
+        } else if cfg!(target_os = "linux") && arch == "x86_64" {
+            list.push("linux-x64-vulkan");
+            if Path::new("/proc/driver/nvidia/version").exists() {
+                list.push("linux-x64-cuda");
+            }
+        } else if cfg!(target_os = "linux") && arch == "aarch64" {
+            let tegra = std::fs::read_to_string("/etc/nv_tegra_release").unwrap_or_default();
+            let first = tegra.lines().next().unwrap_or("");
+            if first.contains("R36") {
+                list.push("linux-arm64-jetson-orin");
+            } else if !first.contains("R32") {
+                list.push("linux-arm64-vulkan");
+            }
+        }
+        let mut list: Vec<String> = list.into_iter().map(str::to_string).collect();
+        list.push(runtime_key());
+        list
+    }
+
+    fn platform_title(target: &str) -> String {
+        match target {
+            "windows-x64-vulkan" => "Windows（Vulkan）",
+            "windows-x64-cuda13" | "windows-x64-cuda" => "Windows（NVIDIA CUDA）",
+            "macos-arm64-metal" => "macOS（Metal）",
+            "linux-x64-vulkan" => "Linux（Vulkan）",
+            "linux-x64-cuda" => "Linux（NVIDIA CUDA）",
+            "linux-arm64-jetson-orin" => "Jetson Orin",
+            "linux-arm64-vulkan" => "ARM64 Linux（Vulkan）",
+            "windows-x64" => "Windows x64",
+            "macos-arm64" => "macOS（Apple 芯片）",
+            "linux-x64" => "Linux x64",
+            "linux-arm64" => "ARM64 Linux",
+            other => other,
+        }
+        .to_string()
+    }
+
+    /// 平台包改过名：装着旧名字的换成新的
+    fn successor(target: &str) -> Option<&'static str> {
+        (target == "windows-x64-cuda").then_some("windows-x64-cuda13")
+    }
+
+    fn newer(a: &str, b: &str) -> bool {
+        let parse = |text: &str| text.split('.').map(|part| part.trim().parse::<u64>().unwrap_or(0)).collect::<Vec<_>>();
+        parse(a) > parse(b)
+    }
+
+    // MARK: 状态
+
+    #[derive(Clone)]
+    struct Installed {
+        version: String,
+        target: String,
+        dir: PathBuf,
+        executable: String,
+        serve: Vec<String>,
+        capabilities: Vec<String>,
+        title: String,
+        detail: String,
+        enabled: bool,
+        runtime_dir: String,
+        options: Vec<Value>,
+        option_values: Map<String, Value>,
+    }
+
+    impl Installed {
+        fn from_json(value: &Value) -> Installed {
+            Installed {
+                version: text(value, "version"),
+                target: text(value, "target"),
+                dir: PathBuf::from(text(value, "dir")),
+                executable: text(value, "executable"),
+                serve: strings(&value["serve"]),
+                capabilities: strings(&value["capabilities"]),
+                title: text(value, "title"),
+                detail: text(value, "detail"),
+                enabled: value["enabled"].as_bool().unwrap_or(true),
+                runtime_dir: text(value, "runtimeDir"),
+                options: value["options"].as_array().cloned().unwrap_or_default(),
+                option_values: value["optionValues"].as_object().cloned().unwrap_or_default(),
+            }
+        }
+
+        fn to_json(&self) -> Value {
+            let mut value = json!({
+                "version": self.version, "target": self.target, "dir": self.dir.to_string_lossy(), "executable": self.executable,
+                "serve": self.serve, "capabilities": self.capabilities, "title": self.title, "detail": self.detail, "enabled": self.enabled,
+            });
+            if !self.runtime_dir.is_empty() {
+                value["runtimeDir"] = json!(self.runtime_dir);
+            }
+            if !self.options.is_empty() {
+                value["options"] = json!(self.options);
+            }
+            if !self.option_values.is_empty() {
+                value["optionValues"] = json!(self.option_values);
+            }
+            value
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Default)]
+    enum Status {
+        #[default]
+        Idle,
+        Downloading,
+        Starting,
+        Running,
+        Stopping,
+        Failed,
+    }
+
+    struct Process {
+        child: Child,
+        stdin: Option<ChildStdin>,
+    }
+
+    struct Running {
+        status: Status,
+        progress: f64,
+        progress_text: String,
+        error: String,
+        cancel: Option<Arc<AtomicBool>>,
+        process: Option<Arc<Mutex<Process>>>,
+        url: String,
+        token: String,
+        stderr_tail: VecDeque<String>,
+        stopping: bool,
+        restart_after_stop: bool,
+        last_used: Instant,
+        runtime_dir: String,
+    }
+
+    impl Default for Running {
+        fn default() -> Self {
+            Running {
+                status: Status::Idle,
+                progress: -1.0,
+                progress_text: String::new(),
+                error: String::new(),
+                cancel: None,
+                process: None,
+                url: String::new(),
+                token: String::new(),
+                stderr_tail: VecDeque::new(),
+                stopping: false,
+                restart_after_stop: false,
+                last_used: Instant::now(),
+                runtime_dir: String::new(),
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct Manager {
+        index: Vec<Spec>,
+        runtimes: HashMap<String, SharedRuntime>,
+        installed: BTreeMap<String, Installed>,
+        running: HashMap<String, Running>,
+        refreshing: bool,
+        index_error: String,
+        platforms: Vec<String>,
+    }
+
+    static MANAGER: LazyLock<Mutex<Manager>> = LazyLock::new(|| Mutex::new(Manager::default()));
+    /// 状态变了（等进程起来的在等它）
+    static SETTLED: Condvar = Condvar::new();
+    static DIRTY: AtomicBool = AtomicBool::new(false);
+
+    /// 变了：80 毫秒内合成一次推给网关（订了的客户端收 powers）
+    fn changed() {
+        DIRTY.store(true, Ordering::Relaxed);
+        SETTLED.notify_all();
+    }
+
+    fn save(manager: &Manager) {
+        let powers: Map<String, Value> = manager.installed.iter().map(|(id, installed)| (id.clone(), installed.to_json())).collect();
+        let _ = std::fs::create_dir_all(root());
+        let _ = std::fs::write(root().join("state.json"), serde_json::to_vec_pretty(&json!({ "powers": powers })).unwrap_or_default());
+    }
+
+    fn runtime_dir_of(runtime: &SharedRuntime) -> PathBuf {
+        runtimes_dir().join(&runtime.id).join(&runtime.version)
+    }
+
+    fn runtime_ready(dir: &Path, sha256: &str) -> bool {
+        std::fs::read_to_string(dir.join(".sha256")).is_ok_and(|text| text.trim().eq_ignore_ascii_case(sha256))
+    }
+
+    fn model_ready(path: &Path, model: &ModelFile) -> bool {
+        let Ok(meta) = std::fs::metadata(path) else { return false };
+        if model.size > 0 && meta.len() != model.size {
+            return false;
+        }
+        let marker = PathBuf::from(format!("{}.sha256", path.display()));
+        std::fs::read_to_string(marker).is_ok_and(|text| text.trim().eq_ignore_ascii_case(&model.sha256))
+    }
+
+    impl Manager {
+        fn spec(&self, id: &str) -> Option<&Spec> {
+            self.index.iter().find(|spec| spec.id == id)
+        }
+
+        fn usable(&self, target: &Target) -> bool {
+            target.runtime.is_empty()
+                || self.runtimes.get(&target.runtime).is_some_and(|runtime| runtime.packages.contains_key(&runtime_key()))
+        }
+
+        fn default_target(&self, spec: &Spec) -> String {
+            self.platforms
+                .iter()
+                .find(|platform| spec.target(platform).is_some_and(|target| self.usable(target)))
+                .cloned()
+                .unwrap_or_default()
+        }
+
+        fn runtime_download_size(&self, target: &Target) -> u64 {
+            let Some(runtime) = self.runtimes.get(&target.runtime) else { return 0 };
+            let Some(package) = runtime.packages.get(&runtime_key()) else { return 0 };
+            if runtime_ready(&runtime_dir_of(runtime), &package.sha256) { 0 } else { package.size }
+        }
+
+        fn manifest(&self, id: &str) -> Option<Spec> {
+            if let Some(spec) = self.spec(id) {
+                return Some(spec.clone());
+            }
+            let installed = self.installed.get(id)?;
+            Spec::parse(&read_json(&installed.dir.join("power.json"))?)
+        }
+    }
+
+    fn read_json(path: &Path) -> Option<Value> {
+        serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+    }
+
+    /// 起来时：读装了的、缓存的索引，清掉没人用的运行库；20 秒后取索引、之后每 6 小时，每分钟看一次闲着的进程
+    pub fn start() {
+        {
+            let mut manager = MANAGER.lock().unwrap();
+            manager.platforms = candidates();
+            if let Some(state) = read_json(&root().join("state.json")) {
+                for (id, value) in state["powers"].as_object().into_iter().flatten() {
+                    let installed = Installed::from_json(value);
+                    // 目录被手动删了就当没装
+                    if installed.dir.join(executable_name(&installed.executable)).is_file() {
+                        manager.installed.insert(id.clone(), installed);
+                    }
+                }
+            }
+            if let Some(index) = read_json(&root().join("index.json")) {
+                manager.index = index["powers"].as_array().into_iter().flatten().filter_map(Spec::parse).collect();
+                manager.runtimes = parse_runtimes(&index);
+            }
+            cleanup_runtimes(&manager);
+        }
+        std::thread::spawn(|| {
+            loop {
+                std::thread::sleep(Duration::from_millis(80));
+                if DIRTY.swap(false, Ordering::Relaxed) {
+                    crate::notify_all_clients("powers", state());
+                    crate::models::powers_changed();
+                }
+            }
+        });
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(20));
+            loop {
+                refresh();
+                std::thread::sleep(Duration::from_secs(6 * 3600));
+            }
+        });
+        std::thread::spawn(|| {
+            loop {
+                std::thread::sleep(Duration::from_secs(60));
+                let idle: Vec<String> = {
+                    let manager = MANAGER.lock().unwrap();
+                    manager
+                        .running
+                        .iter()
+                        .filter(|(_, running)| {
+                            running.process.is_some() && running.status == Status::Running && running.last_used.elapsed() > IDLE_STOP
+                        })
+                        .map(|(id, _)| id.clone())
+                        .collect()
+                };
+                for id in idle {
+                    crate::serve_log("powers", &format!("本地能力 {id} 闲置 15 分钟，先停掉"));
+                    stop(&id);
+                }
+            }
+        });
+    }
+
+    // MARK: 索引
+
+    fn fetch_index() -> Result<Vec<u8>, String> {
+        let location = std::env::var("FRIDAY_POWERS_INDEX").ok().filter(|location| !location.is_empty()).unwrap_or_else(|| INDEX.into());
+        if !location.starts_with("http://") && !location.starts_with("https://") {
+            let path = location.strip_prefix("file://").unwrap_or(&location);
+            return std::fs::read(path).map_err(|_| format!("打不开 {path}"));
+        }
+        let get = |url: &str| -> Result<(u16, Vec<u8>), String> {
+            let mut response = crate::http_agent().get(url).call().map_err(|error| format!("取本地能力列表失败：{error}"))?;
+            let status = response.status().as_u16();
+            let mut body = Vec::new();
+            response.body_mut().as_reader().read_to_end(&mut body).map_err(|error| format!("取本地能力列表失败：{error}"))?;
+            Ok((status, body))
+        };
+        let (mut status, mut body) = get(&location)?;
+        // 还没有 index-v2.json 时退回老的 index.json
+        if status == 404
+            && let Some(base) = location.strip_suffix("index-v2.json")
+        {
+            (status, body) = get(&format!("{base}index.json"))?;
+        }
+        match status {
+            404 => Err("还没有发布可用的本地能力".into()),
+            200..300 => Ok(body),
+            other => Err(format!("取本地能力列表失败：HTTP {other}")),
+        }
+    }
+
+    /// 重新取索引（检查更新）：装了的有新版本就在后台更新
+    pub fn refresh() {
+        {
+            let mut manager = MANAGER.lock().unwrap();
+            if manager.refreshing {
+                return;
+            }
+            manager.refreshing = true;
+        }
+        changed();
+        let fetched = fetch_index().and_then(|body| {
+            let index: Value = serde_json::from_slice(&body).map_err(|_| "本地能力列表格式不对".to_string())?;
+            if !index.is_object() {
+                return Err("本地能力列表格式不对".to_string());
+            }
+            Ok((body, index))
+        });
+        let updates: Vec<(String, String)> = {
+            let mut manager = MANAGER.lock().unwrap();
+            manager.refreshing = false;
+            match fetched {
+                Ok((body, index)) => {
+                    manager.index_error.clear();
+                    let _ = std::fs::create_dir_all(root());
+                    let _ = std::fs::write(root().join("index.json"), body);
+                    manager.index = index["powers"].as_array().into_iter().flatten().filter_map(Spec::parse).collect();
+                    manager.runtimes = parse_runtimes(&index);
+                    updates(&manager)
+                }
+                Err(error) => {
+                    crate::serve_log("powers", &error);
+                    manager.index_error = error;
+                    Vec::new()
+                }
+            }
+        };
+        changed();
+        for (id, target) in updates {
+            install(&id, &target);
+        }
+    }
+
+    /// 装着的、索引里有新版本（或用的运行库被删了）的：(id, 平台包)
+    fn updates(manager: &Manager) -> Vec<(String, String)> {
+        let mut list = Vec::new();
+        for (id, installed) in &manager.installed {
+            let Some(latest) = manager.spec(id) else { continue };
+            let mut target = installed.target.clone();
+            if latest.target(&target).is_none_or(|current| !manager.usable(current)) {
+                let Some(next) = successor(&target) else { continue };
+                if latest.target(next).is_none_or(|next| !manager.usable(next))
+                    || !manager.platforms.iter().any(|platform| platform == next)
+                {
+                    continue;
+                }
+                target = next.to_string();
+            }
+            let broken = !installed.runtime_dir.is_empty() && !Path::new(&installed.runtime_dir).exists();
+            let busy = manager.running.get(id).is_some_and(|running| running.status == Status::Downloading);
+            if (newer(&latest.version, &installed.version) || broken) && !busy {
+                crate::serve_log("powers", &format!("本地能力 {id} 有新版本 {}（现在 {}），后台更新", latest.version, installed.version));
+                list.push((id.clone(), target));
+            }
+        }
+        list
+    }
+
+    // MARK: 安装
+
+    /// 下到 destination：http(s) 断点续传（先下到 .part），file:// 直接复制（本机测试用的索引）
+    pub fn fetch(url: &str, destination: &Path, cancel: &AtomicBool, progress: &mut dyn FnMut(u64)) -> Result<(), String> {
+        if let Some(dir) = destination.parent() {
+            std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
+        }
+        let name = destination.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            let source = url.strip_prefix("file://").unwrap_or(url);
+            std::fs::copy(source, destination).map_err(|_| format!("复制 {source} 失败"))?;
+            progress(std::fs::metadata(destination).map(|meta| meta.len()).unwrap_or(0));
+            return Ok(());
+        }
+        let part = PathBuf::from(format!("{}.part", destination.display()));
+        let mut attempt = 0;
+        loop {
+            let have = std::fs::metadata(&part).map(|meta| meta.len()).unwrap_or(0);
+            let mut request = crate::http_agent().get(url).header("User-Agent", format!("Friday/{}", crate::VERSION));
+            if have > 0 {
+                request = request.header("Range", format!("bytes={have}-"));
+            }
+            let outcome = (|| -> Result<(), (bool, String)> {
+                let mut response = request.call().map_err(|error| (true, format!("下载 {name} 失败：{error}")))?;
+                let status = response.status().as_u16();
+                if status == 416 {
+                    return Ok(());
+                }
+                if !(200..300).contains(&status) {
+                    return Err((status >= 500 || status == 429, format!("下载 {name} 失败：HTTP {status}")));
+                }
+                let append = status == 206 && have > 0;
+                let mut file = std::fs::File::options()
+                    .create(true)
+                    .write(true)
+                    .append(append)
+                    .truncate(!append)
+                    .open(&part)
+                    .map_err(|error| (false, format!("写入 {name} 失败：{error}")))?;
+                let mut done = if append { have } else { 0 };
+                let mut reader = response.body_mut().as_reader();
+                let mut buffer = vec![0u8; 256 * 1024];
+                loop {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err((false, CANCELLED.into()));
+                    }
+                    let read = reader.read(&mut buffer).map_err(|error| (true, format!("下载 {name} 断了：{error}")))?;
+                    if read == 0 {
+                        break;
+                    }
+                    file.write_all(&buffer[..read]).map_err(|error| (false, format!("写入 {name} 失败：{error}")))?;
+                    done += read as u64;
+                    progress(done);
+                }
+                Ok(())
+            })();
+            match outcome {
+                Ok(()) => {
+                    std::fs::rename(&part, destination).map_err(|error| format!("放不进 {}：{error}", destination.display()))?;
+                    return Ok(());
+                }
+                // 断了、服务端 5xx：等一会儿从 .part 接着下，最多再试 5 次
+                Err((true, _)) if attempt < 5 => {
+                    std::thread::sleep(Duration::from_secs([2, 5, 10, 20, 30][attempt]));
+                    attempt += 1;
+                }
+                Err((_, message)) => return Err(message),
+            }
+        }
+    }
+
+    pub const CANCELLED: &str = "已取消";
+
+    pub fn sha256_of(path: &Path, cancel: &AtomicBool) -> Result<String, String> {
+        let mut file = std::fs::File::open(path).map_err(|error| format!("读不了 {}：{error}", path.display()))?;
+        let mut hasher = sha2::Sha256::new();
+        let mut buffer = vec![0u8; 8 << 20];
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(CANCELLED.into());
+            }
+            let read = file.read(&mut buffer).map_err(|error| error.to_string())?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        Ok(hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
+    }
+
+    fn verify(path: &Path, size: u64, sha256: &str, cancel: &AtomicBool) -> Result<(), String> {
+        let actual_size = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+        if (size > 0 && actual_size != size) || !sha256_of(path, cancel)?.eq_ignore_ascii_case(sha256) {
+            let _ = std::fs::remove_file(path);
+            let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+            return Err(format!("{name} 校验不对（下载不完整或被改过），已删除，请重试"));
+        }
+        Ok(())
+    }
+
+    /// 解开 zip / tar.gz（Windows 10 起自带的 tar.exe 也认 zip）
+    fn extract(archive: &Path, into: &Path) -> Result<(), String> {
+        let tar = if cfg!(windows) {
+            PathBuf::from(std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into())).join("System32").join("tar.exe")
+        } else {
+            PathBuf::from("tar")
+        };
+        let output =
+            Command::new(tar).arg("-xf").arg(archive).arg("-C").arg(into).output().map_err(|error| format!("解压失败：{error}"))?;
+        if !output.status.success() {
+            return Err(format!("解压失败：{}", String::from_utf8_lossy(&output.stderr).trim()));
+        }
+        Ok(())
+    }
+
+    /// 解开的目录里找程序所在的目录（包里多一层同名目录时）；只认文件
+    fn package_root(staging: &Path, executable: &str) -> Option<PathBuf> {
+        if staging.join(executable).is_file() {
+            return Some(staging.to_path_buf());
+        }
+        std::fs::read_dir(staging).ok()?.flatten().map(|entry| entry.path()).find(|path| path.is_dir() && path.join(executable).is_file())
+    }
+
+    fn random_token() -> String {
+        uuid::Uuid::new_v4().simple().to_string()
+    }
+
+    /// 在这台上下载安装（target 不给用装着的 / 这台默认的）；装了的就是更新、换平台
+    pub fn install(id: &str, requested: &str) {
+        let job = {
+            let mut manager = MANAGER.lock().unwrap();
+            let Some(spec) = manager.spec(id).cloned() else { return };
+            if manager.running.get(id).is_some_and(|running| running.status == Status::Downloading) {
+                return;
+            }
+            let mut target_id = if !requested.is_empty() {
+                requested.to_string()
+            } else if let Some(installed) = manager.installed.get(id) {
+                installed.target.clone()
+            } else {
+                manager.default_target(&spec)
+            };
+            if spec.target(&target_id).is_none()
+                && let Some(next) = successor(&target_id)
+            {
+                target_id = next.to_string();
+            }
+            let target = spec.target(&target_id).cloned();
+            let fits = target.as_ref().is_some_and(|target| manager.platforms.contains(&target.id) && manager.usable(target));
+            let runtime = target.as_ref().and_then(|target| manager.runtimes.get(&target.runtime).cloned());
+            let running = manager.running.entry(id.to_string()).or_default();
+            if !fits {
+                running.status = Status::Failed;
+                running.error = format!("这台机器用不了「{}」", spec.title);
+                drop(manager);
+                changed();
+                return;
+            }
+            let cancel = Arc::new(AtomicBool::new(false));
+            running.status = Status::Downloading;
+            running.progress = 0.0;
+            running.progress_text = "准备下载".into();
+            running.error.clear();
+            running.cancel = Some(cancel.clone());
+            (spec, target.unwrap(), runtime, cancel)
+        };
+        changed();
+        std::thread::spawn(move || {
+            let (spec, target, runtime, cancel) = job;
+            let id = spec.id.clone();
+            let outcome = install_job(&spec, &target, runtime.as_ref(), &cancel);
+            let mut manager = MANAGER.lock().unwrap();
+            match outcome {
+                Ok(fresh) => finish_install(&mut manager, &id, fresh),
+                Err(message) => {
+                    if message != CANCELLED {
+                        crate::serve_log("powers", &format!("安装本地能力 {id} 失败：{message}"));
+                    }
+                    let running = manager.running.entry(id).or_default();
+                    running.status = if running.process.is_some() {
+                        Status::Running
+                    } else if message == CANCELLED {
+                        Status::Idle
+                    } else {
+                        Status::Failed
+                    };
+                    running.progress = -1.0;
+                    running.error = message;
+                    running.cancel = None;
+                }
+            }
+            drop(manager);
+            changed();
+        });
+    }
+
+    /// 一次只装一个共用运行库（几个 Power 一起装时只下一次）
+    static RUNTIME_LOCK: Mutex<()> = Mutex::new(());
+
+    fn install_job(spec: &Spec, target: &Target, runtime: Option<&SharedRuntime>, cancel: &AtomicBool) -> Result<Installed, String> {
+        let id = &spec.id;
+        let package = match runtime {
+            Some(runtime) => Some(runtime.packages.get(&runtime_key()).cloned().ok_or(format!("这台机器没有「{}」的包", runtime.title))?),
+            None if !target.runtime.is_empty() => return Err(format!("索引里没有「{}」", target.runtime)),
+            None => None,
+        };
+        let mut runtime_path = runtime.map(runtime_dir_of).unwrap_or_default();
+        let need_runtime = package.as_ref().is_some_and(|package| !runtime_ready(&runtime_path, &package.sha256));
+        let missing: Vec<ModelFile> =
+            spec.models_for(target).into_iter().filter(|model| !model_ready(&models_dir(id).join(&model.file), model)).collect();
+        let total = target.size
+            + if need_runtime { package.as_ref().map_or(0, |package| package.size) } else { 0 }
+            + missing.iter().map(|model| model.size).sum::<u64>();
+        let mut done = 0u64;
+        let mut shown = -1.0;
+        let mut report = |received: u64, what: &str, done: u64| {
+            let progress = if total > 0 { ((done + received) as f64 / total as f64).min(1.0) } else { 0.0 };
+            if progress - shown < 0.005 && progress < 1.0 {
+                return;
+            }
+            shown = progress;
+            let text = format!("{what}（{} / {}）", human_size(done + received), human_size(total));
+            if let Some(running) = MANAGER.lock().unwrap().running.get_mut(id) {
+                running.progress = progress;
+                running.progress_text = text;
+            }
+            changed();
+        };
+        // 0. 共用运行库（解到 runtimes/<id>/<版本>/，.sha256 最后写：有它才算装好）
+        if let (Some(runtime), Some(package)) = (runtime, package.as_ref()) {
+            let _one = RUNTIME_LOCK.lock().unwrap();
+            if !runtime_ready(&runtime_path, &package.sha256) {
+                let archive = downloads_dir().join(package.url.rsplit('/').next().unwrap_or("runtime"));
+                let label = format!("下载 {} {}", runtime.title, runtime.version);
+                fetch(&package.url, &archive, cancel, &mut |received| report(received, &label, done))?;
+                verify(&archive, package.size, &package.sha256, cancel)?;
+                let staging = runtimes_dir().join(&runtime.id).join(".staging");
+                let _ = std::fs::remove_dir_all(&staging);
+                std::fs::create_dir_all(&staging).map_err(|error| error.to_string())?;
+                extract(&archive, &staging)?;
+                if runtime_path.exists() && std::fs::remove_dir_all(&runtime_path).is_err() {
+                    runtime_path = PathBuf::from(format!("{}-{}", runtime_path.display(), &random_token()[..6]));
+                }
+                std::fs::rename(&staging, &runtime_path).map_err(|_| format!("放不进 {}", runtime_path.display()))?;
+                std::fs::write(runtime_path.join(".sha256"), &package.sha256).map_err(|error| error.to_string())?;
+                let _ = std::fs::remove_file(&archive);
+            }
+            if need_runtime {
+                done += package.size;
+            }
+        }
+        // 1. 平台包
+        let archive = downloads_dir().join(target.url.rsplit('/').next().unwrap_or("package"));
+        let what = format!("下载 {} {}", spec.title, spec.version);
+        fetch(&target.url, &archive, cancel, &mut |received| report(received, &what, done))?;
+        verify(&archive, target.size, &target.sha256, cancel)?;
+        done += target.size;
+        if let Some(running) = MANAGER.lock().unwrap().running.get_mut(id) {
+            running.progress_text = "解压".into();
+        }
+        changed();
+        let staging = power_dir(id).join(".staging");
+        let _ = std::fs::remove_dir_all(&staging);
+        std::fs::create_dir_all(&staging).map_err(|error| error.to_string())?;
+        extract(&archive, &staging)?;
+        let exe = executable_name(&spec.executable);
+        let Some(package_root) = package_root(&staging, &exe) else {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(format!("包里没有 {exe}"));
+        };
+        let mut destination = power_dir(id).join(format!("{}-{}", spec.version, target.id));
+        if destination.exists() && std::fs::remove_dir_all(&destination).is_err() {
+            destination = PathBuf::from(format!("{}-{}", destination.display(), &random_token()[..6]));
+        }
+        std::fs::rename(&package_root, &destination).map_err(|_| format!("放不进 {}", destination.display()))?;
+        let _ = std::fs::remove_dir_all(&staging);
+        let _ = std::fs::remove_file(&archive);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(destination.join(&exe), std::fs::Permissions::from_mode(0o755));
+        }
+        // 2. 模型（各版本共用）
+        for model in &missing {
+            let path = models_dir(id).join(&model.file);
+            let label = format!("下载模型 {}", if model.purpose.is_empty() { &model.id } else { &model.purpose });
+            fetch(&model.url, &path, cancel, &mut |received| report(received, &label, done))?;
+            verify(&path, model.size, &model.sha256, cancel)?;
+            let _ = std::fs::write(format!("{}.sha256", path.display()), &model.sha256);
+            done += model.size;
+        }
+        Ok(Installed {
+            version: spec.version.clone(),
+            target: target.id.clone(),
+            dir: destination,
+            executable: spec.executable.clone(),
+            serve: spec.serve.clone(),
+            capabilities: spec.capabilities_for(target),
+            title: spec.title.clone(),
+            detail: spec.detail.clone(),
+            enabled: true,
+            runtime_dir: if runtime.is_some() { runtime_path.to_string_lossy().into_owned() } else { String::new() },
+            options: spec.options.clone(),
+            option_values: Map::new(),
+        })
+    }
+
+    fn finish_install(manager: &mut Manager, id: &str, fresh: Installed) {
+        let mut installed = fresh;
+        if let Some(previous) = manager.installed.get(id) {
+            installed.enabled = previous.enabled;
+            installed.option_values = previous.option_values.clone();
+        }
+        crate::serve_log(
+            "powers",
+            &format!("本地能力 {id} {}（{}）已装好：{}", installed.version, installed.target, installed.dir.display()),
+        );
+        manager.installed.insert(id.to_string(), installed);
+        save(manager);
+        let running = manager.running.entry(id.to_string()).or_default();
+        running.progress = -1.0;
+        running.progress_text.clear();
+        running.error.clear();
+        running.cancel = None;
+        if running.process.is_some() {
+            // 正在跑旧版本：停掉换新的（下个请求按新版本拉起）
+            running.status = Status::Running;
+            stop_locked(manager, id, true);
+        } else {
+            running.status = Status::Idle;
+            cleanup_versions(manager, id);
+        }
+        cleanup_runtimes(manager);
+    }
+
+    /// 旧版本目录（不是装着的、不是模型）删掉
+    fn cleanup_versions(manager: &Manager, id: &str) {
+        let Some(keep) = manager.installed.get(id).map(|installed| installed.dir.clone()) else { return };
+        for entry in std::fs::read_dir(power_dir(id)).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() && entry.file_name() != "models" && path != keep {
+                let _ = std::fs::remove_dir_all(&path);
+            }
+        }
+    }
+
+    /// 没有装着的 Power、也没有在跑的进程用的运行库删掉（有在装的先不动）
+    fn cleanup_runtimes(manager: &Manager) {
+        if manager.running.values().any(|running| running.status == Status::Downloading) {
+            return;
+        }
+        let mut keep: Vec<PathBuf> = manager
+            .installed
+            .values()
+            .filter(|installed| !installed.runtime_dir.is_empty())
+            .map(|installed| PathBuf::from(&installed.runtime_dir))
+            .collect();
+        keep.extend(
+            manager
+                .running
+                .values()
+                .filter(|running| running.process.is_some() && !running.runtime_dir.is_empty())
+                .map(|running| PathBuf::from(&running.runtime_dir)),
+        );
+        for kind in std::fs::read_dir(runtimes_dir()).into_iter().flatten().flatten() {
+            for version in std::fs::read_dir(kind.path()).into_iter().flatten().flatten() {
+                if !keep.contains(&version.path()) && std::fs::remove_dir_all(version.path()).is_ok() {
+                    crate::serve_log("powers", &format!("运行库 {} 没有能力在用了，已删除", version.path().display()));
+                }
+            }
+            let _ = std::fs::remove_dir(kind.path());
+        }
+        let _ = std::fs::remove_dir(runtimes_dir());
+    }
+
+    pub fn cancel(id: &str) {
+        if let Some(cancel) = MANAGER.lock().unwrap().running.get(id).and_then(|running| running.cancel.clone()) {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    pub fn uninstall(id: &str) {
+        cancel(id);
+        let process = {
+            let mut manager = MANAGER.lock().unwrap();
+            let process = manager.running.remove(id).and_then(|running| running.process);
+            manager.installed.remove(id);
+            save(&manager);
+            process
+        };
+        if let Some(process) = process {
+            let mut process = process.lock().unwrap();
+            process.stdin = None;
+            let _ = process.child.kill();
+            let _ = process.child.wait();
+        }
+        let _ = std::fs::remove_dir_all(power_dir(id));
+        cleanup_runtimes(&MANAGER.lock().unwrap());
+        crate::serve_log("powers", &format!("本地能力 {id} 已卸载"));
+        changed();
+    }
+
+    pub fn set_enabled(id: &str, enabled: bool) {
+        {
+            let mut manager = MANAGER.lock().unwrap();
+            let Some(installed) = manager.installed.get_mut(id) else { return };
+            if installed.enabled == enabled {
+                return;
+            }
+            installed.enabled = enabled;
+            save(&manager);
+            if !enabled {
+                stop_locked(&mut manager, id, false);
+            }
+        }
+        changed();
+    }
+
+    /// 放进环境变量的写法：整数不带小数点
+    fn option_text(value: &Value) -> String {
+        match value {
+            Value::Number(number) => match number.as_f64() {
+                Some(float) if float.fract() == 0.0 => format!("{}", float as i64),
+                Some(float) => float.to_string(),
+                None => number.to_string(),
+            },
+            Value::Bool(flag) => if *flag { "1" } else { "0" }.into(),
+            Value::String(text) => text.clone(),
+            _ => String::new(),
+        }
+    }
+
+    fn option_value(option: &Value, values: &Map<String, Value>) -> Value {
+        values.get(option["key"].as_str().unwrap_or("")).cloned().unwrap_or_else(|| option["default"].clone())
+    }
+
+    /// 改装好的这一版清单里的选项（只认 choices 里的值）；在跑的进程重新启动后生效
+    pub fn set_option(id: &str, key: &str, value: &Value) {
+        {
+            let mut manager = MANAGER.lock().unwrap();
+            let Some(installed) = manager.installed.get_mut(id) else { return };
+            let Some(option) = installed.options.iter().find(|option| option["key"] == json!(key)).cloned() else { return };
+            let chosen = option_text(value);
+            let known = option["choices"].as_array().into_iter().flatten().any(|choice| option_text(&choice["value"]) == chosen);
+            if !known || option_text(&option_value(&option, &installed.option_values)) == chosen {
+                return;
+            }
+            if chosen == option_text(&option["default"]) {
+                installed.option_values.remove(key);
+            } else {
+                installed.option_values.insert(key.to_string(), value.clone());
+            }
+            save(&manager);
+            crate::serve_log("powers", &format!("本地能力 {id} 的选项 {key} 改成 {chosen}"));
+            if manager.running.get(id).is_some_and(|running| running.process.is_some()) {
+                stop_locked(&mut manager, id, false);
+            }
+        }
+        changed();
+    }
+
+    // MARK: 进程
+
+    pub fn start_power(id: &str) {
+        let mut manager = MANAGER.lock().unwrap();
+        if manager.running.get(id).is_some_and(|running| running.process.is_some())
+            || !manager.installed.get(id).is_some_and(|installed| installed.enabled)
+        {
+            return;
+        }
+        start_locked(&mut manager, id);
+        drop(manager);
+        changed();
+    }
+
+    pub fn stop(id: &str) {
+        stop_locked(&mut MANAGER.lock().unwrap(), id, false);
+        changed();
+    }
+
+    fn start_locked(manager: &mut Manager, id: &str) {
+        let Some(installed) = manager.installed.get(id).cloned() else { return };
+        let token = random_token();
+        let models = models_dir(id);
+        let _ = std::fs::create_dir_all(&models);
+        let mut arguments: Vec<String> = Vec::new();
+        for argument in &installed.serve {
+            // 「{library}」：模型库的目录（魔搭、HF 两个缓存），前面的参数名跟着每个目录重复一遍
+            if argument == "{library}" {
+                let flag = arguments.last().cloned();
+                for (index, dir) in crate::models::roots().iter().enumerate() {
+                    if index > 0
+                        && let Some(flag) = &flag
+                    {
+                        arguments.push(flag.clone());
+                    }
+                    arguments.push(dir.to_string_lossy().into_owned());
+                }
+                continue;
+            }
+            arguments.push(argument.replace("{models}", &models.to_string_lossy()).replace("{token}", &token));
+        }
+        let mut command = Command::new(installed.dir.join(executable_name(&installed.executable)));
+        command.args(&arguments).current_dir(&installed.dir).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        if !installed.runtime_dir.is_empty() {
+            // 共用运行库（cuBLAS 这类）：Windows 按 PATH、Linux 按 LD_LIBRARY_PATH 找动态库，放在最前面
+            let name = if cfg!(windows) { "PATH" } else { "LD_LIBRARY_PATH" };
+            let previous = std::env::var(name).unwrap_or_default();
+            let separator = if cfg!(windows) { ";" } else { ":" };
+            command.env(
+                name,
+                if previous.is_empty() { installed.runtime_dir.clone() } else { format!("{}{separator}{previous}", installed.runtime_dir) },
+            );
+        }
+        for option in &installed.options {
+            let name = option["env"].as_str().unwrap_or("");
+            let chosen = option_value(option, &installed.option_values);
+            if !name.is_empty() && !chosen.is_null() {
+                command.env(name, option_text(&chosen));
+            }
+        }
+        #[cfg(unix)]
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            command.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000 | 0x0000_0200);
+        }
+        let running = manager.running.entry(id.to_string()).or_default();
+        running.token = token;
+        running.url.clear();
+        running.error.clear();
+        running.stderr_tail.clear();
+        running.stopping = false;
+        running.runtime_dir = installed.runtime_dir.clone();
+        crate::serve_log("powers", &format!("拉起本地能力 {id} {}", installed.version));
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                running.status = Status::Failed;
+                running.error = format!("起不了本地能力：{error}");
+                return;
+            }
+        };
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let process = Arc::new(Mutex::new(Process { child, stdin }));
+        running.process = Some(process.clone());
+        running.status = Status::Starting;
+        let started = Instant::now();
+        if let Some(stdout) = stdout {
+            let id = id.to_string();
+            let process = process.clone();
+            std::thread::spawn(move || {
+                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                    let Ok(event) = serde_json::from_str::<Value>(line.trim()) else { continue };
+                    if event["event"] != "listening" {
+                        continue;
+                    }
+                    let mut manager = MANAGER.lock().unwrap();
+                    if let Some(running) = manager.running.get_mut(&id)
+                        && running.process.as_ref().is_some_and(|current| Arc::ptr_eq(current, &process))
+                        && running.status == Status::Starting
+                    {
+                        running.url = event["url"].as_str().unwrap_or("").trim_end_matches('/').to_string();
+                        running.status = Status::Running;
+                        running.last_used = Instant::now();
+                        crate::serve_log("powers", &format!("本地能力 {id} 已就绪：{}", running.url));
+                    }
+                    drop(manager);
+                    changed();
+                }
+            });
+        }
+        if let Some(stderr) = stderr {
+            let id = id.to_string();
+            std::thread::spawn(move || {
+                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                    let line = line.trim().to_string();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if let Some(running) = MANAGER.lock().unwrap().running.get_mut(&id) {
+                        running.stderr_tail.push_back(line);
+                        while running.stderr_tail.len() > 30 {
+                            running.stderr_tail.pop_front();
+                        }
+                    }
+                }
+            });
+        }
+        // 看它退出（起不来的两分钟后结束它）
+        let id = id.to_string();
+        std::thread::spawn(move || {
+            let code = loop {
+                std::thread::sleep(Duration::from_millis(200));
+                let mut guard = process.lock().unwrap();
+                match guard.child.try_wait() {
+                    Ok(Some(status)) => break status.code().unwrap_or(-1),
+                    Ok(None) => {}
+                    Err(_) => break -1,
+                }
+                let starting = MANAGER.lock().unwrap().running.get(&id).is_some_and(|running| running.status == Status::Starting);
+                if starting && started.elapsed() > START_TIMEOUT {
+                    if let Some(running) = MANAGER.lock().unwrap().running.get_mut(&id) {
+                        running.stderr_tail.push_back("两分钟没就绪".into());
+                    }
+                    let _ = guard.child.kill();
+                }
+            };
+            finished(&id, &process, code);
+        });
+    }
+
+    fn finished(id: &str, process: &Arc<Mutex<Process>>, code: i32) {
+        let restart = {
+            let mut manager = MANAGER.lock().unwrap();
+            let Some(running) = manager.running.get_mut(id) else { return };
+            if !running.process.as_ref().is_some_and(|current| Arc::ptr_eq(current, process)) {
+                return;
+            }
+            running.process = None;
+            running.url.clear();
+            let expected = std::mem::take(&mut running.stopping);
+            let mut error = String::new();
+            if !expected {
+                let mut tail: Vec<String> =
+                    running.stderr_tail.iter().filter(|line| line.contains("error") || line.contains("失败")).cloned().collect();
+                if tail.is_empty() {
+                    tail = running.stderr_tail.iter().rev().take(3).rev().cloned().collect();
+                }
+                error = format!(
+                    "本地能力进程退出了（退出码 {code}）{}",
+                    if tail.is_empty() { String::new() } else { format!("：{}", tail.join(" ")) }
+                );
+                crate::serve_log("powers", &format!("{id} {error}"));
+            }
+            running.status = if expected { Status::Idle } else { Status::Failed };
+            running.error = error;
+            running.runtime_dir.clear();
+            let restart = std::mem::take(&mut running.restart_after_stop);
+            if expected {
+                cleanup_versions(&manager, id);
+                cleanup_runtimes(&manager);
+            }
+            restart && manager.installed.get(id).is_some_and(|installed| installed.enabled)
+        };
+        if restart {
+            start_locked(&mut MANAGER.lock().unwrap(), id);
+        }
+        changed();
+    }
+
+    /// 停掉（restart：停了再按新的拉起）：关标准输入它自己退，3 秒没退就结束它
+    fn stop_locked(manager: &mut Manager, id: &str, restart: bool) {
+        let Some(running) = manager.running.get_mut(id) else { return };
+        let Some(process) = running.process.clone() else {
+            if restart {
+                start_locked(manager, id);
+            }
+            return;
+        };
+        running.stopping = true;
+        running.restart_after_stop = restart;
+        running.status = Status::Stopping;
+        process.lock().unwrap().stdin = None;
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(3));
+            let mut process = process.lock().unwrap();
+            if matches!(process.child.try_wait(), Ok(None)) {
+                let _ = process.child.kill();
+            }
+        });
+    }
+
+    /// 没在跑就拉起，等到就绪：(地址, 令牌)
+    pub fn ensure_running(id: &str, timeout: Duration) -> Result<(String, String), String> {
+        let deadline = Instant::now() + timeout;
+        let mut manager = MANAGER.lock().unwrap();
+        let title =
+            manager.installed.get(id).map(|installed| installed.title.clone()).ok_or(format!("本地能力「{id}」还没安装（设置 › 能力）"))?;
+        if !manager.installed[id].enabled {
+            return Err(format!("本地能力「{title}」被关掉了（设置 › 能力）"));
+        }
+        if manager.running.get(id).is_none_or(|running| running.process.is_none()) {
+            start_locked(&mut manager, id);
+            changed();
+        }
+        loop {
+            let running = manager.running.get_mut(id).ok_or("本地能力已停止")?;
+            match (running.status, running.process.is_some()) {
+                (Status::Running, true) => {
+                    running.last_used = Instant::now();
+                    return Ok((running.url.clone(), running.token.clone()));
+                }
+                (_, false) => return Err(if running.error.is_empty() { "本地能力已停止".into() } else { running.error.clone() }),
+                _ => {}
+            }
+            let left = deadline.checked_duration_since(Instant::now()).ok_or(format!("本地能力「{title}」启动超时"))?;
+            manager = SETTLED.wait_timeout(manager, left.min(Duration::from_millis(500))).unwrap().0;
+        }
+    }
+
+    // MARK: 查询
+
+    pub fn is_installed(id: &str) -> bool {
+        MANAGER.lock().unwrap().installed.contains_key(id)
+    }
+
+    pub fn is_enabled(id: &str) -> bool {
+        MANAGER.lock().unwrap().installed.get(id).is_some_and(|installed| installed.enabled)
+    }
+
+    pub fn has_process(id: &str) -> bool {
+        MANAGER.lock().unwrap().running.get(id).is_some_and(|running| running.process.is_some())
+    }
+
+    pub fn is_refreshing() -> bool {
+        MANAGER.lock().unwrap().refreshing
+    }
+
+    /// 清单（索引里的，没有就装着的 power.json）
+    pub fn manifest(id: &str) -> Option<Spec> {
+        MANAGER.lock().unwrap().manifest(id)
+    }
+
+    /// 装着的 Power 能不能做这件事（清单的 capabilities，如 voiceImport）
+    pub fn can(id: &str, capability: &str) -> bool {
+        MANAGER.lock().unwrap().installed.get(id).is_some_and(|installed| installed.capabilities.iter().any(|item| item == capability))
+    }
+
+    fn user_voices(id: &str) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(models_dir(id).join("user-voices"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                // 点开头的是本地语音正在写的临时文件
+                (!name.starts_with('.')).then(|| name.strip_suffix(".gguf").map(str::to_string)).flatten()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn voices(manager: &Manager, id: &str) -> Vec<String> {
+        let Some(installed) = manager.installed.get(id) else { return Vec::new() };
+        let mut names: Vec<String> = std::fs::read_dir(installed.dir.join("voices"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_string_lossy().strip_suffix(".gguf").map(str::to_string))
+            .collect();
+        names.sort();
+        // 用户的排在后面；和包里的重名的不加载，也不列
+        for name in user_voices(id) {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        names
+    }
+
+    /// PowersState（同 Friday 的 RemoteServer::powersJson）
+    pub fn state() -> Value {
+        let manager = MANAGER.lock().unwrap();
+        let mut ids: Vec<String> = manager.index.iter().map(|spec| spec.id.clone()).collect();
+        for id in manager.installed.keys() {
+            if !ids.contains(id) {
+                ids.push(id.clone());
+            }
+        }
+        let mut list = Vec::new();
+        for id in ids {
+            let latest = manager.spec(&id);
+            let installed = manager.installed.get(&id);
+            let empty = Running::default();
+            let running = manager.running.get(&id).unwrap_or(&empty);
+            let targets: Vec<Value> = latest
+                .map(|latest| {
+                    manager
+                        .platforms
+                        .iter()
+                        .filter_map(|platform| latest.target(platform).filter(|target| manager.usable(target)))
+                        .map(|target| {
+                            json!({ "id": target.id, "title": platform_title(&target.id), "detail": target.detail,
+                                "size": target.size + manager.runtime_download_size(target) })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            // 这台机器用不了的不列
+            if installed.is_none() && targets.is_empty() {
+                continue;
+            }
+            let target = match (installed, latest) {
+                (Some(installed), _) => installed.target.clone(),
+                (None, Some(latest)) => manager.default_target(latest),
+                _ => String::new(),
+            };
+            let mut download_size = 0u64;
+            if let Some(latest) = latest {
+                let next = if installed.is_some() && latest.target(&target).is_none() {
+                    successor(&target).unwrap_or("").to_string()
+                } else {
+                    target.clone()
+                };
+                if let Some(chosen) = latest.target(&next).filter(|chosen| manager.usable(chosen)) {
+                    if installed.is_none_or(|installed| newer(&latest.version, &installed.version)) {
+                        download_size += chosen.size + manager.runtime_download_size(chosen);
+                    }
+                    download_size += latest
+                        .models_for(chosen)
+                        .iter()
+                        .filter(|model| !model_ready(&models_dir(&id).join(&model.file), model))
+                        .map(|model| model.size)
+                        .sum::<u64>();
+                }
+            }
+            let options: Vec<Value> = installed
+                .map(|installed| {
+                    installed
+                        .options
+                        .iter()
+                        .map(|option| {
+                            let mut item = option.clone();
+                            if let Some(object) = item.as_object_mut() {
+                                object.remove("env");
+                                object.insert("value".into(), option_value(option, &installed.option_values));
+                            }
+                            item
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let status = match running.status {
+                Status::Downloading => "downloading",
+                Status::Starting => "starting",
+                Status::Running | Status::Stopping => "running",
+                Status::Failed => "failed",
+                Status::Idle if installed.is_some() => "installed",
+                Status::Idle => "notInstalled",
+            };
+            let status_text = match status {
+                "downloading" => running.progress_text.clone(),
+                "starting" => "正在启动".into(),
+                "running" if running.status == Status::Stopping => "正在停止".into(),
+                "running" => "运行中".into(),
+                "failed" => running.error.clone(),
+                "installed" if installed.is_some_and(|installed| installed.enabled) => "已安装，用到时自动启动".into(),
+                "installed" => "已关闭".into(),
+                _ => "未安装".into(),
+            };
+            list.push(json!({
+                "id": id,
+                "title": latest.map(|latest| latest.title.clone()).or_else(|| installed.map(|installed| installed.title.clone())).unwrap_or_default(),
+                "detail": latest.map(|latest| latest.detail.clone()).or_else(|| installed.map(|installed| installed.detail.clone())).unwrap_or_default(),
+                "latestVersion": latest.map(|latest| latest.version.clone()).unwrap_or_default(),
+                "installedVersion": installed.map(|installed| installed.version.clone()).unwrap_or_default(),
+                "target": target,
+                "targetTitle": platform_title(&target),
+                "targets": targets,
+                "status": status,
+                "statusText": status_text,
+                "progress": running.progress,
+                "error": running.error,
+                "enabled": installed.is_none_or(|installed| installed.enabled),
+                "options": options,
+                "updateAvailable": installed.is_some_and(|installed| latest.is_some_and(|latest| newer(&latest.version, &installed.version))),
+                "capabilities": installed.map(|installed| installed.capabilities.clone()).or_else(|| latest.map(|latest| latest.capabilities.clone())).unwrap_or_default(),
+                "downloadSize": download_size,
+                "downloadSizeText": if download_size > 0 { human_size(download_size) } else { String::new() },
+                "voices": voices(&manager, &id),
+                "userVoices": if installed.is_some() { user_voices(&id) } else { Vec::new() },
+            }));
+        }
+        json!({
+            "powers": list,
+            "refreshing": manager.refreshing,
+            "indexError": manager.index_error,
+            "platformTargets": manager.platforms,
+            "available": true,
+        })
+    }
+
+    // MARK: 用户音色（本地语音 0.5，Friday 的 POWERS.md §4.2）
+
+    fn voice_error(status: u16, body: &[u8]) -> String {
+        let message = serde_json::from_slice::<Value>(body)
+            .ok()
+            .and_then(|value| value["error"]["message"].as_str().map(str::to_string))
+            .unwrap_or_default();
+        if !message.is_empty() {
+            message
+        } else if status == 404 || status == 405 {
+            "本地语音要更新到 0.5 才能导入、克隆音色（设置 › 能力）".into()
+        } else {
+            format!("本地语音没做成（HTTP {status}）：{}", String::from_utf8_lossy(&body[..body.len().min(300)]))
+        }
+    }
+
+    /// 导入（.gguf）或克隆（录音）一个用户音色：(音色名, 听写出来的底稿)
+    pub fn import_voice(path: &Path, name: &str, text: &str, replace: bool) -> Result<(String, String), String> {
+        let gguf = path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"));
+        let wanted = if gguf { "voiceImport" } else { "voiceCloning" };
+        if !is_installed("voice") {
+            return Err("还没装本地语音（设置 › 能力）".into());
+        }
+        if !is_enabled("voice") {
+            return Err("本地语音关着（设置 › 能力）".into());
+        }
+        if !can("voice", wanted) {
+            return Err(format!("本地语音要更新到 0.5 才能{}（设置 › 能力）", if gguf { "导入音色" } else { "克隆音色" }));
+        }
+        let data = std::fs::read(path).map_err(|_| format!("打不开文件：{}", path.display()))?;
+        let (url, token) = ensure_running("voice", START_TIMEOUT)?;
+        let boundary = format!("Friday-{}", random_token());
+        let mut body: Vec<u8> = Vec::new();
+        let mut field = |key: &str, value: &[u8]| {
+            body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{key}\"\r\n\r\n").as_bytes());
+            body.extend_from_slice(value);
+            body.extend_from_slice(b"\r\n");
+        };
+        field("name", name.as_bytes());
+        if replace {
+            field("replace", b"true");
+        }
+        if !gguf && !text.trim().is_empty() {
+            field("text", text.trim().as_bytes());
+        }
+        let (file, kind) = if gguf { ("voice.gguf", "application/octet-stream") } else { ("audio.wav", "audio/wav") };
+        body.extend_from_slice(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{file}\"\r\nContent-Type: {kind}\r\n\r\n")
+                .as_bytes(),
+        );
+        body.extend_from_slice(&data);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let endpoint = format!("{url}{}", if gguf { "/v1/voice/import" } else { "/v1/voice/clone" });
+        let mut response = crate::http_agent()
+            .post(&endpoint)
+            .header("Content-Type", format!("multipart/form-data; boundary={boundary}"))
+            .header("Authorization", format!("Bearer {token}"))
+            .send(&body[..])
+            .map_err(|error| format!("本地语音没做成：{error}"))?;
+        let status = response.status().as_u16();
+        let mut reply = Vec::new();
+        let _ = response.body_mut().as_reader().read_to_end(&mut reply);
+        changed();
+        if !(200..300).contains(&status) {
+            return Err(voice_error(status, &reply));
+        }
+        let object: Value = serde_json::from_slice(&reply).unwrap_or_default();
+        Ok((object["voice"].as_str().unwrap_or(name).to_string(), object["transcript"].as_str().unwrap_or("").to_string()))
+    }
+
+    /// 删掉一个用户音色（内置的删不掉）
+    pub fn delete_voice(name: &str) -> Result<(), String> {
+        if name.is_empty() || name.contains('/') || name.contains('\\') || name.starts_with('.') {
+            return Err(format!("没有这个音色：{name}"));
+        }
+        let running = MANAGER
+            .lock()
+            .unwrap()
+            .running
+            .get("voice")
+            .is_some_and(|running| running.status == Status::Running && running.process.is_some());
+        if !running {
+            // 没在跑：直接删文件（下次拉起就没有它了）
+            let path = models_dir("voice").join("user-voices").join(format!("{name}.gguf"));
+            let result = if !path.exists() {
+                Err(format!("没有这个音色：{name}"))
+            } else {
+                std::fs::remove_file(&path).map_err(|_| format!("删不掉：{}", path.display()))
+            };
+            changed();
+            return result;
+        }
+        let (url, token) = ensure_running("voice", START_TIMEOUT)?;
+        let encoded: String =
+            name.bytes()
+                .map(|byte| {
+                    if byte.is_ascii_alphanumeric() || b"-_.~".contains(&byte) {
+                        (byte as char).to_string()
+                    } else {
+                        format!("%{byte:02X}")
+                    }
+                })
+                .collect();
+        let mut response = crate::http_agent()
+            .delete(&format!("{url}/v1/voice/{encoded}"))
+            .header("Authorization", format!("Bearer {token}"))
+            .call()
+            .map_err(|error| format!("本地语音没做成：{error}"))?;
+        let status = response.status().as_u16();
+        let mut reply = Vec::new();
+        let _ = response.body_mut().as_reader().read_to_end(&mut reply);
+        changed();
+        if (200..300).contains(&status) { Ok(()) } else { Err(voice_error(status, &reply)) }
+    }
+
+    /// 常驻的那份退出：停掉全部进程
+    pub fn stop_all() {
+        let processes: Vec<Arc<Mutex<Process>>> = MANAGER
+            .lock()
+            .unwrap()
+            .running
+            .values_mut()
+            .filter_map(|running| {
+                running.stopping = true;
+                running.process.take()
+            })
+            .collect();
+        for process in processes {
+            let mut process = process.lock().unwrap();
+            process.stdin = None;
+            std::thread::sleep(Duration::from_millis(200));
+            if matches!(process.child.try_wait(), Ok(None)) {
+                let _ = process.child.kill();
+            }
+            let _ = process.child.wait();
+        }
+    }
+
+    /// 有在下的、在跑的（常驻的那份闲着不退）
+    pub fn busy() -> bool {
+        MANAGER.lock().unwrap().running.values().any(|running| running.status == Status::Downloading || running.process.is_some())
+    }
+}
+
+// MARK: - 本地模型（模型库里的 GGUF，在 friday-llm 里跑）
+
+mod models {
+    //! 本地模型（照 Friday Qt 的 LocalModels / ModelLibrary / Downloader / ModelScopeDownloader / HubAdapters / GGUF，Friday 仓库的
+    //! qt/docs/POWERS.md §8、REMOTE.md §6「本地模型」）：模型库是魔搭 / Hugging Face 自己的缓存布局（`MODELSCOPE_CACHE`、`HF_HUB_CACHE`、
+    //! `HF_HOME` 可以换），和这台的 Friday 桌面端共用。`models.use` 没下的先下（friday-llm 没装的先装），下好了在 EDITH 的 config.json
+    //! 里建一个本地引擎（baseURL `power://llm`、model「组织/仓库:量化档」），给那段会话换上（没给会话 = 新对话默认）。
+    //! 大脑每段请求前问 `model.endpoint`（能力协议 §6.6）：拉起 friday-llm，回它的地址、令牌和 `x_friday`（模型文件、会话、优先级）。
+
+    use std::collections::{HashMap, HashSet};
+    use std::io::Read;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, LazyLock, Mutex};
+    use std::time::{Duration, SystemTime};
+
+    use regex::Regex;
+    use serde_json::{Map, Value, json};
+    use sha2::Digest;
+
+    use crate::powers;
+
+    // MARK: 目录
+
+    fn home() -> PathBuf {
+        crate::user_home()
+    }
+
+    fn env_path(name: &str) -> Option<PathBuf> {
+        std::env::var_os(name).filter(|value| !value.is_empty()).map(PathBuf::from)
+    }
+
+    fn modelscope_root() -> PathBuf {
+        env_path("MODELSCOPE_CACHE").map(|dir| dir.join("models")).unwrap_or_else(|| home().join(".cache/modelscope/hub/models"))
+    }
+
+    fn huggingface_root() -> PathBuf {
+        env_path("HF_HUB_CACHE")
+            .or_else(|| env_path("HF_HOME").map(|dir| dir.join("hub")))
+            .unwrap_or_else(|| home().join(".cache/huggingface/hub"))
+    }
+
+    /// 模型库的目录（魔搭、HF 两个缓存；friday-llm 的 --models）
+    pub fn roots() -> Vec<PathBuf> {
+        vec![modelscope_root(), huggingface_root()]
+    }
+
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Source {
+        ModelScope,
+        HuggingFace,
+    }
+
+    impl Source {
+        fn parse(text: &str) -> Option<Source> {
+            match text {
+                "modelScope" => Some(Source::ModelScope),
+                "huggingFace" => Some(Source::HuggingFace),
+                _ => None,
+            }
+        }
+
+        fn raw(self) -> &'static str {
+            match self {
+                Source::ModelScope => "modelScope",
+                Source::HuggingFace => "huggingFace",
+            }
+        }
+
+        fn other(self) -> Source {
+            match self {
+                Source::ModelScope => Source::HuggingFace,
+                Source::HuggingFace => Source::ModelScope,
+            }
+        }
+
+        /// 仓库在本机的目录（HF 是 refs/main 指着的快照，没有就第一个）
+        fn local_directory(self, repo: &str) -> PathBuf {
+            match self {
+                Source::ModelScope => modelscope_root().join(repo),
+                Source::HuggingFace => {
+                    let root = hf_repo_dir(repo);
+                    let snapshots = root.join("snapshots");
+                    let commit = std::fs::read_to_string(root.join("refs/main")).unwrap_or_default().trim().to_string();
+                    if !commit.is_empty() && snapshots.join(&commit).is_dir() {
+                        return snapshots.join(commit);
+                    }
+                    let mut entries: Vec<PathBuf> = std::fs::read_dir(&snapshots)
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                        .map(|entry| entry.path())
+                        .filter(|path| path.is_dir())
+                        .collect();
+                    entries.sort();
+                    entries.into_iter().next().unwrap_or_else(|| snapshots.join(if commit.is_empty() { "main".into() } else { commit }))
+                }
+            }
+        }
+    }
+
+    fn hf_repo_dir(repo: &str) -> PathBuf {
+        huggingface_root().join(format!("models--{}", repo.replace('/', "--")))
+    }
+
+    /// 默认的下载源（`~/.edith/friday/settings.json` 的 downloadSource，没有用魔搭）
+    fn default_source() -> Source {
+        crate::read_json_file(&crate::serve_dir().join("settings.json"))["downloadSource"]
+            .as_str()
+            .and_then(Source::parse)
+            .unwrap_or(Source::ModelScope)
+    }
+
+    // MARK: id
+
+    fn repo_of(id: &str) -> String {
+        id.split_once(':').map_or(id, |(repo, _)| repo).trim().to_string()
+    }
+
+    fn quant_of(id: &str) -> String {
+        id.split_once(':').map(|(_, quant)| quant.trim().to_uppercase()).unwrap_or_default()
+    }
+
+    fn make_id(repo: &str, quant: &str) -> String {
+        if quant.is_empty() { repo.to_string() } else { format!("{repo}:{quant}") }
+    }
+
+    fn safe_relative(path: &str) -> bool {
+        !path.is_empty()
+            && !path.starts_with('/')
+            && !path.chars().any(|c| c == '\\' || c == ':' || (c as u32) < 0x20 || c as u32 == 0x7f)
+            && path.split('/').all(|segment| !segment.is_empty() && segment != "." && segment != "..")
+    }
+
+    fn valid_repo(repo: &str) -> bool {
+        safe_relative(repo) && repo.matches('/').count() == 1 && !repo.contains(' ')
+    }
+
+    // MARK: GGUF 文件名（照 llama.cpp common/download.cpp）
+
+    #[derive(Clone, Debug)]
+    struct RemoteFile {
+        path: String,
+        size: u64,
+        sha256: String,
+    }
+
+    struct SplitInfo {
+        prefix: String,
+        tag: String,
+        index: u32,
+        count: u32,
+    }
+
+    static SPLIT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^(.+)-([0-9]{5})-of-([0-9]{5})$").unwrap());
+    static TAG: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)[-.]([A-Z0-9_]+)$").unwrap());
+    static QUANT: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^(?:I?Q[1-8](?:_[0-9A-Z]+)*|TQ[1-3]_[0-9]|F(?:P)?(?:16|32|64)|BF16|FP8|MXFP4(?:_MOE)?|NVFP4)$").unwrap()
+    });
+
+    fn file_name_of(path: &str) -> &str {
+        path.rsplit('/').next().unwrap_or(path)
+    }
+
+    fn is_gguf(path: &str) -> bool {
+        path.to_lowercase().ends_with(".gguf")
+    }
+
+    fn split_info(path: &str) -> SplitInfo {
+        let mut info = SplitInfo { prefix: String::new(), tag: String::new(), index: 1, count: 1 };
+        if !is_gguf(path) {
+            return info;
+        }
+        info.prefix = path[..path.len() - 5].to_string();
+        if let Some(split) = SPLIT.captures(&info.prefix.clone()) {
+            info.index = split[2].parse().unwrap_or(1);
+            info.count = split[3].parse().unwrap_or(1);
+            info.prefix = split[1].to_string();
+        }
+        if let Some(tag) = TAG.captures(&info.prefix) {
+            info.tag = tag[1].to_uppercase();
+        }
+        info
+    }
+
+    fn quant_from_file(path: &str) -> String {
+        let tag = split_info(file_name_of(path)).tag;
+        if QUANT.is_match(&tag) { tag } else { String::new() }
+    }
+
+    fn bits_of_tag(tag: &str) -> i64 {
+        let digits: String = tag.chars().skip_while(|c| !c.is_ascii_digit()).take_while(char::is_ascii_digit).collect();
+        digits.parse().unwrap_or(0)
+    }
+
+    fn is_mmproj(path: &str) -> bool {
+        file_name_of(path).to_lowercase().contains("mmproj")
+    }
+
+    fn is_model_file(path: &str) -> bool {
+        if !is_gguf(path) {
+            return false;
+        }
+        let name = file_name_of(path).to_lowercase();
+        !["mmproj", "imatrix", "mtp-", "eagle3-", "dflash-", "dspark-"].iter().any(|keyword| name.contains(keyword))
+    }
+
+    fn is_first_piece(path: &str) -> bool {
+        let info = split_info(path);
+        !(info.count > 1 && info.index != 1)
+    }
+
+    /// 同 prefix、同分片数的全部分片（按序号）
+    fn split_files(files: &[RemoteFile], file: &RemoteFile) -> Vec<RemoteFile> {
+        let split = split_info(&file.path);
+        if split.count <= 1 {
+            return vec![file.clone()];
+        }
+        let mut found: Vec<(u32, RemoteFile)> = files
+            .iter()
+            .filter_map(|candidate| {
+                let info = split_info(&candidate.path);
+                (info.count == split.count && info.prefix == split.prefix).then(|| (info.index, candidate.clone()))
+            })
+            .collect();
+        found.sort_by_key(|(index, _)| *index);
+        found.dedup_by_key(|(index, _)| *index);
+        found.into_iter().map(|(_, file)| file).collect()
+    }
+
+    fn mmproj_rank(path: &str) -> i32 {
+        match split_info(path).tag.as_str() {
+            "F16" | "FP16" => 0,
+            "BF16" => 1,
+            "F32" | "FP32" => 2,
+            _ => 3,
+        }
+    }
+
+    /// 视觉投影：在主模型目录或它的上级、位数最接近的（同 llama.cpp 的 find_best_mmproj）
+    fn best_mmproj(files: &[RemoteFile], model_path: &str) -> Option<RemoteFile> {
+        let model_parts: Vec<&str> = model_path.split('/').collect();
+        let model_dirs = model_parts.len() - 1;
+        let model_bits = bits_of_tag(&split_info(model_path).tag);
+        let mut best: Option<(RemoteFile, usize, i64, i32)> = None;
+        for file in files.iter().filter(|file| is_gguf(&file.path) && is_mmproj(&file.path)) {
+            let parts: Vec<&str> = file.path.split('/').collect();
+            let dirs = parts.len() - 1;
+            if dirs > model_dirs || (0..dirs).any(|index| parts[index] != model_parts[index]) {
+                continue;
+            }
+            let diff = (bits_of_tag(&split_info(&file.path).tag) - model_bits).abs();
+            let rank = mmproj_rank(&file.path);
+            let better = match &best {
+                None => true,
+                Some((_, best_dirs, best_diff, best_rank)) => {
+                    dirs > *best_dirs
+                        || (dirs == *best_dirs && diff < *best_diff)
+                        || (dirs == *best_dirs && diff == *best_diff && rank < *best_rank)
+                }
+            };
+            if better {
+                best = Some((file.clone(), dirs, diff, rank));
+            }
+        }
+        best.map(|(file, ..)| file)
+    }
+
+    #[derive(Default, Clone)]
+    struct Selection {
+        model_file: String,
+        model_files: Vec<String>,
+        model_bytes: u64,
+        quant: String,
+        mmproj_file: String,
+        mmproj_bytes: u64,
+    }
+
+    fn select_file(files: &[RemoteFile], model_path: &str) -> Option<Selection> {
+        let file = files.iter().find(|file| file.path == model_path)?;
+        let group = split_files(files, file);
+        let model_file = group.first().map_or(file.path.clone(), |first| first.path.clone());
+        let mut selection = Selection {
+            quant: quant_from_file(&model_file),
+            model_files: group.iter().map(|file| file.path.clone()).collect(),
+            model_bytes: group.iter().map(|file| file.size).sum(),
+            model_file,
+            ..Default::default()
+        };
+        if let Some(mmproj) = best_mmproj(files, &selection.model_file) {
+            selection.mmproj_file = mmproj.path;
+            selection.mmproj_bytes = mmproj.size;
+        }
+        Some(selection)
+    }
+
+    /// 按量化档挑主模型（不给时 Q4_K_M → Q4_0 → Q5_K_M → Q8_0，都没有挑最小的）
+    fn select(files: &[RemoteFile], quant: &str) -> Option<Selection> {
+        let quant = quant.trim().to_uppercase();
+        let candidates: Vec<&RemoteFile> = files.iter().filter(|file| is_model_file(&file.path) && is_first_piece(&file.path)).collect();
+        let find = |tag: &str| -> Option<&RemoteFile> {
+            candidates.iter().copied().find(|file| split_info(&file.path).tag == tag).or_else(|| {
+                let pattern = Regex::new(&format!("(?i){}[.-]", regex::escape(tag))).ok()?;
+                candidates.iter().copied().find(|file| pattern.is_match(&file.path))
+            })
+        };
+        let chosen = if !quant.is_empty() {
+            find(&quant)
+        } else {
+            ["Q4_K_M", "Q4_0", "Q5_K_M", "Q8_0"].iter().find_map(|tag| find(tag)).or_else(|| {
+                candidates.iter().copied().min_by_key(|file| split_files(files, file).iter().map(|file| file.size).sum::<u64>())
+            })
+        }?;
+        select_file(files, &chosen.path)
+    }
+
+    /// GGUF 头里的 general.architecture（读到为止）
+    fn architecture(path: &Path) -> Option<String> {
+        let mut file = std::io::BufReader::with_capacity(1 << 20, std::fs::File::open(path).ok()?);
+        let mut read = |length: usize| -> Option<Vec<u8>> {
+            let mut buffer = vec![0u8; length];
+            file.read_exact(&mut buffer).ok()?;
+            Some(buffer)
+        };
+        let u32_of = |bytes: Vec<u8>| u32::from_le_bytes(bytes.try_into().unwrap_or([0; 4]));
+        let u64_of = |bytes: Vec<u8>| u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8]));
+        if read(4)? != b"GGUF" {
+            return None;
+        }
+        let version = u32_of(read(4)?);
+        if version < 2 {
+            return None;
+        }
+        let _tensors = u64_of(read(8)?);
+        let count = u64_of(read(8)?).min(100_000);
+        fn scalar(kind: u32) -> usize {
+            match kind {
+                0 | 1 | 7 => 1,
+                2 | 3 => 2,
+                4..=6 => 4,
+                10..=12 => 8,
+                _ => 0,
+            }
+        }
+        for _ in 0..count {
+            let key_length = u64_of(read(8)?) as usize;
+            if key_length > 4096 {
+                return None;
+            }
+            let key = String::from_utf8_lossy(&read(key_length)?).into_owned();
+            let kind = u32_of(read(4)?);
+            match kind {
+                8 => {
+                    let length = u64_of(read(8)?) as usize;
+                    if length > 1 << 30 {
+                        return None;
+                    }
+                    let value = read(length)?;
+                    if key == "general.architecture" {
+                        return Some(String::from_utf8_lossy(&value).into_owned());
+                    }
+                }
+                9 => {
+                    let element = u32_of(read(4)?);
+                    let items = u64_of(read(8)?);
+                    if element == 8 {
+                        for _ in 0..items {
+                            let length = u64_of(read(8)?) as usize;
+                            read(length)?;
+                        }
+                    } else if scalar(element) > 0 {
+                        read(scalar(element) * items as usize)?;
+                    } else {
+                        return None;
+                    }
+                }
+                other if scalar(other) > 0 => {
+                    read(scalar(other))?;
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    // MARK: 模型库（本机的）
+
+    #[derive(Clone, PartialEq)]
+    struct LocalModel {
+        id: String,
+        source: Source,
+        directory: PathBuf,
+        files: Vec<PathBuf>,
+        model_file: PathBuf,
+        mmproj_file: Option<PathBuf>,
+        size_bytes: u64,
+        model_type: String,
+        modified: SystemTime,
+    }
+
+    impl LocalModel {
+        fn name(&self) -> String {
+            static SHARD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)-[0-9]{5}-of-[0-9]{5}$").unwrap());
+            let file = self.model_file.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+            let base = file.strip_suffix(".gguf").or_else(|| file.strip_suffix(".GGUF")).unwrap_or(&file);
+            let base = SHARD.replace(base, "").into_owned();
+            if base.is_empty() { self.id.rsplit('/').next().unwrap_or(&self.id).to_string() } else { base }
+        }
+
+        /// LocalModelInfo（Friday 的 RemoteProtocol::localModelToJson）
+        fn to_json(&self, kind: &str) -> Value {
+            let modified: chrono::DateTime<chrono::Utc> = self.modified.into();
+            json!({
+                "id": self.id,
+                "source": self.source.raw(),
+                "name": self.name(),
+                "quant": quant_of(&self.id),
+                "sizeBytes": self.size_bytes,
+                "modelType": self.model_type,
+                "hasVision": self.mmproj_file.is_some(),
+                "kind": kind,
+                "modelFile": self.model_file.to_string_lossy(),
+                "mmprojFile": self.mmproj_file.as_ref().map(|path| path.to_string_lossy().into_owned()),
+                "directory": self.directory.to_string_lossy(),
+                "modified": modified.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            })
+        }
+    }
+
+    /// 目录里的文件（相对路径；跳过点开头的、正在下的 .part / 没校验的 .incomplete）
+    fn scan_directory(directory: &Path) -> Vec<RemoteFile> {
+        let mut result = Vec::new();
+        let mut stack = vec![directory.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') {
+                    continue;
+                }
+                // HF 快照里是指向 blobs 的符号链接：按目标算
+                let Ok(meta) = std::fs::metadata(&path) else { continue };
+                if meta.is_dir() {
+                    stack.push(path);
+                } else if !name.ends_with(".part") && !name.ends_with(".incomplete") {
+                    let relative =
+                        path.strip_prefix(directory).map(|relative| relative.to_string_lossy().replace('\\', "/")).unwrap_or_default();
+                    result.push(RemoteFile { path: relative, size: meta.len(), sha256: String::new() });
+                }
+            }
+        }
+        result.sort_by(|a, b| a.path.cmp(&b.path));
+        result
+    }
+
+    /// 还在下的（有 .part / .incomplete 的）
+    fn partial_files(directory: &Path) -> HashSet<String> {
+        let mut result = HashSet::new();
+        let mut stack = vec![directory.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let relative =
+                    path.strip_prefix(directory).map(|relative| relative.to_string_lossy().replace('\\', "/")).unwrap_or_default();
+                for suffix in [".incomplete.part", ".part", ".incomplete"] {
+                    if let Some(stripped) = relative.strip_suffix(suffix) {
+                        result.insert(stripped.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    /// 一个仓库目录里的本地模型：每个量化档（分片要齐全、没有在下的）一个
+    fn inspect(repo: &str, source: Source, weights: &Path, remove_at: &Path) -> Vec<LocalModel> {
+        let files = scan_directory(weights);
+        if files.is_empty() {
+            return Vec::new();
+        }
+        let partial = partial_files(weights);
+        let models: Vec<&RemoteFile> = files.iter().filter(|file| is_model_file(&file.path) && is_first_piece(&file.path)).collect();
+        let mmprojs: Vec<PathBuf> =
+            files.iter().filter(|file| is_gguf(&file.path) && is_mmproj(&file.path)).map(|file| weights.join(&file.path)).collect();
+        let mut seen = HashSet::new();
+        let mut result = Vec::new();
+        for candidate in &models {
+            let Some(selection) = select_file(&files, &candidate.path) else { continue };
+            if selection.model_files.len() as u32 != split_info(&selection.model_file).count.max(1) {
+                continue; // 分片不齐
+            }
+            if selection.model_files.iter().any(|path| partial.contains(path)) {
+                continue; // 还在下载
+            }
+            let id = make_id(repo, &selection.quant);
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            let mut model_files: Vec<PathBuf> = selection.model_files.iter().map(|path| weights.join(path)).collect();
+            let mmproj = (!selection.mmproj_file.is_empty()).then(|| weights.join(&selection.mmproj_file));
+            // 仓库里唯一的量化档：删除时连视觉投影一起删
+            if models.len() == 1 {
+                model_files.extend(mmprojs.iter().cloned());
+            }
+            let model_file = weights.join(&selection.model_file);
+            let modified = model_files
+                .iter()
+                .chain(mmproj.iter())
+                .filter_map(|path| std::fs::metadata(path).and_then(|meta| meta.modified()).ok())
+                .max()
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            result.push(LocalModel {
+                id,
+                source,
+                directory: remove_at.to_path_buf(),
+                model_type: architecture(&model_file).unwrap_or_default(),
+                model_file,
+                mmproj_file: mmproj,
+                files: model_files,
+                size_bytes: selection.model_bytes + selection.mmproj_bytes,
+                modified,
+            });
+        }
+        result
+    }
+
+    fn scan_local() -> Vec<LocalModel> {
+        let mut result = Vec::new();
+        // 魔搭：<根>/<组织>/<仓库>
+        let root = modelscope_root();
+        for org in sorted_dirs(&root) {
+            for repo in sorted_dirs(&root.join(&org)) {
+                let dir = root.join(&org).join(&repo);
+                result.extend(inspect(&format!("{org}/{repo}"), Source::ModelScope, &dir, &dir));
+            }
+        }
+        // Hugging Face：<根>/models--组织--仓库/snapshots/<提交>
+        for entry in sorted_dirs(&huggingface_root()) {
+            let Some(rest) = entry.strip_prefix("models--") else { continue };
+            let Some((org, repo)) = rest.split_once("--") else { continue };
+            let id = format!("{org}/{repo}");
+            let snapshot = Source::HuggingFace.local_directory(&id);
+            if snapshot.is_dir() {
+                result.extend(inspect(&id, Source::HuggingFace, &snapshot, &hf_repo_dir(&id)));
+            }
+        }
+        result.sort_by_key(|model| std::cmp::Reverse(model.modified));
+        result
+    }
+
+    fn sorted_dirs(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| entry.path().is_dir())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| !name.starts_with('.'))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// id 带量化档时要完全一致；不带时同一个仓库的任一量化档都算
+    fn id_matches(model: &LocalModel, id: &str) -> bool {
+        if !repo_of(&model.id).eq_ignore_ascii_case(&repo_of(id)) {
+            return false;
+        }
+        let quant = quant_of(id);
+        quant.is_empty() || quant_of(&model.id) == quant
+    }
+
+    /// 本机的这一份（魔搭优先）
+    fn local_copy(id: &str) -> Option<LocalModel> {
+        let repo = repo_of(id);
+        if !valid_repo(&repo) {
+            return None;
+        }
+        let ms = modelscope_root().join(&repo);
+        if let Some(found) = inspect(&repo, Source::ModelScope, &ms, &ms).into_iter().find(|model| id_matches(model, id)) {
+            return Some(found);
+        }
+        let snapshot = Source::HuggingFace.local_directory(&repo);
+        if !snapshot.is_dir() {
+            return None;
+        }
+        inspect(&repo, Source::HuggingFace, &snapshot, &hf_repo_dir(&repo)).into_iter().find(|model| id_matches(model, id))
+    }
+
+    // MARK: 下载（魔搭 / Hugging Face 的接口）
+
+    fn hf_endpoint() -> String {
+        std::env::var("HF_ENDPOINT")
+            .ok()
+            .map(|value| value.trim().trim_end_matches('/').to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "https://huggingface.co".into())
+    }
+
+    fn hf_token() -> String {
+        std::env::var("HF_TOKEN").unwrap_or_default().trim().to_string()
+    }
+
+    fn get_json(url: &str, bearer: &str) -> Result<(u16, Value, String), String> {
+        let mut request = crate::http_agent().get(url).header("User-Agent", format!("Friday/{}", crate::VERSION));
+        if !bearer.is_empty() {
+            request = request.header("Authorization", format!("Bearer {bearer}"));
+        }
+        let mut response = request.call().map_err(|error| error.to_string())?;
+        let status = response.status().as_u16();
+        let link = response.headers().get("Link").and_then(|value| value.to_str().ok()).unwrap_or("").to_string();
+        let mut body = Vec::new();
+        response.body_mut().as_reader().read_to_end(&mut body).map_err(|error| error.to_string())?;
+        Ok((status, serde_json::from_slice(&body).unwrap_or(Value::Null), link))
+    }
+
+    /// 仓库里的文件（魔搭的 master 分支、HF 的 main）
+    fn list_files(source: Source, repo: &str) -> Result<Vec<RemoteFile>, String> {
+        if !valid_repo(repo) {
+            return Err(format!("模型 id 不对：{repo}"));
+        }
+        let mut result = Vec::new();
+        match source {
+            Source::ModelScope => {
+                let url = format!("https://modelscope.cn/api/v1/models/{repo}/repo/files?Revision=master&Recursive=true");
+                let (status, body, _) = get_json(&url, "")?;
+                let files = body["Data"]["Files"].as_array().cloned();
+                let Some(files) = files.filter(|_| status == 200) else {
+                    let reason = body["Message"]
+                        .as_str()
+                        .filter(|message| !message.is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("HTTP {status}"));
+                    return Err(format!("魔搭上找不到模型 {repo}（{reason}）"));
+                };
+                for file in files.iter().filter(|file| file["Type"] == "blob") {
+                    let remote = RemoteFile {
+                        path: file["Path"].as_str().unwrap_or("").to_string(),
+                        size: file["Size"].as_u64().unwrap_or(0),
+                        sha256: file["Sha256"].as_str().unwrap_or("").to_lowercase(),
+                    };
+                    if safe_relative(&remote.path) {
+                        result.push(remote);
+                    }
+                }
+            }
+            Source::HuggingFace => {
+                static NEXT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"<([^>]+)>;\s*rel="next""#).unwrap());
+                let mut url = format!("{}/api/models/{repo}/tree/main?recursive=true", hf_endpoint());
+                for _ in 0..100 {
+                    let (status, body, link) = get_json(&url, &hf_token())?;
+                    if status != 200 {
+                        let detail = body["error"].as_str().map(str::to_string).unwrap_or_else(|| format!("HTTP {status}"));
+                        return Err(format!("Hugging Face 上找不到模型 {repo}（{detail}）"));
+                    }
+                    for item in body.as_array().into_iter().flatten().filter(|item| item["type"] == "file") {
+                        let mut file = RemoteFile {
+                            path: item["path"].as_str().unwrap_or("").to_string(),
+                            size: item["size"].as_u64().unwrap_or(0),
+                            sha256: String::new(),
+                        };
+                        if item["lfs"].is_object() {
+                            file.sha256 = item["lfs"]["oid"].as_str().unwrap_or("").to_lowercase();
+                            file.size = item["lfs"]["size"].as_u64().unwrap_or(file.size);
+                        }
+                        if safe_relative(&file.path) {
+                            result.push(file);
+                        }
+                    }
+                    match NEXT.captures(&link) {
+                        Some(next) => url = next[1].to_string(),
+                        None => break,
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// 下仓库里的这几个文件（已经有、大小对的跳过；有 SHA-256 的先下到 .incomplete、校验过再改名）。progress：这几个文件已下的字节
+    fn download(source: Source, repo: &str, wanted: &[String], cancel: &AtomicBool, progress: &mut dyn FnMut(u64)) -> Result<(), String> {
+        let files = list_files(source, repo)?;
+        let selected: Vec<RemoteFile> =
+            files.iter().filter(|file| wanted.iter().any(|path| path.eq_ignore_ascii_case(&file.path))).cloned().collect();
+        if selected.is_empty() {
+            return Err(format!("仓库 {repo} 里没有要下的文件"));
+        }
+        let directory = match source {
+            Source::ModelScope => modelscope_root().join(repo),
+            Source::HuggingFace => {
+                // 快照目录：提交 sha 不好拿时沿用本地的 refs/main 或 main（Friday 的 HubDownloader 用第一跳的 X-Repo-Commit）
+                let root = hf_repo_dir(repo);
+                let commit = std::fs::read_to_string(root.join("refs/main"))
+                    .ok()
+                    .map(|text| text.trim().to_string())
+                    .filter(|commit| safe_relative(commit) && !commit.contains('/'))
+                    .unwrap_or_else(|| "main".into());
+                let _ = std::fs::create_dir_all(root.join("refs"));
+                let _ = std::fs::write(root.join("refs/main"), &commit);
+                root.join("snapshots").join(commit)
+            }
+        };
+        let mut completed = 0u64;
+        for file in &selected {
+            let destination = directory.join(&file.path);
+            if std::fs::metadata(&destination).is_ok_and(|meta| meta.len() == file.size) {
+                completed += file.size;
+                progress(completed);
+                continue;
+            }
+            let url = match source {
+                Source::ModelScope => format!("https://modelscope.cn/models/{repo}/resolve/master/{}", file.path),
+                Source::HuggingFace => format!("{}/{repo}/resolve/main/{}", hf_endpoint(), file.path),
+            };
+            let base = completed;
+            let staging =
+                if file.sha256.is_empty() { destination.clone() } else { PathBuf::from(format!("{}.incomplete", destination.display())) };
+            powers::fetch(&url, &staging, cancel, &mut |written| progress(base + written))?;
+            if !file.sha256.is_empty() {
+                let actual = powers::sha256_of(&staging, cancel)?;
+                if !actual.eq_ignore_ascii_case(&file.sha256) {
+                    let _ = std::fs::remove_file(&staging);
+                    return Err(format!("{} 下载后校验失败（SHA-256 不一致），已删除，请重试", file_name_of(&file.path)));
+                }
+                let _ = std::fs::remove_file(&destination);
+                std::fs::rename(&staging, &destination).map_err(|error| format!("无法把 {} 改名：{error}", staging.display()))?;
+            }
+            completed = base + file.size;
+            progress(completed);
+        }
+        Ok(())
+    }
+
+    // MARK: 生图 / 生视频的模型家族（friday-diffusion 清单的 families）
+
+    #[derive(Clone)]
+    struct Component {
+        repo: String,
+        file: String,
+        size: u64,
+    }
+
+    #[derive(Clone)]
+    struct Family {
+        kind: String,
+        patterns: Vec<Regex>,
+        recommended_repo: String,
+        recommended_file: String,
+        components: Vec<Component>,
+    }
+
+    fn families() -> Vec<Family> {
+        let Some(spec) = powers::manifest("diffusion") else { return Vec::new() };
+        spec.families
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|item| {
+                let kind = item["kind"].as_str().unwrap_or("").to_string();
+                let patterns: Vec<Regex> = item["match"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                    .filter_map(|text| Regex::new(&format!("(?i){text}")).ok())
+                    .collect();
+                let components: Option<Vec<Component>> = item["components"]
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .map(|(_, component)| {
+                        let component = Component {
+                            repo: component["repo"].as_str().unwrap_or("").to_string(),
+                            file: component["file"].as_str().unwrap_or("").to_string(),
+                            size: component["size"].as_f64().unwrap_or(0.0) as u64,
+                        };
+                        (!component.repo.is_empty() && safe_relative(&component.file)).then_some(component)
+                    })
+                    .collect();
+                let family = Family {
+                    recommended_repo: item["recommended"]["repo"].as_str().unwrap_or("").to_string(),
+                    recommended_file: item["recommended"]["file"].as_str().unwrap_or("").to_string(),
+                    components: components?,
+                    patterns,
+                    kind,
+                };
+                (item["id"].is_string() && matches!(family.kind.as_str(), "image" | "video") && !family.patterns.is_empty())
+                    .then_some(family)
+            })
+            .collect()
+    }
+
+    fn family_for(id: &str) -> Option<Family> {
+        let repo = repo_of(id);
+        families().into_iter().find(|family| family.patterns.iter().any(|pattern| pattern.is_match(&repo) || pattern.is_match(id)))
+    }
+
+    /// 认不出家族的生图 / 生视频仓库、配套文件、向量模型：不能拿来对话
+    fn looks_non_chat(name: &str) -> bool {
+        static DIFFUSION: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"comfy|stable[-_]?diffusion|sdxl|\bsd[-_]?3|flux|wan[-_]?2|ltx[-_]?(video|2)|hunyuan[-_]?video|z[-_]?image|qwen[-_]?image|hidream|chroma|cogvideo|mochi|minimax[-_]?h|kolors|pixart|lumina|umt5|t5[-_]?xxl|t5[-_]?encoder|vae").unwrap()
+        });
+        let lower = name.to_lowercase();
+        DIFFUSION.is_match(&lower) || ["embedding", "rerank", "-embed"].iter().any(|marker| lower.contains(marker))
+    }
+
+    fn kind_of(id: &str, task: &str) -> String {
+        if let Some(family) = family_for(id) {
+            return family.kind;
+        }
+        if looks_non_chat(&repo_of(id)) {
+            return "other".into();
+        }
+        if task == "image-text-to-text" || task == "multimodal" { "multimodal".into() } else { "text".into() }
+    }
+
+    /// 配套文件在本机哪里（两个缓存都看）
+    fn component_path(component: &Component) -> Option<PathBuf> {
+        [Source::ModelScope, Source::HuggingFace]
+            .into_iter()
+            .map(|source| source.local_directory(&component.repo).join(&component.file))
+            .find(|path| std::fs::metadata(path).is_ok_and(|meta| meta.is_file() && (component.size == 0 || meta.len() == component.size)))
+    }
+
+    fn is_complete(id: &str, kind: &str) -> bool {
+        if local_copy(id).is_none() {
+            return false;
+        }
+        if kind != "image" && kind != "video" {
+            return true;
+        }
+        family_for(id).is_some_and(|family| family.components.iter().all(|component| component_path(component).is_some()))
+    }
+
+    // MARK: 状态
+
+    /// 下好了要做的：给会话换上（use），失败了告诉发起的网关（modelsFailed）
+    struct Waiter {
+        client: String,
+        activate: bool,
+        conversation: Option<String>,
+    }
+
+    struct Task {
+        kind: String,
+        source: Source,
+        running: bool,
+        error: String,
+        progress: f64,
+        completed: u64,
+        total: u64,
+        cancel: Arc<AtomicBool>,
+        waiters: Vec<Waiter>,
+        retry_waiters: Vec<Waiter>,
+    }
+
+    #[derive(Default)]
+    struct Models {
+        tasks: HashMap<String, Task>,
+        order: Vec<String>,
+        /// 在等下完的大模型的会话 → 模型 id
+        waiting: HashMap<String, String>,
+        local: Vec<LocalModel>,
+        scanned: bool,
+        chat_available: Option<bool>,
+    }
+
+    static MODELS: LazyLock<Mutex<Models>> = LazyLock::new(|| Mutex::new(Models::default()));
+    static DIRTY: AtomicBool = AtomicBool::new(false);
+
+    fn changed() {
+        DIRTY.store(true, Ordering::Relaxed);
+    }
+
+    /// 起来时：后台扫一遍模型库，80 毫秒合并一次推 models
+    pub fn start() {
+        std::thread::spawn(|| {
+            rescan();
+            loop {
+                std::thread::sleep(Duration::from_millis(80));
+                if DIRTY.swap(false, Ordering::Relaxed) {
+                    crate::notify_all_clients("models", state());
+                }
+            }
+        });
+    }
+
+    fn rescan() {
+        let found = scan_local();
+        let mut models = MODELS.lock().unwrap();
+        models.scanned = true;
+        if models.local != found {
+            models.local = found;
+            changed();
+        }
+    }
+
+    fn chat_available() -> bool {
+        powers::is_installed("llm") && powers::is_enabled("llm")
+    }
+
+    /// 本地能力变了：本地大模型能不能用变了时，本地引擎跟着开 / 关（config.json 里 power://llm 的 disabled）
+    pub fn powers_changed() {
+        let available = chat_available();
+        let previous = MODELS.lock().unwrap().chat_available.replace(available);
+        if previous == Some(available) {
+            return;
+        }
+        let path = crate::config_path();
+        let mut config = crate::read_json_file(&path);
+        let mut touched = false;
+        for engine in config["engines"].as_array_mut().into_iter().flatten() {
+            if engine["baseURL"].as_str().is_some_and(|base| base.starts_with("power://llm"))
+                && engine["disabled"].as_bool().unwrap_or(false) == available
+            {
+                engine["disabled"] = json!(!available);
+                touched = true;
+            }
+        }
+        if touched && crate::write_json_file(&path, &config).is_ok() {
+            crate::notify_all_clients("engines.changed", json!({}));
+        }
+        changed();
+    }
+
+    fn display_name(id: &str) -> String {
+        let repo = repo_of(id);
+        let name = repo.rsplit('/').next().unwrap_or(&repo);
+        let name = if name.to_uppercase().ends_with("-GGUF") { &name[..name.len() - 5] } else { name };
+        let quant = quant_of(id);
+        if quant.is_empty() { name.to_string() } else { format!("{name} {quant}") }
+    }
+
+    fn engine_id_for(id: &str) -> String {
+        let hash: String = sha2::Sha256::digest(id.to_lowercase().as_bytes()).iter().take(6).map(|byte| format!("{byte:02x}")).collect();
+        format!("local-{hash}")
+    }
+
+    /// 下好了的大模型：在 config.json 里建（或更新）它的本地引擎，回引擎 id；生图 / 生视频记成这台本地生图 / 生视频用的
+    fn activate(id: &str, kind: &str) -> String {
+        let local = local_copy(id);
+        let model_id = local.as_ref().map_or(id.to_string(), |local| local.id.clone());
+        if kind == "image" || kind == "video" {
+            let path = crate::serve_dir().join("settings.json");
+            let mut settings = crate::read_json_file(&path);
+            if !settings.is_object() {
+                settings = json!({});
+            }
+            settings[if kind == "image" { "localImageModel" } else { "localVideoModel" }] = json!(model_id);
+            let _ = crate::write_json_file(&path, &settings);
+            return String::new();
+        }
+        let engine_id = engine_id_for(&model_id);
+        let engine = json!({
+            "id": engine_id,
+            "title": format!("本地 · {}", display_name(&model_id)),
+            "baseURL": "power://llm",
+            "apiKeySecret": "none",
+            "model": model_id,
+            "supportsVision": local.as_ref().is_some_and(|local| local.mmproj_file.is_some()),
+            "supportsTools": true,
+            // friday-llm 认顶层的 enable_thinking，模板支持思考时生效
+            "sendsEnableThinking": true,
+            "thinking": "toggle",
+            "maxConcurrency": 4,
+            "disabled": !chat_available(),
+        });
+        let path = crate::config_path();
+        let mut config = crate::read_json_file(&path);
+        if !config.is_object() {
+            config = json!({});
+        }
+        if !config["engines"].is_array() {
+            config["engines"] = json!([]);
+        }
+        let engines = config["engines"].as_array_mut().unwrap();
+        match engines.iter_mut().find(|item| item["id"] == json!(engine_id)) {
+            Some(existing) => *existing = engine,
+            None => engines.push(engine),
+        }
+        let _ = crate::write_json_file(&path, &config);
+        engine_id
+    }
+
+    /// 给会话换上（没给会话 = 新对话默认）：会话上选的记在 friday.json（同网关的 runner.setEngine），网关们推给客户端
+    fn apply(engine_id: &str, conversation: Option<&str>) {
+        match conversation {
+            Some(conversation) => crate::META.set_setting(conversation, "engineID", engine_id),
+            None => {
+                let path = crate::config_path();
+                let mut config = crate::read_json_file(&path);
+                if config.is_object() {
+                    config["defaultEngine"] = json!(engine_id);
+                    let _ = crate::write_json_file(&path, &config);
+                }
+            }
+        }
+        crate::notify_all_clients("engines.changed", json!({ "conversationID": conversation }));
+    }
+
+    fn ensure_power(id: &str) {
+        if !powers::is_installed(id) {
+            powers::install(id, "");
+        } else if !powers::is_enabled(id) {
+            powers::set_enabled(id, true);
+        }
+    }
+
+    /// 开始下（在下的只加等的人）
+    fn download_model(id: &str, kind: &str, source: Source, waiter: Option<Waiter>) {
+        let start = {
+            let mut models = MODELS.lock().unwrap();
+            let added = !models.tasks.contains_key(id);
+            if added {
+                models.order.push(id.to_string());
+            }
+            let task = models.tasks.entry(id.to_string()).or_insert_with(|| Task {
+                kind: kind.to_string(),
+                source,
+                running: false,
+                error: String::new(),
+                progress: 0.0,
+                completed: 0,
+                total: 0,
+                cancel: Arc::new(AtomicBool::new(false)),
+                waiters: Vec::new(),
+                retry_waiters: Vec::new(),
+            });
+            if let Some(waiter) = waiter {
+                task.waiters.push(waiter);
+            }
+            if task.running {
+                false
+            } else {
+                task.kind = kind.to_string();
+                task.source = source;
+                task.running = true;
+                task.error.clear();
+                task.progress = 0.0;
+                task.completed = 0;
+                task.total = 0;
+                task.cancel = Arc::new(AtomicBool::new(false));
+                task.retry_waiters.clear();
+                true
+            }
+        };
+        changed();
+        if !start {
+            return;
+        }
+        let (id, kind) = (id.to_string(), kind.to_string());
+        let cancel = MODELS.lock().unwrap().tasks[&id].cancel.clone();
+        std::thread::spawn(move || {
+            let outcome = download_job(&id, &kind, source, &cancel);
+            finish(&id, outcome);
+        });
+    }
+
+    fn download_job(id: &str, kind: &str, source: Source, cancel: &AtomicBool) -> Result<(), String> {
+        let diffusion = kind == "image" || kind == "video";
+        let family = if diffusion {
+            Some(family_for(id).ok_or("认不出这是哪一类生图 / 生视频模型（本地生图 / 生视频还不支持它）")?)
+        } else {
+            None
+        };
+        let repo = repo_of(id);
+        let quant = quant_of(id);
+        let files = list_files(source, &repo)?;
+        let mut selection = None;
+        if let Some(family) = &family
+            && quant.is_empty()
+            && repo.eq_ignore_ascii_case(&family.recommended_repo)
+            && !family.recommended_file.is_empty()
+        {
+            selection = select_file(&files, &family.recommended_file);
+        }
+        let selection = selection.or_else(|| select(&files, &quant)).ok_or_else(|| {
+            if quant.is_empty() {
+                format!("仓库 {repo} 里没有 GGUF 模型文件")
+            } else {
+                format!("仓库 {repo} 里没有 {quant} 这一档")
+            }
+        })?;
+        let mut wanted = selection.model_files.clone();
+        // 生图 / 生视频模型的仓库里有 mmproj 也不要
+        if family.is_none() && !selection.mmproj_file.is_empty() {
+            wanted.push(selection.mmproj_file.clone());
+        }
+        let missing: Vec<Component> = family
+            .as_ref()
+            .map(|family| family.components.iter().filter(|component| component_path(component).is_none()).cloned().collect())
+            .unwrap_or_default();
+        let main_bytes = selection.model_bytes + if family.is_none() { selection.mmproj_bytes } else { 0 };
+        let total = main_bytes + missing.iter().map(|component| component.size).sum::<u64>();
+        let mut last = std::time::Instant::now() - Duration::from_secs(1);
+        let mut report = |done: u64| {
+            if last.elapsed() < Duration::from_millis(200) && done < total {
+                return;
+            }
+            last = std::time::Instant::now();
+            if let Some(task) = MODELS.lock().unwrap().tasks.get_mut(id) {
+                task.completed = done.min(total);
+                task.total = total;
+                task.progress = if total > 0 { (done as f64 / total as f64).min(1.0) } else { 0.0 };
+            }
+            changed();
+        };
+        download(source, &repo, &wanted, cancel, &mut |done| report(done))?;
+        let mut base = main_bytes;
+        for component in &missing {
+            let wanted = vec![component.file.clone()];
+            // 这个源上没有：换另一个源试试（配套文件多半两边都有）
+            if let Err(error) = download(source, &component.repo, &wanted, cancel, &mut |done| report(base + done)) {
+                if error == powers::CANCELLED {
+                    return Err(error);
+                }
+                download(source.other(), &component.repo, &wanted, cancel, &mut |done| report(base + done))?;
+            }
+            base += component.size;
+        }
+        Ok(())
+    }
+
+    fn finish(id: &str, outcome: Result<(), String>) {
+        let waiters = {
+            let mut models = MODELS.lock().unwrap();
+            let Some(task) = models.tasks.get_mut(id) else { return };
+            let waiters = std::mem::take(&mut task.waiters);
+            match &outcome {
+                Err(error) if error != powers::CANCELLED => {
+                    task.running = false;
+                    task.error = error.clone();
+                    task.retry_waiters = waiters
+                        .iter()
+                        .map(|waiter| Waiter {
+                            client: waiter.client.clone(),
+                            activate: waiter.activate,
+                            conversation: waiter.conversation.clone(),
+                        })
+                        .collect();
+                }
+                // 下好了、取消了：不再列出
+                _ => {
+                    models.tasks.remove(id);
+                    models.order.retain(|item| item != id);
+                }
+            }
+            waiters
+        };
+        rescan();
+        changed();
+        let kind = kind_of(id, "");
+        for waiter in waiters {
+            match &outcome {
+                Ok(()) if waiter.activate => {
+                    let engine = activate(id, &kind);
+                    // 这段会话已经改选了别的：只建引擎，不换回来
+                    let still = waiter
+                        .conversation
+                        .as_ref()
+                        .is_none_or(|conversation| MODELS.lock().unwrap().waiting.get(conversation).is_some_and(|wanted| wanted == id));
+                    if let Some(conversation) = &waiter.conversation
+                        && still
+                    {
+                        MODELS.lock().unwrap().waiting.remove(conversation);
+                    }
+                    if still && !engine.is_empty() {
+                        apply(&engine, waiter.conversation.as_deref());
+                    }
+                    changed();
+                }
+                Ok(()) => {}
+                Err(error) if error == powers::CANCELLED => {
+                    if let Some(conversation) = &waiter.conversation {
+                        MODELS.lock().unwrap().waiting.remove(conversation);
+                    }
+                    changed();
+                }
+                Err(error) => {
+                    crate::notify_clients(std::slice::from_ref(&waiter.client), "modelsFailed", json!({ "id": id, "message": error }))
+                }
+            }
+        }
+    }
+
+    /// 用起来：没下的在这台上下（要用的 Power 没装的先装），下好了大模型给会话换上
+    fn use_model(client: &str, id: &str, kind: &str, source: Source, conversation: Option<String>) {
+        let diffusion = kind == "image" || kind == "video";
+        ensure_power(if diffusion { "diffusion" } else { "llm" });
+        let conversation = if diffusion { None } else { conversation };
+        if let Some(conversation) = &conversation {
+            MODELS.lock().unwrap().waiting.insert(conversation.clone(), id.to_string());
+            changed();
+        }
+        if is_complete(id, kind) {
+            let engine = activate(id, kind);
+            if let Some(conversation) = &conversation {
+                MODELS.lock().unwrap().waiting.remove(conversation);
+            }
+            if !engine.is_empty() {
+                apply(&engine, conversation.as_deref());
+            }
+            changed();
+            return;
+        }
+        download_model(id, kind, source, Some(Waiter { client: client.to_string(), activate: true, conversation }));
+    }
+
+    /// 强制删一个本地模型：friday-llm 还在就停掉、等它放开文件再删，删不掉隔半秒再试，最多 15 秒
+    fn remove(model: &LocalModel) -> Result<(), String> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if powers::has_process("llm") {
+                powers::stop("llm");
+                while powers::has_process("llm") && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+            let mut failed = Vec::new();
+            let mut reason = String::new();
+            let mut remove_file = |path: &Path| {
+                if std::fs::symlink_metadata(path).is_err() {
+                    return;
+                }
+                if let Err(error) = std::fs::remove_file(path) {
+                    failed.push(path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default());
+                    if reason.is_empty() {
+                        reason = error.to_string();
+                    }
+                }
+            };
+            for path in &model.files {
+                // HF 的快照里是指向 blobs 的符号链接：连同目标一起删
+                if let Ok(target) = std::fs::read_link(path) {
+                    let target = if target.is_absolute() { target } else { path.parent().map(|dir| dir.join(&target)).unwrap_or(target) };
+                    remove_file(path);
+                    remove_file(&target);
+                } else {
+                    remove_file(path);
+                }
+                for suffix in [".part", ".incomplete", ".incomplete.part"] {
+                    remove_file(&PathBuf::from(format!("{}{suffix}", path.display())));
+                }
+            }
+            if failed.is_empty() {
+                // 仓库里没有别的模型文件了：整个目录一起删
+                if scan_directory(&model.directory).iter().all(|file| !is_model_file(&file.path)) {
+                    let _ = std::fs::remove_dir_all(&model.directory);
+                }
+                rescan();
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                rescan();
+                return Err(format!("无法删除 {}（{reason}）。可能有别的程序占着这个文件：关掉它再删", failed.join("、")));
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    // MARK: 状态与请求
+
+    fn physical_memory() -> u64 {
+        #[cfg(target_os = "macos")]
+        {
+            let mut size: u64 = 0;
+            let mut length = std::mem::size_of::<u64>();
+            let name = c"hw.memsize";
+            if unsafe { libc::sysctlbyname(name.as_ptr(), (&mut size as *mut u64).cast(), &mut length, std::ptr::null_mut(), 0) } == 0 {
+                return size;
+            }
+            0
+        }
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::read_to_string("/proc/meminfo")
+                .ok()
+                .and_then(|text| {
+                    text.lines()
+                        .find(|line| line.starts_with("MemTotal:"))
+                        .and_then(|line| line.split_whitespace().nth(1)?.parse::<u64>().ok())
+                })
+                .map(|kib| kib * 1024)
+                .unwrap_or(0)
+        }
+        #[cfg(windows)]
+        {
+            #[repr(C)]
+            struct MemoryStatus {
+                length: u32,
+                load: u32,
+                total_phys: u64,
+                avail_phys: u64,
+                total_page: u64,
+                avail_page: u64,
+                total_virtual: u64,
+                avail_virtual: u64,
+                avail_extended: u64,
+            }
+            unsafe extern "system" {
+                fn GlobalMemoryStatusEx(buffer: *mut MemoryStatus) -> i32;
+            }
+            let mut status = MemoryStatus {
+                length: std::mem::size_of::<MemoryStatus>() as u32,
+                load: 0,
+                total_phys: 0,
+                avail_phys: 0,
+                total_page: 0,
+                avail_page: 0,
+                total_virtual: 0,
+                avail_virtual: 0,
+                avail_extended: 0,
+            };
+            if unsafe { GlobalMemoryStatusEx(&mut status) } != 0 { status.total_phys } else { 0 }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+        {
+            0
+        }
+    }
+
+    /// 独立显卡（显存从大到小）：NVIDIA 用 nvidia-smi，Linux 上 amdgpu 看 sysfs
+    fn gpus() -> Vec<Value> {
+        static CACHED: LazyLock<Vec<(String, u64)>> = LazyLock::new(|| {
+            let minimum = 1u64 << 30;
+            let mut list: Vec<(String, u64)> = Vec::new();
+            if let Ok(output) =
+                std::process::Command::new("nvidia-smi").args(["--query-gpu=name,memory.total", "--format=csv,noheader,nounits"]).output()
+                && output.status.success()
+            {
+                for line in String::from_utf8_lossy(&output.stdout).lines() {
+                    if let Some((name, memory)) = line.rsplit_once(',') {
+                        let memory = memory.trim().parse::<u64>().unwrap_or(0) * 1024 * 1024;
+                        if memory >= minimum {
+                            list.push((name.trim().to_string(), memory));
+                        }
+                    }
+                }
+            }
+            #[cfg(target_os = "linux")]
+            for card in std::fs::read_dir("/sys/class/drm").into_iter().flatten().flatten() {
+                let name = card.file_name().to_string_lossy().into_owned();
+                if !name.starts_with("card") || name.contains('-') {
+                    continue;
+                }
+                let memory = std::fs::read_to_string(card.path().join("device/mem_info_vram_total"))
+                    .ok()
+                    .and_then(|text| text.trim().parse::<u64>().ok())
+                    .unwrap_or(0);
+                if memory >= minimum {
+                    let product = std::fs::read_to_string(card.path().join("device/product_name")).unwrap_or_default().trim().to_string();
+                    list.push((product, memory));
+                }
+            }
+            list.sort_by_key(|item| std::cmp::Reverse(item.1));
+            list
+        });
+        CACHED.iter().map(|(name, memory)| json!({ "name": name, "memory": memory })).collect()
+    }
+
+    /// ModelsState
+    pub fn state() -> Value {
+        let models = MODELS.lock().unwrap();
+        let local: Vec<Value> = models
+            .local
+            .iter()
+            .map(|model| model.to_json(&kind_of(&model.id, if model.mmproj_file.is_some() { "multimodal" } else { "" })))
+            .collect();
+        let downloads: Vec<Value> = models
+            .order
+            .iter()
+            .filter_map(|id| models.tasks.get(id).map(|task| (id, task)))
+            .map(|(id, task)| {
+                json!({ "id": id, "name": display_name(id), "kind": task.kind, "running": task.running, "progress": task.progress,
+                    "completed": task.completed, "total": task.total, "error": task.error })
+            })
+            .collect();
+        let waiting: Vec<Value> =
+            models.waiting.iter().map(|(conversation, id)| json!({ "conversationID": crate::upper(conversation), "id": id })).collect();
+        json!({
+            "available": true,
+            "machine": { "memory": physical_memory(), "gpus": gpus() },
+            "chatAvailable": chat_available(),
+            "local": local,
+            "downloads": downloads,
+            "waiting": waiting,
+        })
+    }
+
+    fn text<'a>(params: &'a Value, key: &str) -> Result<&'a str, (i64, String)> {
+        params[key].as_str().filter(|text| !text.is_empty()).ok_or((-32602, format!("缺少参数 {key}")))
+    }
+
+    /// models.*（客户端看着这台时：模型菜单的「本地」、模型库）
+    pub fn request(client: &str, method: &str, params: &Value) -> crate::Reply {
+        let source = || params["source"].as_str().and_then(Source::parse).unwrap_or_else(default_source);
+        match method {
+            "models.state" => Ok(state()),
+            "models.refresh" => {
+                std::thread::spawn(rescan);
+                // 生图 / 生视频的家族在 diffusion 的清单里：还没取到索引就取一次
+                if families().is_empty() && !powers::is_refreshing() {
+                    std::thread::spawn(powers::refresh);
+                }
+                Ok(json!({}))
+            }
+            "models.download" => {
+                let id = text(params, "id")?;
+                let kind = params["kind"].as_str().filter(|kind| !kind.is_empty()).map(str::to_string).unwrap_or_else(|| kind_of(id, ""));
+                download_model(id, &kind, source(), Some(Waiter { client: client.to_string(), activate: false, conversation: None }));
+                Ok(json!({}))
+            }
+            "models.use" => {
+                let id = text(params, "id")?.to_string();
+                let conversation = params["conversationID"].as_str().filter(|text| !text.is_empty()).map(crate::lower);
+                let kind = match params["kind"].as_str().filter(|kind| !kind.is_empty()) {
+                    Some(kind) => kind.to_string(),
+                    None => {
+                        let vision = local_copy(&id).is_some_and(|local| local.mmproj_file.is_some());
+                        kind_of(&id, if vision { "multimodal" } else { "" })
+                    }
+                };
+                let (client, source) = (client.to_string(), source());
+                std::thread::spawn(move || use_model(&client, &id, &kind, source, conversation));
+                Ok(json!({}))
+            }
+            "models.cancel" => {
+                let id = text(params, "id")?;
+                let mut models = MODELS.lock().unwrap();
+                match models.tasks.get(id) {
+                    Some(task) if task.running => task.cancel.store(true, Ordering::Relaxed),
+                    Some(_) => {
+                        models.tasks.remove(id);
+                        models.order.retain(|item| item != id);
+                        models.waiting.retain(|_, wanted| wanted != id);
+                        changed();
+                    }
+                    None => {}
+                }
+                Ok(json!({}))
+            }
+            "models.retry" => {
+                let id = text(params, "id")?;
+                let retry = {
+                    let mut models = MODELS.lock().unwrap();
+                    models
+                        .tasks
+                        .get_mut(id)
+                        .filter(|task| !task.running)
+                        .map(|task| (task.kind.clone(), task.source, std::mem::take(&mut task.retry_waiters)))
+                };
+                if let Some((kind, source, waiters)) = retry {
+                    download_model(id, &kind, source, None);
+                    if let Some(task) = MODELS.lock().unwrap().tasks.get_mut(id) {
+                        task.waiters.extend(waiters);
+                    }
+                }
+                Ok(json!({}))
+            }
+            "models.dismiss" => {
+                let id = text(params, "id")?;
+                let mut models = MODELS.lock().unwrap();
+                if models.tasks.get(id).is_some_and(|task| !task.running) {
+                    models.tasks.remove(id);
+                    models.order.retain(|item| item != id);
+                    models.waiting.retain(|_, wanted| wanted != id);
+                    changed();
+                }
+                Ok(json!({}))
+            }
+            "models.release" => {
+                let conversation = crate::lower(text(params, "conversationID")?);
+                if MODELS.lock().unwrap().waiting.remove(&conversation).is_some() {
+                    changed();
+                }
+                Ok(json!({}))
+            }
+            "models.delete" => {
+                let id = text(params, "id")?;
+                let wanted = params["source"].as_str().and_then(Source::parse);
+                if !MODELS.lock().unwrap().scanned {
+                    rescan();
+                }
+                let found = MODELS
+                    .lock()
+                    .unwrap()
+                    .local
+                    .iter()
+                    .find(|model| model.id == id && wanted.is_none_or(|source| model.source == source))
+                    .cloned();
+                let model = found.ok_or((crate::NOT_FOUND, format!("这台机器上没有这个本地模型：{id}")))?;
+                remove(&model).map(|_| json!({})).map_err(|error| (-32603, error))
+            }
+            other => Err((-32601, format!("没有这个方法：{other}"))),
+        }
+    }
+
+    /// model.endpoint（能力协议 §6.6）：power://llm 的真地址——拉起 friday-llm，回地址、令牌、x_friday（模型文件、会话、优先级）
+    pub fn endpoint(params: &Value) -> Result<Value, String> {
+        let base = params["baseURL"].as_str().unwrap_or("");
+        let power = base.strip_prefix("power://").map(|rest| rest.trim_end_matches('/')).unwrap_or("");
+        if power != "llm" {
+            return Err(format!("Friday 不认识这个模型地址：{base}"));
+        }
+        let model = params["model"].as_str().unwrap_or("");
+        let local = local_copy(model).ok_or(format!("这台机器上没有本地模型 {model}（模型库里下载它）"))?;
+        let (url, token) = powers::ensure_running("llm", Duration::from_secs(150))?;
+        let agent = params["agent"].as_str().filter(|agent| !agent.is_empty());
+        let session = agent.or_else(|| params["session"].as_str()).unwrap_or("");
+        let mut hints = Map::new();
+        hints.insert("model_path".into(), json!(local.model_file.to_string_lossy()));
+        hints.insert(
+            "mmproj_path".into(),
+            json!(local.mmproj_file.as_ref().map(|path| path.to_string_lossy().into_owned()).unwrap_or_default()),
+        );
+        if !session.is_empty() {
+            hints.insert("session".into(), json!(session));
+        }
+        hints.insert("priority".into(), json!(if agent.is_some() { 100 } else { 1000 }));
+        hints.insert("main".into(), json!(agent.is_none() && !session.is_empty()));
+        Ok(json!({ "baseURL": format!("{url}/v1"), "apiKey": token, "body": { "x_friday": hints } }))
+    }
+
+    /// 有在下的（常驻的那份闲着不退）
+    pub fn busy() -> bool {
+        MODELS.lock().unwrap().tasks.values().any(|task| task.running)
     }
 }
 

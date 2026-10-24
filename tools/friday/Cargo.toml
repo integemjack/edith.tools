@@ -17,6 +17,9 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
 base64 = "0.23"
+# 常驻的那份下载本地能力、模型，问魔搭 / Hugging Face
+ureq = "3"
+regex = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
