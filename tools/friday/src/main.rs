@@ -2723,8 +2723,13 @@ fn mcp_state(listing: &Value) -> Value {
     })
 }
 
+/// CapabilitiesState（设置 › 工具 › 能力提供方）：常驻那份的本机提供方
 fn capabilities_state() -> Value {
-    json!({ "entries": [], "packages": [], "problems": [], "jobs": [], "availability": {}, "optionSpecs": {}, "packageFor": {}, "providersDirectory": "" })
+    let empty = json!({ "entries": [], "packages": [], "problems": [], "jobs": [], "availability": {}, "optionSpecs": {}, "packageFor": {}, "providersDirectory": "" });
+    if serve_mode() == "off" {
+        return empty;
+    }
+    hub().and_then(|hub| hub.request("capabilities.state", json!({}), Duration::from_secs(10))).unwrap_or(empty)
 }
 
 /// 设置页开着的客户端：推变了的那几份
@@ -2978,12 +2983,16 @@ fn settings_request(method: &str, params: &Value) -> Reply {
             Ok(json!({}))
         }
         // EDITH 用到时才连 MCP 服务、配置变了下次用时重连
-        "mcp.reconnect" | "mcp.reloadAll" | "capabilities.refreshAvailability" => {
+        "mcp.reconnect" | "mcp.reloadAll" => {
             config_changed(&["mcp"]);
             Ok(json!({}))
         }
+        // 能力提供方：常驻那份的本机提供方
         other if other.starts_with("capabilities.") => {
-            Err(not_allowed("在这里管能力提供方（EDITH 的能力写在 ~/.edith/capabilities.json）"))
+            let hub = hub().map_err(|error| (NOT_ALLOWED, error))?;
+            let reply = hub.request(other, params.clone(), Duration::from_secs(60)).map_err(|error| hub_error(&error))?;
+            config_changed(&["capabilities"]);
+            Ok(reply)
         }
         other => Err(not_allowed(&format!("脚本工具（{other}）"))),
     }
@@ -4336,6 +4345,16 @@ fn http_agent() -> &'static ureq::Agent {
     &HTTP
 }
 
+/// 常驻那份自己的设置（~/.edith/friday/settings.json：下载源、本地生图 / 生视频用的模型、信任的项目钩子）：读、改、写回一把锁
+fn update_serve_settings(change: impl FnOnce(&mut Map<String, Value>)) {
+    static LOCK: Mutex<()> = Mutex::new(());
+    let _guard = LOCK.lock().unwrap();
+    let path = serve_dir().join("settings.json");
+    let mut settings = read_json_file(&path).as_object().cloned().unwrap_or_default();
+    change(&mut settings);
+    let _ = write_json_file(&path, &Value::Object(settings));
+}
+
 /// 文件夹里的子文件夹名（按名字排）
 fn sorted_names(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
@@ -4435,6 +4454,7 @@ fn serve_actions() -> Vec<Value> {
         "timeoutSeconds": 30,
     }));
     actions.extend(scripts::meta_actions());
+    actions.extend(caps::actions());
     actions.extend(scripts::actions());
     actions
 }
@@ -4502,10 +4522,14 @@ fn serve_act(params: &Value, brain: &Brain) -> Value {
         let command = if loops::is_command(command) { command.to_string() } else { format!("/loop {command}") };
         return json!({ "text": loops::handle(&command, session, "agent", true), "ok": true });
     }
-    // 脚本工具、扩展自己的能力：参数里的相对路径按这段会话的工作目录
-    if scripts::is_meta(action) || scripts::is_script(action) {
+    // 能力（本机的提供方）、脚本工具、扩展自己的能力：参数里的相对路径按这段会话的工作目录
+    if caps::is_action(action) || scripts::is_meta(action) || scripts::is_script(action) {
         let caller = find_session(session).map(|stored| stored.cwd).filter(|cwd| !cwd.is_empty());
-        let (ok, text, media) = scripts::act(action, &arguments, caller.as_deref(), brain);
+        let (ok, text, media) = if caps::is_action(action) {
+            caps::act(action, &arguments, caller.as_deref())
+        } else {
+            scripts::act(action, &arguments, caller.as_deref(), brain)
+        };
         let media: Vec<Value> = media
             .into_iter()
             .map(|path| {
@@ -4516,6 +4540,8 @@ fn serve_act(params: &Value, brain: &Brain) -> Value {
                     (".jpeg", "image/jpeg"),
                     (".gif", "image/gif"),
                     (".webp", "image/webp"),
+                    (".wav", "audio/wav"),
+                    (".webm", "video/webm"),
                 ]
                 .iter()
                 .find(|(extension, _)| lower.ends_with(extension))
@@ -4721,6 +4747,7 @@ fn serve_request(client: &str, method: &str, params: &Value) -> Reply {
         method if method.starts_with("loops.") => loops::request(method, params),
         method if method == "scripts.state" || method.starts_with("tools.") => scripts::request(method, params),
         method if method.starts_with("hooks.") => hooks::request(method, params),
+        method if method.starts_with("capabilities.") => caps::request(method, params),
         method if method.starts_with("plugins.") => plugins::request(method, params),
         other => Err((-32601, format!("常驻的那份没有 {other}"))),
     }
@@ -5004,9 +5031,12 @@ fn on_hub_message(hub: &Arc<Brain>, message: Value) {
         Some("powers") if STATE.lock().unwrap().powers => event("powers", message["params"].clone()),
         Some("models") if STATE.lock().unwrap().models => event("models", message["params"].clone()),
         Some("loops") if STATE.lock().unwrap().loops => event("loops", message["params"].clone()),
-        // 脚本工具变了：设置页重列（另起线程：重列要问常驻那份，回话得靠这个线程读）
+        // 脚本工具、能力提供方变了：设置页重列（另起线程：重列要问常驻那份，回话得靠这个线程读）
         Some("scripts") => {
             std::thread::spawn(|| config_changed(&["tools"]));
+        }
+        Some("capabilities") => {
+            std::thread::spawn(|| config_changed(&["capabilities"]));
         }
         Some("modelsFailed") => event("modelsFailed", message["params"].clone()),
         // 本地模型下好了：建了本地引擎、给会话换上了（会话上选的记在 friday.json）
@@ -5682,6 +5712,7 @@ mod powers {
                 if DIRTY.swap(false, Ordering::Relaxed) {
                     crate::notify_all_clients("powers", state());
                     crate::models::powers_changed();
+                    crate::caps::powers_changed();
                 }
             }
         });
@@ -7589,6 +7620,7 @@ mod models {
 
     #[derive(Clone)]
     struct Component {
+        role: String,
         repo: String,
         file: String,
         size: u64,
@@ -7596,7 +7628,12 @@ mod models {
 
     #[derive(Clone)]
     struct Family {
+        id: String,
         kind: String,
+        /// 主模型在 x_friday.files 里的键（缺省 diffusion_model）
+        main_role: String,
+        /// 能按参考图改图（FLUX.2 klein、Qwen-Image-Edit 这类）
+        edits: bool,
         patterns: Vec<Regex>,
         recommended_repo: String,
         recommended_file: String,
@@ -7623,8 +7660,9 @@ mod models {
                     .as_object()
                     .into_iter()
                     .flatten()
-                    .map(|(_, component)| {
+                    .map(|(role, component)| {
                         let component = Component {
+                            role: role.clone(),
                             repo: component["repo"].as_str().unwrap_or("").to_string(),
                             file: component["file"].as_str().unwrap_or("").to_string(),
                             size: component["size"].as_f64().unwrap_or(0.0) as u64,
@@ -7633,6 +7671,9 @@ mod models {
                     })
                     .collect();
                 let family = Family {
+                    id: item["id"].as_str().unwrap_or("").to_string(),
+                    main_role: item["main"].as_str().unwrap_or("diffusion_model").to_string(),
+                    edits: item["edits"].as_bool().unwrap_or(false),
                     recommended_repo: item["recommended"]["repo"].as_str().unwrap_or("").to_string(),
                     recommended_file: item["recommended"]["file"].as_str().unwrap_or("").to_string(),
                     components: components?,
@@ -7675,6 +7716,29 @@ mod models {
             .into_iter()
             .map(|source| source.local_directory(&component.repo).join(&component.file))
             .find(|path| std::fs::metadata(path).is_ok_and(|meta| meta.is_file() && (component.size == 0 || meta.len() == component.size)))
+    }
+
+    /// 这台本地生图 / 生视频用的模型（模型库里「使用」的那个；~/.edith/friday/settings.json）
+    pub fn selected(what: &str) -> String {
+        let settings = crate::read_json_file(&crate::serve_dir().join("settings.json"));
+        settings[if what == "video" { "localVideoModel" } else { "localImageModel" }].as_str().unwrap_or("").to_string()
+    }
+
+    /// 交给 friday-diffusion 的 x_friday：{family, files: {角色: 路径}}；文件没下齐是 None
+    pub fn diffusion_request(model: &str) -> Option<Value> {
+        let family = family_for(model)?;
+        let local = local_copy(model)?;
+        let mut files = Map::new();
+        files.insert(family.main_role.clone(), json!(local.model_file.to_string_lossy()));
+        for component in &family.components {
+            files.insert(component.role.clone(), json!(component_path(component)?.to_string_lossy()));
+        }
+        Some(json!({ "family": family.id, "files": files }))
+    }
+
+    /// 这个模型的家族能按参考图改图
+    pub fn family_edits(model: &str) -> bool {
+        family_for(model).is_some_and(|family| family.edits)
     }
 
     fn is_complete(id: &str, kind: &str) -> bool {
@@ -7796,13 +7860,10 @@ mod models {
         let local = local_copy(id);
         let model_id = local.as_ref().map_or(id.to_string(), |local| local.id.clone());
         if kind == "image" || kind == "video" {
-            let path = crate::serve_dir().join("settings.json");
-            let mut settings = crate::read_json_file(&path);
-            if !settings.is_object() {
-                settings = json!({});
-            }
-            settings[if kind == "image" { "localImageModel" } else { "localVideoModel" }] = json!(model_id);
-            let _ = crate::write_json_file(&path, &settings);
+            crate::update_serve_settings(|settings| {
+                settings.insert(if kind == "image" { "localImageModel" } else { "localVideoModel" }.into(), json!(model_id));
+            });
+            crate::caps::powers_changed();
             return String::new();
         }
         let engine_id = engine_id_for(&model_id);
@@ -10397,21 +10458,18 @@ mod hooks {
     fn set_trust(directory: &str, trusted: bool) {
         let Some(path) = project_path(directory) else { return };
         let config = load(&path, "project");
-        let settings_file = settings_path();
-        let mut settings = crate::read_json_file(&settings_file);
-        if !settings.is_object() {
-            settings = json!({});
-        }
-        if !settings["trustedProjectHooks"].is_object() {
-            settings["trustedProjectHooks"] = json!({});
-        }
-        let table = settings["trustedProjectHooks"].as_object_mut().unwrap();
-        if trusted && config.exists && !config.hash.is_empty() {
-            table.insert(trust_key(&path), json!(config.hash));
-        } else {
-            table.remove(&trust_key(&path));
-        }
-        let _ = crate::write_json_file(&settings_file, &settings);
+        crate::update_serve_settings(|settings| {
+            let table = settings.entry("trustedProjectHooks").or_insert_with(|| json!({}));
+            if !table.is_object() {
+                *table = json!({});
+            }
+            let table = table.as_object_mut().unwrap();
+            if trusted && config.exists && !config.hash.is_empty() {
+                table.insert(trust_key(&path), json!(config.hash));
+            } else {
+                table.remove(&trust_key(&path));
+            }
+        });
     }
 
     /// 启用的插件带来的（装的时候确认过，不用再信任）
@@ -11514,6 +11572,669 @@ mod plugins {
             }
             other => Err((-32601, format!("没有这个方法：{other}"))),
         }
+    }
+}
+
+// MARK: - 能力提供方（本机的：本地语音、生图 / 生视频）
+
+mod caps {
+    //! 能力层（照 Friday 的 CapabilityRegistry + PowerBackend）：装好的本地能力是「本机」提供方（`power-<id>`）——本地语音能听录音、说话，
+    //! friday-diffusion 能生图、生视频。智能体看到的是固定的几个工具（transcribe_audio、speak、generate_image、generate_video、check_job），
+    //! 是常驻那份的动作；有提供方开着、这项没关的才给。生视频是异步任务（jobs.json），check_job 查进度、做完取回文件。
+    //! 设置 › 工具 › 能力提供方 看着这台时：列这些提供方、开关、关掉某一项、改名字（存在 ~/.edith/friday/capabilities.json）。
+
+    use std::io::Read;
+    use std::path::PathBuf;
+    use std::sync::{LazyLock, Mutex};
+    use std::time::Duration;
+
+    use base64::Engine;
+    use serde_json::{Map, Value, json};
+
+    use crate::{models, powers};
+
+    struct Kind {
+        raw: &'static str,
+        title: &'static str,
+        symbol: &'static str,
+        tool: &'static str,
+        detail: &'static str,
+        /// 装着的 Power 清单里的 capabilities 写的
+        power: &'static str,
+    }
+
+    const KINDS: [Kind; 4] = [
+        Kind {
+            raw: "transcription",
+            title: "听录音",
+            symbol: "waveform",
+            tool: "transcribe_audio",
+            detail: "把录音转成文字",
+            power: "transcription",
+        },
+        Kind { raw: "speech", title: "说话", symbol: "speaker.wave.2", tool: "speak", detail: "把文字合成语音", power: "speech" },
+        Kind {
+            raw: "imageGeneration",
+            title: "生图",
+            symbol: "photo",
+            tool: "generate_image",
+            detail: "按描述生成图片",
+            power: "imageGeneration",
+        },
+        Kind {
+            raw: "videoGeneration",
+            title: "生视频",
+            symbol: "film",
+            tool: "generate_video",
+            detail: "按描述生成短视频",
+            power: "videoGeneration",
+        },
+    ];
+
+    fn kind(raw: &str) -> Option<&'static Kind> {
+        KINDS.iter().find(|kind| kind.raw == raw || kind.tool == raw)
+    }
+
+    fn settings_path() -> PathBuf {
+        crate::serve_dir().join("capabilities.json")
+    }
+
+    fn jobs_path() -> PathBuf {
+        crate::serve_dir().join("jobs.json")
+    }
+
+    pub fn media_dir() -> PathBuf {
+        crate::serve_dir().join("media")
+    }
+
+    /// 本机的提供方：装着、清单里写了这几项能力的 Power（用户的开关、关掉的项、名字记在 capabilities.json 的 powerEntries）
+    fn entries() -> Vec<Value> {
+        let saved = crate::read_json_file(&settings_path());
+        let state = powers::state();
+        state["powers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|power| power["installedVersion"].as_str().is_some_and(|version| !version.is_empty()))
+            .filter_map(|power| {
+                let id = power["id"].as_str().unwrap_or("").to_string();
+                let declared: Vec<&str> = power["capabilities"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+                let kinds: Vec<&str> = KINDS.iter().filter(|kind| declared.contains(&kind.power)).map(|kind| kind.raw).collect();
+                if kinds.is_empty() {
+                    return None;
+                }
+                let entry_id = format!("power-{id}");
+                let user = &saved["powerEntries"][&entry_id];
+                Some(json!({
+                    "id": entry_id,
+                    "type": "power",
+                    "title": user["title"].as_str().map(str::to_string).unwrap_or_else(|| power["title"].as_str().unwrap_or(&id).to_string()),
+                    "options": { "power": id, "capabilities": kinds.join(",") },
+                    "enabled": user["enabled"].as_bool().unwrap_or(true),
+                    "disabledKinds": user["disabledKinds"].as_array().cloned().unwrap_or_default(),
+                    "kinds": kinds,
+                    "powerEnabled": power["enabled"].as_bool().unwrap_or(true),
+                }))
+            })
+            .collect()
+    }
+
+    fn save_user(entry_id: &str, change: impl FnOnce(&mut Map<String, Value>)) {
+        let path = settings_path();
+        let mut saved = crate::read_json_file(&path);
+        if !saved.is_object() {
+            saved = json!({});
+        }
+        if !saved["powerEntries"].is_object() {
+            saved["powerEntries"] = json!({});
+        }
+        let entries = saved["powerEntries"].as_object_mut().unwrap();
+        let entry = entries.entry(entry_id.to_string()).or_insert_with(|| json!({}));
+        if !entry.is_object() {
+            *entry = json!({});
+        }
+        change(entry.as_object_mut().unwrap());
+        let _ = crate::write_json_file(&path, &saved);
+        changed();
+    }
+
+    /// 这一项能不能用、还缺什么
+    fn availability(entry: &Value, raw: &str) -> (bool, String) {
+        let power = entry["options"]["power"].as_str().unwrap_or("");
+        if !powers::is_installed(power) {
+            return (false, "还没安装（设置 › 能力）".into());
+        }
+        if !powers::is_enabled(power) {
+            return (false, "被关掉了（设置 › 能力）".into());
+        }
+        if raw == "imageGeneration" || raw == "videoGeneration" {
+            let what = if raw == "videoGeneration" { "video" } else { "image" };
+            let model = models::selected(what);
+            if model.is_empty() {
+                return (
+                    false,
+                    if what == "video" {
+                        "还没选本地生视频模型（模型库里类型选「生视频」，点「使用」）".into()
+                    } else {
+                        "还没选本地生图模型（模型库里类型选「生图」，点「使用」）".into()
+                    },
+                );
+            }
+            if models::diffusion_request(&model).is_none() {
+                return (false, format!("{model} 的文件还没下完（设置 › 能力里能看到进度）"));
+            }
+        }
+        (true, String::new())
+    }
+
+    /// 这项能力现在用哪个提供方（开着、这项没关的第一个）
+    fn provider_for(raw: &str) -> Option<Value> {
+        entries().into_iter().find(|entry| {
+            entry["enabled"] == true
+                && entry["kinds"].as_array().is_some_and(|kinds| kinds.contains(&json!(raw)))
+                && !entry["disabledKinds"].as_array().is_some_and(|kinds| kinds.contains(&json!(raw)))
+        })
+    }
+
+    // MARK: 动作
+
+    fn property(description: &str, kind: &str) -> Value {
+        json!({ "type": kind, "description": description })
+    }
+
+    /// 常驻那份的动作（有提供方的才给）
+    pub fn actions() -> Vec<Value> {
+        let mut actions = Vec::new();
+        if provider_for("transcription").is_some() {
+            actions.push(json!({ "name": "transcribe_audio", "description": "听一段录音（语音消息、会议录音、视频里的声音）并转成文字。录音是本地路径，常见格式（wav、mp3、flac）都行。",
+                "parameters": { "type": "object", "properties": { "audio": property("录音的本地路径", "string"), "language": property("语言：zh、en、ja 等；不填自动判断", "string") }, "required": ["audio"] },
+                "readOnly": true, "timeoutSeconds": 300 }));
+        }
+        if provider_for("speech").is_some() {
+            actions.push(json!({ "name": "speak", "description": "把一段话说出来：合成语音，返回 wav 文件的路径。用户让你「说」「念」「读出来」「用语音回答」时用它。text 写成要说的原话，不要带 Markdown 符号、代码和表格。",
+                "parameters": { "type": "object", "properties": { "text": property("要说的话，原样朗读（中英文等皆可）", "string"), "voice": property("音色（本地语音的音色名）；不填用默认音色", "string"), "style": property("语气或情绪，一句话描述；不填为自然语气", "string") }, "required": ["text"] },
+                "timeoutSeconds": 300 }));
+        }
+        if provider_for("imageGeneration").is_some() {
+            actions.push(json!({ "name": "generate_image", "description": "按文字描述生成图片（在这台的显卡上用本地生图模型）。生成的图片会直接展示给用户并返回文件路径。提示词写具体：主体、风格、构图、光线。",
+                "parameters": { "type": "object", "properties": {
+                    "prompt": property("画面描述（中英文皆可）", "string"), "negative_prompt": property("不希望出现的内容", "string"),
+                    "size": property("尺寸，如 1024x1024、1280x720；不填用默认", "string"), "count": property("张数，默认 1，最多 4", "integer"),
+                    "reference_image": property("参考图路径（图生图 / 编辑）；不填则纯文生图", "string") }, "required": ["prompt"] },
+                "timeoutSeconds": 900 }));
+        }
+        if provider_for("videoGeneration").is_some() {
+            actions.push(json!({ "name": "generate_video", "description": "按文字（可附一张参考图）生成一段短视频（本地生视频模型）。这是异步任务：调用后立刻返回任务 ID，通常要等几分钟，之后用 check_job 查询并取回视频。",
+                "parameters": { "type": "object", "properties": {
+                    "prompt": property("画面与动作描述", "string"), "duration": property("时长（秒），默认 2，最多 10", "integer"),
+                    "size": property("分辨率，如 832x480；不填用默认", "string"), "image": property("首帧参考图的路径（图生视频）；不填则文生视频", "string") }, "required": ["prompt"] },
+                "timeoutSeconds": 120 }));
+            actions.push(json!({ "name": "check_job", "description": "查询 generate_video 等异步任务的进度。完成后会把结果文件取回来展示给用户并返回路径；未完成就告诉用户稍后再查（间隔至少 30 秒，不要连续轮询）。",
+                "parameters": { "type": "object", "properties": { "job_id": property("任务 ID", "string") }, "required": ["job_id"] }, "readOnly": true, "timeoutSeconds": 300 }));
+        }
+        actions
+    }
+
+    pub fn is_action(action: &str) -> bool {
+        matches!(action, "transcribe_audio" | "speak" | "generate_image" | "generate_video" | "check_job")
+    }
+
+    fn text<'a>(arguments: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
+        arguments.get(key).and_then(Value::as_str).map(str::trim).filter(|text| !text.is_empty())
+    }
+
+    /// 参数里的路径：相对的按会话的工作目录
+    fn path_of(value: &str, caller: Option<&str>) -> PathBuf {
+        let path = PathBuf::from(value.strip_prefix("file://").unwrap_or(value));
+        if path.is_absolute() {
+            return path;
+        }
+        if let Some(rest) = value.strip_prefix("~/") {
+            return crate::user_home().join(rest);
+        }
+        caller.map(PathBuf::from).unwrap_or_else(crate::user_home).join(path)
+    }
+
+    fn data_url(path: &std::path::Path) -> Result<String, String> {
+        let bytes = std::fs::read(path).map_err(|_| format!("读不了 {}", path.display()))?;
+        let lower = path.to_string_lossy().to_lowercase();
+        let mime = if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+            "image/jpeg"
+        } else if lower.ends_with(".webp") {
+            "image/webp"
+        } else {
+            "image/png"
+        };
+        Ok(format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes)))
+    }
+
+    fn send(method: &str, url: &str, token: &str, body: Option<&Value>, timeout: u64) -> Result<(u16, Vec<u8>), String> {
+        let agent: ureq::Agent =
+            ureq::Agent::config_builder().http_status_as_error(false).timeout_global(Some(Duration::from_secs(timeout))).build().into();
+        let authorization = format!("Bearer {token}");
+        let response = match (method, body) {
+            ("GET", _) => agent.get(url).header("Authorization", &authorization).call(),
+            (_, Some(body)) => agent
+                .post(url)
+                .header("Authorization", &authorization)
+                .header("Content-Type", "application/json")
+                .send(&serde_json::to_vec(body).unwrap_or_default()[..]),
+            _ => agent.post(url).header("Authorization", &authorization).send_empty(),
+        };
+        let mut response = response.map_err(|error| error.to_string())?;
+        let status = response.status().as_u16();
+        let mut data = Vec::new();
+        response.body_mut().as_reader().read_to_end(&mut data).map_err(|error| error.to_string())?;
+        Ok((status, data))
+    }
+
+    fn json_of(status: u16, data: &[u8], what: &str) -> Result<Value, String> {
+        let value: Value = serde_json::from_slice(data).unwrap_or_default();
+        if !(200..300).contains(&status) {
+            let message = value["error"]["message"].as_str().map(str::to_string).unwrap_or_else(|| format!("HTTP {status}"));
+            return Err(format!("{what}出错：{message}"));
+        }
+        Ok(value)
+    }
+
+    /// 结果存进 ~/.edith/friday/media/
+    fn keep(data: &[u8], extension: &str) -> Result<String, String> {
+        let dir = media_dir();
+        std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+        let path = dir.join(format!(
+            "{}-{}.{extension}",
+            chrono::Local::now().format("%Y%m%d-%H%M%S"),
+            &uuid::Uuid::new_v4().simple().to_string()[..6]
+        ));
+        std::fs::write(&path, data).map_err(|error| format!("存不了结果：{error}"))?;
+        Ok(path.to_string_lossy().into_owned())
+    }
+
+    fn outputs(url: &str, token: &str, job: &Value) -> Result<Vec<String>, String> {
+        job["outputs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|output| {
+                let (status, data) = send("GET", &format!("{url}{}", output["url"].as_str().unwrap_or("")), token, None, 120)?;
+                if !(200..300).contains(&status) {
+                    return Err(format!("取本地生成的结果失败：HTTP {status}"));
+                }
+                keep(&data, if output["mime"] == "video/webm" { "webm" } else { "png" })
+            })
+            .collect()
+    }
+
+    fn diffusion_body(arguments: &Map<String, Value>, what: &str, caller: Option<&str>) -> Result<Value, String> {
+        let model = models::selected(what);
+        let files = models::diffusion_request(&model).ok_or_else(|| {
+            if model.is_empty() {
+                format!(
+                    "还没选本地生{}模型：在模型库里类型选「生{}」，点「使用」",
+                    if what == "video" { "视频" } else { "图" },
+                    if what == "video" { "视频" } else { "图" }
+                )
+            } else {
+                format!("本地模型 {model} 的文件还没下完")
+            }
+        })?;
+        let mut body = json!({ "kind": what, "prompt": text(arguments, "prompt").unwrap_or(""), "x_friday": files });
+        if let Some(negative) = text(arguments, "negative_prompt") {
+            body["negative_prompt"] = json!(negative);
+        }
+        if let Some((width, height)) = text(arguments, "size").and_then(|size| size.split_once(['x', 'X', '×'])) {
+            let number = |text: &str| text.trim().parse::<u32>().ok().map(|value| (value / 16 * 16).max(64));
+            if let (Some(width), Some(height)) = (number(width), number(height)) {
+                body["width"] = json!(width);
+                body["height"] = json!(height);
+            }
+        }
+        if what == "image" {
+            body["n"] = json!(arguments.get("count").and_then(Value::as_u64).unwrap_or(1).clamp(1, 4));
+            if let Some(reference) = text(arguments, "reference_image") {
+                let url = data_url(&path_of(reference, caller))?;
+                if models::family_edits(&model) {
+                    body["reference_images"] = json!([url]);
+                } else {
+                    body["image"] = json!(url);
+                }
+            }
+        } else {
+            // 时长（秒）→ 帧数：16 fps，帧数取 4k+1（Wan 的要求）
+            let seconds = arguments.get("duration").and_then(Value::as_u64).unwrap_or(2).clamp(1, 10);
+            body["fps"] = json!(16);
+            body["frames"] = json!(seconds * 16 / 4 * 4 + 1);
+            if let Some(image) = text(arguments, "image") {
+                body["image"] = json!(data_url(&path_of(image, caller))?);
+            }
+        }
+        Ok(body)
+    }
+
+    /// 做一个动作：(成没成, 给模型看的, 产出的文件)
+    pub fn act(action: &str, arguments: &Map<String, Value>, caller: Option<&str>) -> (bool, String, Vec<String>) {
+        match perform(action, arguments, caller) {
+            Ok((text, files)) => (true, text, files),
+            Err(error) => (false, error, Vec::new()),
+        }
+    }
+
+    fn perform(action: &str, arguments: &Map<String, Value>, caller: Option<&str>) -> Result<(String, Vec<String>), String> {
+        if action == "check_job" {
+            return check_job(text(arguments, "job_id").ok_or("要给 job_id")?);
+        }
+        let kind = kind(action).ok_or_else(|| format!("没有这个能力：{action}"))?;
+        let entry = provider_for(kind.raw).ok_or_else(|| format!("没有开着的「{}」提供方", kind.title))?;
+        let (ready, needs) = availability(&entry, kind.raw);
+        if !ready {
+            return Err(format!("「{}」现在用不了：{needs}", kind.title));
+        }
+        let power = entry["options"]["power"].as_str().unwrap_or("").to_string();
+        let (url, token) = powers::ensure_running(&power, Duration::from_secs(150))?;
+        match action {
+            "transcribe_audio" => {
+                let path = path_of(text(arguments, "audio").ok_or("要给 audio（录音的路径）")?, caller);
+                let data = std::fs::read(&path).map_err(|_| format!("读不了录音 {}", path.display()))?;
+                let boundary = format!("Friday-{}", uuid::Uuid::new_v4().simple());
+                let mut body: Vec<u8> = Vec::new();
+                let mut field = |key: &str, value: &str| {
+                    body.extend_from_slice(
+                        format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{key}\"\r\n\r\n{value}\r\n").as_bytes(),
+                    )
+                };
+                field("model", "sensevoice-small");
+                field("response_format", "json");
+                if let Some(language) = text(arguments, "language") {
+                    field("language", language);
+                }
+                let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| "audio.wav".into());
+                body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\nContent-Type: application/octet-stream\r\n\r\n").as_bytes());
+                body.extend_from_slice(&data);
+                body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+                let mut response = crate::http_agent()
+                    .post(&format!("{url}/v1/audio/transcriptions"))
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header("Content-Type", format!("multipart/form-data; boundary={boundary}"))
+                    .send(&body[..])
+                    .map_err(|error| format!("听录音出错：{error}"))?;
+                let status = response.status().as_u16();
+                let mut reply = Vec::new();
+                let _ = response.body_mut().as_reader().read_to_end(&mut reply);
+                let value = json_of(status, &reply, "听录音")?;
+                let text = value["text"].as_str().unwrap_or("").trim().to_string();
+                Ok((if text.is_empty() { "（没听出字来）".into() } else { text }, Vec::new()))
+            }
+            "speak" => {
+                let input = text(arguments, "text").ok_or("要给 text（要说的话）")?;
+                let mut body = json!({ "model": "cosyvoice3", "input": input, "voice": text(arguments, "voice").unwrap_or("default"), "response_format": "wav" });
+                if let Some(style) = text(arguments, "style") {
+                    body["instructions"] = json!(style);
+                }
+                let (status, data) = send("POST", &format!("{url}/v1/audio/speech"), &token, Some(&body), 280)?;
+                if !(200..300).contains(&status) {
+                    return Err(json_of(status, &data, "说话").err().unwrap_or_default());
+                }
+                let path = keep(&data, "wav")?;
+                Ok((format!("合成好了，语音文件：{path}"), vec![path]))
+            }
+            "generate_image" => {
+                let body = diffusion_body(arguments, "image", caller)?;
+                let (status, data) = send("POST", &format!("{url}/v1/jobs"), &token, Some(&body), 60)?;
+                let job = json_of(status, &data, "本地生图")?;
+                let id = job["id"].as_str().unwrap_or("").to_string();
+                let started = std::time::Instant::now();
+                loop {
+                    let (status, data) = send("GET", &format!("{url}/v1/jobs/{id}"), &token, None, 60)?;
+                    let state = json_of(status, &data, "本地生图")?;
+                    match state["status"].as_str() {
+                        Some("done") => {
+                            let files = outputs(&url, &token, &state)?;
+                            let text = format!(
+                                "已用本机的 {} 生成 {} 张图片（{:.1} 秒）：\n{}",
+                                models::selected("image"),
+                                files.len(),
+                                state["elapsed_ms"].as_f64().unwrap_or(0.0) / 1000.0,
+                                files.join("\n")
+                            );
+                            return Ok((text, files));
+                        }
+                        Some("failed" | "cancelled") => {
+                            return Err(state["error"]["message"].as_str().unwrap_or("本地生图失败").to_string());
+                        }
+                        _ if started.elapsed() > Duration::from_secs(840) => {
+                            let _ = send("POST", &format!("{url}/v1/jobs/{id}/cancel"), &token, None, 10);
+                            return Err("本地生图超过 14 分钟没做完，取消了".into());
+                        }
+                        _ => std::thread::sleep(Duration::from_millis(500)),
+                    }
+                }
+            }
+            _ => {
+                // 生视频：提交任务，记进 jobs.json，check_job 取
+                let body = diffusion_body(arguments, "video", caller)?;
+                let (status, data) = send("POST", &format!("{url}/v1/jobs"), &token, Some(&body), 60)?;
+                let job = json_of(status, &data, "本地生视频")?;
+                let remote = job["id"].as_str().unwrap_or("").to_string();
+                let id = uuid::Uuid::new_v4().to_string().to_uppercase();
+                let record = json!({
+                    "id": id, "kind": "videoGeneration", "provider": entry["id"], "providerTitle": entry["title"], "remoteID": format!("diffusion:{remote}"),
+                    "status": "running", "prompt": text(arguments, "prompt").unwrap_or(""), "message": "本地生视频排队中",
+                    "createdAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true), "files": [],
+                });
+                with_jobs(|jobs| jobs.push(record));
+                Ok((
+                    format!(
+                        "本机的 {} 正在生成视频（{} 帧），任务 ID：{id}。通常要等几分钟，之后用 check_job 查询并取回视频。",
+                        models::selected("video"),
+                        body["frames"]
+                    ),
+                    Vec::new(),
+                ))
+            }
+        }
+    }
+
+    static JOBS_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_jobs<T>(change: impl FnOnce(&mut Vec<Value>) -> T) -> T {
+        let _guard = JOBS_LOCK.lock().unwrap();
+        let mut jobs: Vec<Value> = crate::read_json_file(&jobs_path())["jobs"].as_array().cloned().unwrap_or_default();
+        let result = change(&mut jobs);
+        let _ = crate::write_json_file(&jobs_path(), &json!({ "jobs": jobs }));
+        drop(_guard);
+        changed();
+        result
+    }
+
+    fn check_job(id: &str) -> Result<(String, Vec<String>), String> {
+        let job = with_jobs(|jobs| jobs.iter().find(|job| job["id"].as_str().is_some_and(|other| other.eq_ignore_ascii_case(id))).cloned())
+            .ok_or_else(|| format!("没有任务 {id}"))?;
+        if job["status"] == "succeeded" {
+            let files: Vec<String> = job["files"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect();
+            return Ok((format!("已经做好了：\n{}", files.join("\n")), files));
+        }
+        if job["status"] == "failed" {
+            return Err(format!("任务没做成：{}", job["message"].as_str().unwrap_or("")));
+        }
+        let remote = job["remoteID"].as_str().and_then(|remote| remote.strip_prefix("diffusion:")).ok_or("不认识的本地任务")?.to_string();
+        let power = job["provider"].as_str().and_then(|provider| provider.strip_prefix("power-")).unwrap_or("diffusion").to_string();
+        let (url, token) = powers::ensure_running(&power, Duration::from_secs(150))?;
+        let (status, data) = send("GET", &format!("{url}/v1/jobs/{remote}"), &token, None, 60)?;
+        let update = |status: &str, message: &str, files: &[String]| {
+            let (id, status, message, files) = (job["id"].clone(), status.to_string(), message.to_string(), files.to_vec());
+            with_jobs(move |jobs| {
+                if let Some(item) = jobs.iter_mut().find(|item| item["id"] == id) {
+                    item["status"] = json!(status);
+                    item["message"] = json!(message);
+                    item["files"] = json!(files);
+                }
+            });
+        };
+        if status == 404 {
+            update("failed", "本地生视频的任务没了（friday-diffusion 重启过，任务不保留）", &[]);
+            return Err("本地生视频的任务没了（friday-diffusion 重启过，任务不保留）".into());
+        }
+        let state = json_of(status, &data, "本地生视频")?;
+        match state["status"].as_str() {
+            Some("done") => {
+                let files = outputs(&url, &token, &state)?;
+                let _ = send("POST", &format!("{url}/v1/memory/release"), &token, None, 30);
+                update("succeeded", &format!("本机生成的视频（{:.0} 秒）", state["elapsed_ms"].as_f64().unwrap_or(0.0) / 1000.0), &files);
+                Ok((format!("视频做好了：\n{}", files.join("\n")), files))
+            }
+            Some(failed @ ("failed" | "cancelled")) => {
+                let message = state["error"]["message"]
+                    .as_str()
+                    .unwrap_or(if failed == "cancelled" { "取消了" } else { "本地生视频失败" })
+                    .to_string();
+                update("failed", &message, &[]);
+                Err(message)
+            }
+            other => {
+                let message = match other {
+                    Some("queued") => "本地生视频排队中".to_string(),
+                    Some("loading") => "本地生视频：正在加载模型".to_string(),
+                    Some("encoding") => "本地生视频：正在编码".to_string(),
+                    _ => format!(
+                        "本地生视频：{:.0}%（第 {} / {} 步）",
+                        state["progress"].as_f64().unwrap_or(0.0) * 100.0,
+                        state["step"],
+                        state["steps"]
+                    ),
+                };
+                update("running", &message, &[]);
+                Ok((format!("还没做完：{message}。过一会儿（至少 30 秒）再查。"), Vec::new()))
+            }
+        }
+    }
+
+    // MARK: 设置页
+
+    /// 上次推出去的（设置页的状态、动作名）：没变不推
+    static LAST: LazyLock<Mutex<(String, String)>> = LazyLock::new(|| Mutex::new((String::new(), String::new())));
+
+    /// 提供方、动作变了：设置页重列，大脑的动作换一份（本地能力下载时每 80 毫秒一次，只在真变了时推）
+    fn changed() {
+        let page = state().to_string();
+        let names = serde_json::to_string(&actions().iter().map(|action| action["name"].clone()).collect::<Vec<_>>()).unwrap_or_default();
+        let (page_changed, names_changed) = {
+            let mut last = LAST.lock().unwrap();
+            let changed = (last.0 != page, last.1 != names);
+            *last = (page, names);
+            changed
+        };
+        if page_changed {
+            crate::notify_all_clients("capabilities", json!({}));
+        }
+        if names_changed {
+            crate::serve_update_actions();
+        }
+    }
+
+    /// 本地能力变了（装了、关了、模型选了）：提供方跟着
+    pub fn powers_changed() {
+        changed();
+    }
+
+    /// CapabilitiesState
+    pub fn state() -> Value {
+        let mut available = Map::new();
+        let entries: Vec<Value> = entries()
+            .into_iter()
+            .map(|entry| {
+                let disabled: Vec<String> = entry["disabledKinds"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect();
+                let kinds: Vec<&str> = entry["kinds"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+                let infos: Vec<Value> = kinds
+                    .iter()
+                    .filter_map(|raw| kind(raw))
+                    .map(|kind| {
+                        let (ready, needs) = availability(&entry, kind.raw);
+                        available.insert(format!("{}|{}", entry["id"].as_str().unwrap_or(""), kind.raw), json!({ "ready": ready, "needs": needs }));
+                        json!({ "raw": kind.raw, "title": kind.title, "symbol": kind.symbol, "toolName": kind.tool, "detail": kind.detail, "description": kind.detail,
+                            "isBuiltin": true, "allowed": !disabled.iter().any(|item| item == kind.raw) })
+                    })
+                    .collect();
+                let mut provider = entry.clone();
+                if let Some(object) = provider.as_object_mut() {
+                    object.remove("powerEnabled");
+                }
+                provider["kindInfos"] = json!(infos);
+                provider["secretNames"] = json!([]);
+                provider["active"] = json!(entry["enabled"] == true && entry["powerEnabled"] == true);
+                provider["isLocal"] = json!(true);
+                provider["isScript"] = json!(false);
+                provider["createdByAgent"] = json!(false);
+                provider["symbol"] = json!("cpu");
+                provider
+            })
+            .collect();
+        let jobs: Vec<Value> = crate::read_json_file(&jobs_path())["jobs"].as_array().cloned().unwrap_or_default();
+        json!({ "entries": entries, "packages": [], "problems": [], "jobs": jobs, "availability": available, "optionSpecs": {}, "packageFor": {},
+            "providersDirectory": crate::serve_dir().join("providers").to_string_lossy() })
+    }
+
+    /// capabilities.*（设置 › 工具 › 能力提供方看着这台时）
+    pub fn request(method: &str, params: &Value) -> crate::Reply {
+        let id = || params["id"].as_str().filter(|id| !id.is_empty()).map(str::to_string).ok_or((-32602, "缺少参数 id".to_string()));
+        let known = |id: &str| entries().iter().any(|entry| entry["id"] == json!(id));
+        match method {
+            "capabilities.state" | "capabilities.refreshAvailability" => {
+                if method == "capabilities.refreshAvailability" {
+                    changed();
+                }
+                return Ok(state());
+            }
+            "capabilities.setEnabled" => {
+                let id = id()?;
+                if !known(&id) {
+                    return Err((crate::NOT_FOUND, format!("没有提供方 {id}")));
+                }
+                let enabled = params["enabled"].as_bool().unwrap_or(true);
+                save_user(&id, |entry| {
+                    entry.insert("enabled".into(), json!(enabled));
+                });
+            }
+            "capabilities.setKindAllowed" => {
+                let id = id()?;
+                let raw = params["kind"].as_str().unwrap_or("").to_string();
+                if !known(&id) || kind(&raw).is_none() {
+                    return Err((crate::NOT_FOUND, format!("没有提供方 {id} 的这项能力")));
+                }
+                let allowed = params["allowed"].as_bool().unwrap_or(true);
+                save_user(&id, |entry| {
+                    let mut disabled: Vec<Value> = entry.get("disabledKinds").and_then(Value::as_array).cloned().unwrap_or_default();
+                    disabled.retain(|item| *item != json!(raw));
+                    if !allowed {
+                        disabled.push(json!(raw));
+                    }
+                    entry.insert("disabledKinds".into(), json!(disabled));
+                });
+            }
+            "capabilities.setTitle" => {
+                let id = id()?;
+                let title = params["title"].as_str().unwrap_or("").trim().to_string();
+                save_user(&id, |entry| {
+                    if title.is_empty() {
+                        entry.remove("title");
+                    } else {
+                        entry.insert("title".into(), json!(title));
+                    }
+                });
+            }
+            "capabilities.deleteJob" => {
+                let id = id()?;
+                with_jobs(|jobs| jobs.retain(|job| job["id"] != json!(id)));
+            }
+            // 本机的提供方没有选项；提供方包（脚本提供方）这台的 EDITH 还不支持
+            "capabilities.setOption" => {}
+            "capabilities.retest" | "capabilities.import" | "capabilities.export" | "capabilities.deletePackage" => {
+                return Ok(
+                    json!({ "ok": false, "error": "这台的 EDITH 还不支持提供方包（脚本提供方）：本机的提供方跟着设置 › 能力里装的本地能力走" }),
+                );
+            }
+            other => return Err((-32601, format!("没有这个方法：{other}"))),
+        }
+        Ok(json!({}))
     }
 }
 
