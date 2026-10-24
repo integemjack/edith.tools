@@ -6,8 +6,13 @@
 
 ```
 Friday 客户端 ──SSH──▶ edith-friday --attach（一条连接一个）──套接字──▶ 各个工作目录的 EDITH 大脑（edith run --idle --linger）
-                         会话列表直接读 ~/.edith/projects/*/sessions/
+                         │ 会话列表直接读 ~/.edith/projects/*/sessions/              ▲
+                         └──控制口──▶ edith-friday serve（常驻的那份，整台机器一个）──┘ 在每个大脑里是能力「friday」
 ```
+
+**两份**：网关（`--attach`，一个客户端一条，客户端走了就退）只管翻译协议；Friday 专有、要一直在的放在**常驻的那份**
+（`edith-friday serve`，像 edith-connect 的设备服务：整台机器一个）——终端、浏览器、智能体的浏览器工具，之后的本地模型、定时任务、钩子、插件……
+大脑只给它开两个口子：模型地址和钩子（EDITH 的能力协议 §6.6、§6.7）。
 
 - **一条连接一个网关**：客户端断了网关就退出；要一直干的活在大脑里，断了照常跑。几个客户端各开一个网关，看到的是同一份。
 - **连上来接着看**：hello 时连上这台全部在跑的大脑（之后每 5 秒看一次有没有新起的），问它们在干什么——客户端关了又打开、
@@ -36,7 +41,17 @@ Friday 客户端 ──SSH──▶ edith-friday --attach（一条连接一个�
   模型列表读 EDITH 的 `config.json`（顶层那个是 `edith`，`engines` 里的照原样），设置里加改删模型、存删密钥写回 `config.json` / `secrets.json`。
 - **设置页、记忆**：设置 › 智能体（系统提示、要不要批准、新对话的权限模式和模型、默认工作目录）、设置 › 工具（工具开关、技能、MCP 服务）改的是
   EDITH 的 `config.json`、`mcp.json`；工具清单问默认工作目录的大脑（`tools.list`）。设置 › 记忆直接读写 EDITH 的 `memory.json`（模型用 save_memory / search_memory）。
-- **终端、浏览器**：在会话所在目录的大脑里开（`terminals.*`、`browser.*`），客户端断了照常在；输出、画面原样转给接着看的客户端。
+- **常驻的那份**：网关第一次要用时拉起（`~/.edith/friday/serve.json` 登记地址和令牌，`serve.lock` 保证只一份，日志 `serve.log`），
+  它连上这台每个登记了的大脑（主令牌；网关新起的大脑先叫它马上连上，第一轮就有浏览器工具）。在大脑里叫 `friday`（网关叫 `friday-client`），
+  报 `resident`（不算有人连着，大脑闲够了照样退）。没有网关连着、没有在跑的终端、没在干活的大脑，闲半小时自己退，下次用到再起。
+  `EDITH_FRIDAY_HUB=off` 不用它（终端、浏览器用不了）。
+- **终端**：常驻的那份开伪终端跑 shell（macOS / Linux 的 posix_openpt，Windows 的 ConPTY），客户端断了照常跑，接上来重放最近 512 KB 的输出。
+- **浏览器**：常驻的那份起这台装着的 Chrome / Chromium / Edge 的无头模式（`EDITH_BROWSER` 指定别的），标签按会话开，记在
+  `~/.edith/friday/browser/tabs.json`，它重起后按网址重新打开；画面推给看着的客户端。
+- **智能体的浏览器工具**：是常驻那份的动作（`friday__browser_navigate` / `read` / `act` / `screenshot` / `resize` / `tabs` / `hand_over` / `run_js`，
+  照 Friday 的 BrowserTools），操作的就是这段会话在卡片里的那些标签。批准用 PreToolUse 钩子告诉大脑（`need`）：打开新网站按网站问、本机 / 内网另说、
+  点输入跑脚本问一声、自动模式下点付款登录和往密码框卡号输入也问；截图随动作的 `media` 交给能看图的模型；智能体开的标签一轮结束（`done`）关掉，
+  `keep` 的留给用户；`hand_over` 推 `browser.handOver`，用户点「好了」时网关照这段会话选的档位替用户说一句。
 - **助手**：这台没有助手（EDITH 是大脑，助手开在客户端那台上）。客户端的助手看这台的会话走 `activity.*`（开始、跑命令、待确认、做完的简报）；
   助手页看这台时说没开，不说版本太旧。
 
@@ -93,13 +108,13 @@ cp edith ~/.friday-server/bin/                            # 或者 edith 在 PAT
 | 设置页（特性 `config`） | `config.subscribe`、`settings.get` / `update`、`tools.setEnabled` / `skill` / `deleteSkill` / `refreshSkills`、`mcp.*` |
 | 记住的事（特性 `memory`、`memorySearch`） | `memory.get` / `search` / `add` / `setText` / `setPinned` / `archive` / `restore` / `remove`、`memory` 事件 |
 | 终端 | `term.open` / `attach` / `detach` / `write` / `resize` / `close`、`terminals`、`term.output` 事件 |
-| 浏览器 | `browser.open` / `select` / `close` / `navigate` / `watch` / `container` / `fit` / `input` / `dialog`、`browser`、`browser.frame` 事件 |
+| 浏览器 | `browser.open` / `select` / `close` / `navigate` / `watch` / `container` / `fit` / `input` / `dialog` / `handOverDone`、`browser`、`browser.frame`、`browser.handOver` 事件 |
 | 客户端的助手看这台（特性 `activity`、`assistant`） | `activity.subscribe` / `unsubscribe`、`activity` 事件、`assistant.status` |
 
 还不行的（回 `-32601` 没有，或错误 `4` 说明原因；`server.features` 不报，客户端就不显示）：
 
 - 本地模型、定时任务、自我改进、提示词文件、钩子、插件、脚本工具、能力提供方、语音、文件存放位置。
-- 浏览器里智能体请用户接手（EDITH 的智能体还没有浏览器工具）；任务模式（工作方式）只记下，EDITH 一律需要时派子智能体。
+- 任务模式（工作方式）只记下，EDITH 一律需要时派子智能体。
 - 要批准的事：没有客户端连着时大脑等能批准的连上来（最多 10 分钟，过了就不做）；要无人值守就选「完全」权限模式，
   或在 `~/.edith/config.json` 的 `permissions.allow` 里放开、用 `edith --auto`。
 
@@ -112,4 +127,5 @@ cd tools/friday && cargo test
 一头扮 Friday 客户端，一头扮大脑（登记一个假的大脑）：存档翻译、连上来接着看在干的那一轮、发话、流式、批准、干活时补充另起一段、
 排队、停下、改名、空白会话第一次发话才在 EDITH 里建、选目录、列目录、新建文件夹、附件上传、删；子智能体的卡片和运行记录、Agent 树、
 子智能体要批准的、停掉 / 追加指示、交回的汇报不显示；会话改动、改动视图、撤销；出错重试、改一条重发、切分支、分叉；模型、密钥、
-会话上选的档位交给大脑；设置页、MCP、记忆；终端、浏览器转给大脑；会话的动静。
+会话上选的档位交给大脑；设置页、MCP、记忆；会话的动静。常驻的那份：网关拉起它、只一份、闲了自己退；终端真跑 shell（开、输出、重放、关）；
+浏览器真开标签（这台装着 Chrome 时）；连上大脑报的浏览器工具、钩子、`resident`，PreToolUse 替自己的动作说怎么批准，做动作。

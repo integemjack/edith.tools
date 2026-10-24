@@ -27,18 +27,23 @@ impl Drop for Client {
 }
 
 impl Client {
+    /// 不用常驻的那份（终端、浏览器、浏览器工具另有测试）
     fn start(home: &Path, work: &Path) -> Client {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_edith-friday"))
+        Client::start_with(home, work, &[("EDITH_FRIDAY_HUB", "off")])
+    }
+
+    fn start_with(home: &Path, work: &Path, env: &[(&str, &str)]) -> Client {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_edith-friday"));
+        command
             .arg("--attach")
             .env("EDITH_HOME", home)
             .env("EDITH_FRIDAY_DIRECTORY", work)
             // 登记里没有时别真去起一个大脑
-            .env("EDITH_BIN", home.join("no-such-edith"))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+            .env("EDITH_BIN", home.join("no-such-edith"));
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         let (sender, messages) = mpsc::channel();
@@ -172,19 +177,6 @@ fn push(link: &mut Link, session: &str, turn: &str, kind: &str, data: Value) {
     link.send(json!({ "jsonrpc": "2.0", "method": "event", "params": { "session": session, "turn": turn, "type": kind, "data": data } }));
 }
 
-/// 连上来时大脑被问浏览器开着哪些标签：没有
-fn answer_browser(link: &mut Link) {
-    let browser = link.wait_for(10, |message| message["method"] == "browser.state").expect("连上来没问浏览器");
-    reply(link, &browser, json!({ "available": true, "tabs": [] }));
-}
-
-/// 连上来时大脑被问浏览器、开着哪些终端：都没有
-fn answer_terminals(link: &mut Link) {
-    answer_browser(link);
-    let terminals = link.wait_for(10, |message| message["method"] == "terminals.list").expect("连上来没问终端");
-    reply(link, &terminals, json!({ "terminals": [] }));
-}
-
 fn reply(link: &mut Link, request: &Value, result: Value) {
     link.send(json!({ "jsonrpc": "2.0", "id": request["id"], "result": result }));
 }
@@ -228,7 +220,6 @@ fn friday_client_through_gateway() {
         &list,
         json!([{ "id": SESSION, "cwd": work.to_string_lossy(), "working": true, "turn": { "id": "t0", "text": "之前发的" } }]),
     );
-    answer_terminals(&mut link);
     let agents = link.wait_for(10, |message| message["method"] == "agents.list").expect("连上来没问子智能体");
     reply(&mut link, &agents, json!([]));
     let hello = client.reply(hello)["result"].clone();
@@ -551,7 +542,6 @@ fn sub_agents_and_file_changes() {
     let mut link = accept(&brain);
     let list = link.wait_for(10, |message| message["method"] == "sessions.list").unwrap();
     reply(&mut link, &list, json!([]));
-    answer_terminals(&mut link);
     let agents = link.wait_for(10, |message| message["method"] == "agents.list").unwrap();
     reply(
         &mut link,
@@ -780,7 +770,6 @@ fn errors_retry_branches_and_fork() {
     let mut link = accept(&brain);
     let list = link.wait_for(10, |message| message["method"] == "sessions.list").unwrap();
     reply(&mut link, &list, json!([]));
-    answer_terminals(&mut link);
     let agents = link.wait_for(10, |message| message["method"] == "agents.list").unwrap();
     reply(&mut link, &agents, json!([]));
     client.reply(hello);
@@ -900,7 +889,6 @@ fn models_secrets_and_turn_settings() {
     let mut link = accept(&brain);
     let list = link.wait_for(10, |message| message["method"] == "sessions.list").unwrap();
     reply(&mut link, &list, json!([]));
-    answer_terminals(&mut link);
     let agents = link.wait_for(10, |message| message["method"] == "agents.list").unwrap();
     reply(&mut link, &agents, json!([]));
     let hello = client.reply(hello)["result"].clone();
@@ -958,7 +946,6 @@ fn activity_for_the_assistant() {
     let mut link = accept(&brain);
     let list = link.wait_for(10, |message| message["method"] == "sessions.list").unwrap();
     reply(&mut link, &list, json!([]));
-    answer_terminals(&mut link);
     let agents = link.wait_for(10, |message| message["method"] == "agents.list").unwrap();
     reply(&mut link, &agents, json!([]));
     let hello = client.reply(hello)["result"].clone();
@@ -1083,111 +1070,135 @@ fn settings_mcp_and_memory() {
     assert_eq!(client.reply(missing)["error"]["code"], 3);
 }
 
+/// 终端在常驻的那份里（伪终端真跑 shell）：网关拉起它；开、输出、接上重放、写、关；没人用了它自己退
 #[test]
-fn terminals_live_in_the_brain() {
+fn terminals_live_in_the_resident_part() {
+    use base64::Engine;
     let home = scratch("friday-terminals");
     let work = home.join("work");
     std::fs::create_dir_all(work.join(".git")).unwrap();
     write_session(&home, &work);
-    let brain = FakeBrain::new();
-    register(&home, &brain, &work);
-    let mut client = Client::start(&home, &work);
+    let mut client = Client::start_with(&home, &work, &[("EDITH_FRIDAY_HUB", "nobrains"), ("EDITH_FRIDAY_HUB_IDLE", "2")]);
     let hello = client.send("hello", json!({ "protocol": 1 }));
-    let mut link = accept(&brain);
-    let list = link.wait_for(10, |message| message["method"] == "sessions.list").unwrap();
-    reply(&mut link, &list, json!([]));
-    // 连上来问它开着哪些终端（之前开的、客户端断了还在跑的）
-    answer_browser(&mut link);
-    let terminals = link.wait_for(10, |message| message["method"] == "terminals.list").unwrap();
-    let running = json!({ "id": "T0", "conversationID": SESSION, "title": "zsh", "shell": "zsh", "running": true, "cols": 80, "rows": 24 });
-    reply(&mut link, &terminals, json!({ "terminals": [running] }));
-    let agents = link.wait_for(10, |message| message["method"] == "agents.list").unwrap();
-    reply(&mut link, &agents, json!([]));
     let hello = client.reply(hello)["result"].clone();
-    let listed = &hello["state"]["terminals"];
-    assert_eq!(
-        (listed["available"].as_bool(), listed["terminals"][0]["conversationID"].clone()),
-        (Some(true), json!(SESSION.to_uppercase()))
-    );
+    assert_eq!(hello["state"]["terminals"], json!({ "terminals": [], "available": true }), "{hello}");
+    let registered: Value = serde_json::from_slice(&std::fs::read(home.join("friday").join("serve.json")).unwrap()).unwrap();
+    assert!(registered["address"].is_string() && registered["token"].is_string(), "{registered}");
 
-    // 开一个：交给会话所在目录的大脑
-    let open = client.send("term.open", json!({ "id": "T1", "conversationID": SESSION, "cols": 90, "rows": 20, "command": "ls" }));
-    let asked = link.wait_for(10, |message| message["method"] == "terminals.open").unwrap();
-    assert_eq!(
-        (asked["params"]["session"].as_str(), asked["params"]["command"].as_str(), asked["params"]["cols"].as_u64()),
-        (Some(SESSION), Some("ls"), Some(90))
-    );
-    let info = json!({ "id": "T1", "conversationID": SESSION, "title": "zsh", "shell": "zsh", "running": true, "cols": 90, "rows": 20 });
-    reply(&mut link, &asked, info);
-    client.reply(open);
-    client.event("terminals", |params| params["terminals"].as_array().unwrap().len() == 2);
-    // 输出原样转；接上、写、改大小、关都转给那个大脑
-    link.send(json!({ "jsonrpc": "2.0", "method": "terminal.output", "params": { "id": "T1", "data": "aGk=" } }));
-    assert_eq!(client.event("term.output", |params| params["id"] == "T1")["params"]["data"], "aGk=");
-    let attach = client.send("term.attach", json!({ "id": "T0" }));
-    let asked = link.wait_for(10, |message| message["method"] == "terminals.attach").unwrap();
-    reply(&mut link, &asked, json!({ "data": "b2xk", "cols": 80, "rows": 24 }));
-    assert_eq!(client.reply(attach)["result"]["data"], "b2xk");
-    let write = client.send("term.write", json!({ "id": "T1", "data": "bHMK" }));
-    let asked = link.wait_for(10, |message| message["method"] == "terminals.write").unwrap();
-    assert_eq!(asked["params"]["data"], "bHMK");
-    reply(&mut link, &asked, json!({}));
-    client.reply(write);
-    // 大脑说关了：列表跟着变；没有的终端回 3
-    link.send(json!({ "jsonrpc": "2.0", "method": "terminals", "params": { "terminals": [running] } }));
-    client.event("terminals", |params| params["terminals"].as_array().unwrap().len() == 1);
+    let command = if cfg!(windows) { "echo edith-42" } else { "echo edith-$((40+2))" };
+    let open = client.send("term.open", json!({ "id": "T1", "conversationID": SESSION, "cols": 90, "rows": 20, "command": command }));
+    assert!(client.reply(open).get("error").is_none());
+    let listed = client.event("terminals", |params| params["terminals"].as_array().unwrap().len() == 1);
+    assert_eq!(listed["params"]["terminals"][0]["conversationID"], json!(SESSION.to_uppercase()));
+    // 开它的网关收输出（原样的 base64）
+    let mut seen = String::new();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !seen.contains("edith-42") && Instant::now() < deadline {
+        let output = client.event("term.output", |params| params["id"] == "T1");
+        let bytes = base64::engine::general_purpose::STANDARD.decode(output["params"]["data"].as_str().unwrap()).unwrap();
+        seen.push_str(&String::from_utf8_lossy(&bytes));
+    }
+    assert!(seen.contains("edith-42"), "{seen}");
+    // 接上：重放最近的输出
+    let attach = client.send("term.attach", json!({ "id": "T1" }));
+    let replay = client.reply(attach)["result"]["data"].as_str().unwrap().to_string();
+    let replay = String::from_utf8_lossy(&base64::engine::general_purpose::STANDARD.decode(replay).unwrap()).into_owned();
+    assert!(replay.contains("edith-42"), "{replay}");
+    let resize = client.send("term.resize", json!({ "id": "T1", "cols": 100, "rows": 30 }));
+    assert!(client.reply(resize).get("error").is_none());
+    let close = client.send("term.close", json!({ "id": "T1" }));
+    assert!(client.reply(close).get("error").is_none());
+    client.event("terminals", |params| params["terminals"].as_array().unwrap().is_empty());
     let missing = client.send("term.write", json!({ "id": "T1", "data": "" }));
     assert_eq!(client.reply(missing)["error"]["code"], 3);
+    // 客户端走了、没有在跑的终端：闲 2 秒就退，登记删掉
+    drop(client);
+    assert!(edith_tools_support::wait_until(15, || !home.join("friday").join("serve.json").exists()), "常驻的那份没退");
 }
 
+/// 常驻的那份连着大脑（在那里是能力「friday」，网关是 friday-client）：报浏览器工具、钩子、resident；
+/// PreToolUse 替自己的动作说怎么批准；做动作
 #[test]
-fn browser_tabs_live_in_the_brain() {
-    let home = scratch("friday-browser");
+fn resident_part_joins_the_brain() {
+    let home = scratch("friday-resident");
     let work = home.join("work");
     std::fs::create_dir_all(work.join(".git")).unwrap();
     write_session(&home, &work);
     let brain = FakeBrain::new();
     register(&home, &brain, &work);
-    let mut client = Client::start(&home, &work);
+    let mut client = Client::start_with(&home, &work, &[("EDITH_FRIDAY_HUB_IDLE", "2")]);
     let hello = client.send("hello", json!({ "protocol": 1 }));
-    let mut link = accept(&brain);
-    let list = link.wait_for(10, |message| message["method"] == "sessions.list").unwrap();
-    reply(&mut link, &list, json!([]));
-    // 连上来问它开着哪些标签（客户端断了还在的）
-    let browser = link.wait_for(10, |message| message["method"] == "browser.state").unwrap();
-    let old = json!({ "id": "B0", "conversationID": SESSION, "title": "旧的", "url": "https://a.example/", "loading": false, "current": true, "viewport": [1280, 800], "fixed": false });
-    reply(&mut link, &browser, json!({ "available": true, "tabs": [old] }));
-    let terminals = link.wait_for(10, |message| message["method"] == "terminals.list").unwrap();
-    reply(&mut link, &terminals, json!({ "terminals": [] }));
-    let agents = link.wait_for(10, |message| message["method"] == "agents.list").unwrap();
-    reply(&mut link, &agents, json!([]));
+    // 两条连接：网关的、常驻那份的（谁先连上不一定）
+    let (mut gateway, mut resident) = (None, None);
+    for _ in 0..2 {
+        let mut link = brain.accept(15).expect("少了一条连接");
+        let reply = link.handshake(json!({ "name": "EDITH", "version": "test" }));
+        match reply["name"].as_str() {
+            Some("friday-client") => gateway = Some((link, reply)),
+            Some("friday") => resident = Some((link, reply)),
+            other => panic!("不认识的连接 {other:?}：{reply}"),
+        }
+    }
+    let ((mut gateway, gateway_info), (mut resident, info)) = (gateway.unwrap(), resident.unwrap());
+    assert_eq!((gateway_info["approves"].as_bool(), gateway_info.get("resident")), (Some(true), None), "{gateway_info}");
+    assert_eq!((info["resident"].as_bool(), info["hooks"].clone()), (Some(true), json!(["PreToolUse"])), "{info}");
+    assert!(info["receives"].as_array().unwrap().contains(&json!("done")), "{info}");
+    let actions: Vec<&str> = info["actions"].as_array().unwrap().iter().filter_map(|action| action["name"].as_str()).collect();
+    assert!(actions.is_empty() || actions.contains(&"browser_navigate"), "{actions:?}");
+    let list = gateway.wait_for(10, |message| message["method"] == "sessions.list").unwrap();
+    reply(&mut gateway, &list, json!([]));
+    let agents = gateway.wait_for(10, |message| message["method"] == "agents.list").unwrap();
+    reply(&mut gateway, &agents, json!([]));
+    assert!(client.reply(hello).get("error").is_none());
+
+    // 钩子：打开本机地址按网站问、标着本机；看网页不用批准；别的工具不管
+    let hook = |link: &mut Link, id: i64, tool: &str, input: Value| {
+        let params = json!({ "hook_event_name": "PreToolUse", "session_id": SESSION, "tool_name": tool, "tool_input": input });
+        link.send(json!({ "jsonrpc": "2.0", "id": id, "method": "hook", "params": params }));
+        link.wait_for(10, |message| message["id"] == id).expect("钩子没回")["result"].clone()
+    };
+    let navigate = hook(&mut resident, 1, "friday__browser_navigate", json!({ "url": "localhost:3000" }));
+    assert_eq!(navigate["need"]["privateNetwork"], true, "{navigate}");
+    assert_eq!(navigate["need"]["rule"], "friday__browser_navigate(localhost)", "{navigate}");
+    assert_eq!(hook(&mut resident, 2, "friday__browser_read", json!({}))["need"], false);
+    assert_eq!(hook(&mut resident, 3, "write_file", json!({ "path": "a" })), json!({}));
+    let script = hook(&mut resident, 4, "friday__browser_run_js", json!({ "script": "1+1" }));
+    assert_eq!(script["need"]["rule"], "friday__browser_run_js", "{script}");
+    // 动作：这台没装浏览器的说清楚，装了的列出这段会话的标签
+    let act = json!({ "call": "c1", "action": "browser_tabs", "arguments": {}, "session": SESSION, "turn": "t1" });
+    resident.send(json!({ "jsonrpc": "2.0", "id": 5, "method": "act", "params": act }));
+    let done = resident.wait_for(30, |message| message["id"] == 5).expect("动作没回");
+    assert!(done["result"]["text"].as_str().is_some_and(|text| !text.is_empty()), "{done}");
+}
+
+/// 浏览器在常驻的那份里（这台装着 Chrome 时真开一个标签）：标签按会话开、推 browser；没有的标签不理
+#[test]
+fn browser_tabs_live_in_the_resident_part() {
+    let home = scratch("friday-browser");
+    let work = home.join("work");
+    std::fs::create_dir_all(work.join(".git")).unwrap();
+    write_session(&home, &work);
+    let mut client = Client::start_with(&home, &work, &[("EDITH_FRIDAY_HUB", "nobrains"), ("EDITH_FRIDAY_HUB_IDLE", "2")]);
+    let hello = client.send("hello", json!({ "protocol": 1 }));
     let hello = client.reply(hello)["result"].clone();
     let state = &hello["state"]["browser"];
-    assert_eq!((state["available"].as_bool(), state["tabs"][0]["conversationID"].clone()), (Some(true), json!(SESSION.to_uppercase())));
-
-    // 开一个：交给会话所在目录的大脑；之后的请求按标签转给它（刚开的还没等到 browser 通知也行）
-    let open = client.send("browser.open", json!({ "conversationID": SESSION, "url": "example.com" }));
-    let asked = link.wait_for(10, |message| message["method"] == "browser.open").unwrap();
-    assert_eq!((asked["params"]["session"].as_str(), asked["params"]["url"].as_str()), (Some(SESSION), Some("example.com")));
-    reply(&mut link, &asked, json!({ "tab": "B1" }));
-    assert_eq!(client.reply(open)["result"]["tab"], "B1");
-    let watch = client.send("browser.watch", json!({ "tab": "B1", "width": 800, "height": 600 }));
-    let asked = link.wait_for(10, |message| message["method"] == "browser.watch").unwrap();
-    assert_eq!((asked["params"]["tab"].as_str(), asked["params"]["width"].as_u64()), (Some("B1"), Some(800)));
-    reply(&mut link, &asked, json!({}));
-    client.reply(watch);
-    // 画面原样转；标签变了推 browser
-    link.send(json!({ "jsonrpc": "2.0", "method": "browser.frame", "params": { "tab": "B1", "data": "/9j/", "viewport": [800, 600] } }));
-    assert_eq!(client.event("browser.frame", |params| params["tab"] == "B1")["params"]["data"], "/9j/");
-    let new = json!({ "id": "B1", "conversationID": SESSION, "title": "Example", "url": "https://example.com/", "loading": false, "current": true, "viewport": [800, 600], "fixed": false });
-    link.send(json!({ "jsonrpc": "2.0", "method": "browser", "params": { "available": true, "tabs": [old, new] } }));
-    client.event("browser", |params| params["tabs"].as_array().unwrap().len() == 2);
-    let input = client.send("browser.input", json!({ "tab": "B0", "kind": "text", "text": "你好" }));
-    let asked = link.wait_for(10, |message| message["method"] == "browser.input").unwrap();
-    assert_eq!(asked["params"]["text"], "你好");
-    reply(&mut link, &asked, json!({}));
-    client.reply(input);
-    // 没有的标签不理
+    let open = client.send("browser.open", json!({ "conversationID": SESSION, "url": "about:blank" }));
+    let opened = client.reply(open);
+    if state["available"] != true {
+        // 这台没有浏览器：说清楚怎么装
+        assert!(state["reason"].as_str().is_some_and(|reason| !reason.is_empty()), "{state}");
+        assert!(opened.get("error").is_some(), "{opened}");
+        return;
+    }
+    let tab = opened["result"]["tab"].as_str().expect("没开出标签").to_string();
+    let listed = client.event("browser", |params| params["tabs"].as_array().unwrap().iter().any(|item| item["id"] == json!(tab)));
+    let item = listed["params"]["tabs"].as_array().unwrap().iter().find(|item| item["id"] == json!(tab)).unwrap().clone();
+    assert_eq!(item["conversationID"], json!(SESSION.to_uppercase()));
     let unknown = client.send("browser.select", json!({ "tab": "nope" }));
     assert!(client.reply(unknown).get("error").is_none());
+    let close = client.send("browser.close", json!({ "tab": tab }));
+    assert!(client.reply(close).get("error").is_none());
+    client.event("browser", |params| params["tabs"].as_array().unwrap().iter().all(|item| item["id"] != json!(tab)));
+    drop(client);
+    assert!(edith_tools_support::wait_until(15, || !home.join("friday").join("serve.json").exists()), "常驻的那份没退");
 }
