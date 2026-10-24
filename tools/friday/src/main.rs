@@ -528,12 +528,18 @@ impl Meta {
 
 /// 内置工具在 Friday 卡片上的标题和图标（没有的不写）
 fn tool_look(name: &str) -> Option<(&'static str, &'static str)> {
-    // 常驻那份的浏览器工具在大脑里叫 friday__browser_*
+    // 常驻那份的浏览器工具、定时任务、扩展自己的能力在大脑里叫 friday__*
     let name = match name.split_once("__") {
-        Some((owner, action)) if owner.starts_with("friday") && action.starts_with("browser_") => action,
+        Some((owner, action)) if owner.starts_with("friday") => action,
         _ => name,
     };
     Some(match name {
+        "loop" => ("定时任务", "clock.arrow.circlepath"),
+        "create_tool" => ("创建工具", "hammer"),
+        "update_tool" => ("修改工具", "hammer"),
+        "delete_tool" => ("删除工具", "trash"),
+        "list_tools" => ("列出工具", "list.bullet"),
+        "read_tool" => ("查看工具", "doc.text.magnifyingglass"),
         "read_file" => ("读取文件", "doc.text"),
         "write_file" => ("写入文件", "square.and.pencil"),
         "edit_file" => ("修改文件", "pencil"),
@@ -2579,10 +2585,20 @@ fn tools_listing() -> Value {
 /// ToolsState（设置 › 工具）
 fn tools_state(listing: &Value) -> Value {
     let disabled: Vec<&str> = listing["disabled"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+    // 常驻那份的脚本工具（自己一组，不在 descriptors 里重复列）
+    let scripts = hub_scripts();
+    let script_names: Vec<String> = scripts["scriptTools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| tool["name"].as_str())
+        .map(|name| format!("friday__{name}"))
+        .collect();
     let descriptors: Vec<Value> = listing["tools"]
         .as_array()
         .into_iter()
         .flatten()
+        .filter(|tool| !tool["name"].as_str().is_some_and(|name| script_names.iter().any(|script| script == name)))
         .map(|tool| {
             let name = tool["name"].as_str().unwrap_or("");
             let permission = if tool["readOnly"] == true {
@@ -2596,9 +2612,21 @@ fn tools_state(listing: &Value) -> Value {
             };
             let (title, symbol) = tool_look(name).unwrap_or((name, "wrench.and.screwdriver"));
             let group = tool["group"].as_str().unwrap_or("builtin");
+            // 常驻那份的浏览器工具、定时任务算内置的，扩展自己的能力算 meta（同 Friday）
+            let origin = match name.split_once("__") {
+                Some((owner, action)) if group == "capability" && owner.starts_with("friday") => {
+                    if ["create_tool", "update_tool", "delete_tool", "list_tools", "read_tool"].contains(&action) {
+                        "meta"
+                    } else {
+                        "builtin"
+                    }
+                }
+                _ if group == "capability" => "capability",
+                _ => group,
+            };
             let mut descriptor = json!({
                 "name": name, "title": title, "description": tool["description"], "symbol": symbol, "permission": permission,
-                "origin": if group == "capability" { "capability" } else { group }, "enabled": !disabled.contains(&name),
+                "origin": origin, "enabled": !disabled.contains(&name),
                 "alwaysConfirm": false, "consumesQuota": false, "problem": null,
             });
             if tool["parameters"].is_object() {
@@ -2618,9 +2646,19 @@ fn tools_state(listing: &Value) -> Value {
         })
         .collect();
     json!({
-        "descriptors": descriptors, "scriptTools": [], "toolsDirectory": "", "skills": skills,
+        "descriptors": descriptors, "scriptTools": scripts["scriptTools"], "toolsDirectory": scripts["toolsDirectory"], "skills": skills,
         "skillsDirectory": listing["skillsDirectory"].as_str().unwrap_or(""),
     })
+}
+
+/// 常驻那份的脚本工具（设置 › 工具）
+fn hub_scripts() -> Value {
+    if serve_mode() == "off" {
+        return json!({ "scriptTools": [], "toolsDirectory": "" });
+    }
+    hub()
+        .and_then(|hub| hub.request("scripts.state", json!({}), Duration::from_secs(10)))
+        .unwrap_or_else(|_| json!({ "scriptTools": [], "toolsDirectory": "" }))
 }
 
 fn mcp_path() -> PathBuf {
@@ -2782,8 +2820,30 @@ fn settings_request(method: &str, params: &Value) -> Reply {
             config_changed(&["settings"]);
             Ok(settings_state())
         }
+        // 脚本工具（常驻那份的）：存、自测、回滚、建、删
+        "tools.scriptVersions"
+        | "tools.saveScript"
+        | "tools.testScript"
+        | "tools.rollback"
+        | "tools.createScript"
+        | "tools.deleteScript" => {
+            let hub = hub().map_err(|error| (NOT_ALLOWED, error))?;
+            let reply = hub.request(method, params.clone(), Duration::from_secs(660)).map_err(|error| hub_error(&error))?;
+            if method != "tools.scriptVersions" {
+                config_changed(&["tools"]);
+            }
+            Ok(reply)
+        }
         "tools.setEnabled" => {
             let tool = name()?;
+            // 脚本工具的开关记在它的清单里
+            if serve_mode() != "off"
+                && let Ok(hub) = hub()
+                && hub.request("tools.setEnabled", params.clone(), Duration::from_secs(10)).is_ok_and(|reply| reply["handled"] == true)
+            {
+                config_changed(&["tools"]);
+                return Ok(json!({}));
+            }
             let path = config_path();
             let mut config = read_json_file(&path);
             let mut disabled: Vec<Value> = config["disabledTools"].as_array().cloned().unwrap_or_default();
@@ -4338,9 +4398,9 @@ fn notify_all_clients(method: &str, params: Value) {
 /// 只读的浏览器工具（只读权限的一轮也能用）
 const READ_ONLY_BROWSER: [&str; 4] = ["browser_read", "browser_screenshot", "browser_tabs", "browser_hand_over"];
 
-/// 在大脑那里报的：浏览器工具是动作；钩子管 PreToolUse（替这些动作说怎么批准）
-fn serve_initialize() -> Value {
-    let actions: Vec<Value> = browser_tools::definitions()
+/// 常驻那份在大脑里的动作：浏览器工具、定时任务、扩展自己的能力、启用了的脚本工具
+fn serve_actions() -> Vec<Value> {
+    let mut actions: Vec<Value> = browser_tools::definitions()
         .into_iter()
         .map(|definition| {
             let name = definition["name"].as_str().unwrap_or("").to_string();
@@ -4354,7 +4414,6 @@ fn serve_initialize() -> Value {
             })
         })
         .collect();
-    let mut actions = actions;
     // 定时任务（只给主智能体：子 Agent 调了退回）
     actions.push(json!({
         "name": "loop",
@@ -4362,13 +4421,30 @@ fn serve_initialize() -> Value {
         "parameters": { "type": "object", "properties": { "command": { "type": "string", "description": loops::TOOL_COMMAND } }, "required": ["command"] },
         "timeoutSeconds": 30,
     }));
+    actions.extend(scripts::meta_actions());
+    actions.extend(scripts::actions());
+    actions
+}
+
+/// 动作变了（脚本工具加了、改了、开关了）：连着的大脑都换一份
+fn serve_update_actions() {
+    let message = json!({ "jsonrpc": "2.0", "method": "capability.update", "params": { "actions": serve_actions() } });
+    let brains: Vec<Arc<Brain>> = SERVED.lock().unwrap().values().cloned().collect();
+    for brain in brains {
+        brain.write(&message);
+    }
+}
+
+/// 在大脑那里报的：动作（serve_actions）；钩子管 PreToolUse（替浏览器动作说怎么批准）；本地模型的地址
+fn serve_initialize() -> Value {
+    let actions = serve_actions();
     json!({
         "protocolVersion": "1",
         "name": "friday",
         "capability": {
             "title": "Friday",
             "version": VERSION,
-            "description": "Friday 的内置浏览器（用户在浏览器卡片里看得见、能一起操作）、定时任务",
+            "description": "Friday 的内置浏览器（用户在浏览器卡片里看得见、能一起操作）、定时任务、自定义脚本工具",
         },
         "actions": actions,
         "receives": ["turn.started", "done"],
@@ -4401,7 +4477,7 @@ fn serve_hook(params: &Value) -> Value {
     json!({ "need": browser_tools::need(tool, action, &arguments, params["session_id"].as_str().unwrap_or("")) })
 }
 
-fn serve_act(params: &Value) -> Value {
+fn serve_act(params: &Value, brain: &Brain) -> Value {
     let action = params["action"].as_str().unwrap_or("");
     let arguments = params["arguments"].as_object().cloned().unwrap_or_default();
     let session = params["session"].as_str().unwrap_or("");
@@ -4412,6 +4488,29 @@ fn serve_act(params: &Value) -> Value {
         let command = arguments.get("command").and_then(Value::as_str).unwrap_or("").trim();
         let command = if loops::is_command(command) { command.to_string() } else { format!("/loop {command}") };
         return json!({ "text": loops::handle(&command, session, "agent", true), "ok": true });
+    }
+    // 脚本工具、扩展自己的能力：参数里的相对路径按这段会话的工作目录
+    if scripts::is_meta(action) || scripts::is_script(action) {
+        let caller = find_session(session).map(|stored| stored.cwd).filter(|cwd| !cwd.is_empty());
+        let (ok, text, media) = scripts::act(action, &arguments, caller.as_deref(), brain);
+        let media: Vec<Value> = media
+            .into_iter()
+            .map(|path| {
+                let lower = path.to_lowercase();
+                let mime = [
+                    (".png", "image/png"),
+                    (".jpg", "image/jpeg"),
+                    (".jpeg", "image/jpeg"),
+                    (".gif", "image/gif"),
+                    (".webp", "image/webp"),
+                ]
+                .iter()
+                .find(|(extension, _)| lower.ends_with(extension))
+                .map_or("application/octet-stream", |(_, mime)| *mime);
+                json!({ "path": path, "mime": mime })
+            })
+            .collect();
+        return json!({ "text": text, "ok": ok, "media": media });
     }
     match browser_tools::run(action, &arguments, session) {
         Some(outcome) => {
@@ -4437,7 +4536,7 @@ fn serve_brain_message(brain: &Arc<Brain>, message: Value, ready: &mut Option<Se
         (Some("act"), Some(id)) => {
             let brain = brain.clone();
             std::thread::spawn(move || {
-                let result = serve_act(&message["params"]);
+                let result = serve_act(&message["params"], &brain);
                 brain.write(&json!({ "jsonrpc": "2.0", "id": id, "result": result }));
             });
         }
@@ -4594,6 +4693,7 @@ fn serve_request(client: &str, method: &str, params: &Value) -> Reply {
         method if method.starts_with("powers.") => powers_request(method, params),
         method if method.starts_with("models.") => models::request(client, method, params),
         method if method.starts_with("loops.") => loops::request(method, params),
+        method if method == "scripts.state" || method.starts_with("tools.") => scripts::request(method, params),
         other => Err((-32601, format!("常驻的那份没有 {other}"))),
     }
 }
@@ -4673,10 +4773,9 @@ fn serve_client(stream: TcpStream, token: &str) {
             });
         };
         // 慢的（连大脑、起浏览器开标签）另起线程；别的按收到的顺序（打的字、鼠标键盘不能乱）
-        if matches!(
-            method.as_str(),
-            "attach" | "browser.open" | "powers.importVoice" | "powers.deleteVoice" | "models.delete" | "powers.uninstall"
-        ) {
+        let slow = ["attach", "browser.open", "powers.importVoice", "powers.deleteVoice", "models.delete", "powers.uninstall"];
+        let tests = ["tools.saveScript", "tools.testScript", "tools.rollback", "tools.createScript"];
+        if slow.contains(&method.as_str()) || tests.contains(&method.as_str()) {
             let (client, name) = (client.clone(), name.clone());
             std::thread::spawn(move || answer(&client, serve_request(&name, &method, &params)));
         } else {
@@ -4867,6 +4966,10 @@ fn on_hub_message(hub: &Arc<Brain>, message: Value) {
         Some("powers") if STATE.lock().unwrap().powers => event("powers", message["params"].clone()),
         Some("models") if STATE.lock().unwrap().models => event("models", message["params"].clone()),
         Some("loops") if STATE.lock().unwrap().loops => event("loops", message["params"].clone()),
+        // 脚本工具变了：设置页重列（另起线程：重列要问常驻那份，回话得靠这个线程读）
+        Some("scripts") => {
+            std::thread::spawn(|| config_changed(&["tools"]));
+        }
         Some("modelsFailed") => event("modelsFailed", message["params"].clone()),
         // 本地模型下好了：建了本地引擎、给会话换上了（会话上选的记在 friday.json）
         Some("engines.changed") => {
@@ -9259,6 +9362,778 @@ mod loops {
             let monday = Local.with_ymd_and_hms(2026, 10, 19, 9, 0, 0).unwrap().with_timezone(&Utc);
             assert_eq!(weekly.next_after(saturday), Some(monday));
             assert_eq!(weekly.describe(), "工作日 9:00");
+        }
+    }
+}
+
+// MARK: - 自定义脚本工具
+
+mod scripts {
+    //! 自定义脚本工具（照 Friday 的 ScriptTools / MetaTools，Swift / Qt 同一个格式，存储用 friday-core 的 script_tools）：
+    //! 每个工具是 `~/.edith/friday/tools/<名字>/`（tool.json、main.py|sh|js、work/、.versions/vN/；`FRIDAY_TOOLS_DIR` 可以换）。
+    //! 启用了的是常驻那份的动作（`friday__<名字>`），参数 JSON 从标准输入进、结果从标准输出出，按权限加沙盒（macOS sandbox-exec，
+    //! Linux 有 bwrap 时用它），声明的密钥从 EDITH 的密钥库按同名环境变量注入，60 秒超时。智能体用 create_tool / update_tool /
+    //! delete_tool / list_tools / read_tool 自己建、改（存了就用 test_arguments 自测，通过才启用）；设置 › 工具 看着这台时也在这里改。
+    //! 工具变了：各个大脑收 capability.update（动作换一份），网关收 scripts（设置页重列）。
+
+    use std::io::{Read, Write};
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    use friday_core::script_tools;
+    use serde_json::{Map, Value, json};
+
+    const TIMEOUT: Duration = Duration::from_secs(60);
+    /// 不能用的名字（常驻那份自己的动作）
+    const RESERVED: [&str; 6] = ["loop", "create_tool", "update_tool", "delete_tool", "list_tools", "read_tool"];
+
+    pub fn root() -> PathBuf {
+        match std::env::var_os("FRIDAY_TOOLS_DIR").filter(|dir| !dir.is_empty()) {
+            Some(dir) => PathBuf::from(dir),
+            None => crate::serve_dir().join("tools"),
+        }
+    }
+
+    fn all() -> Vec<Value> {
+        script_tools::load_all(&root())
+    }
+
+    fn load(name: &str) -> Option<Value> {
+        script_tools::is_valid_name(name).then(|| script_tools::load(&root().join(name))).flatten()
+    }
+
+    fn usable(tool: &Value) -> bool {
+        let name = tool["manifest"]["name"].as_str().unwrap_or("");
+        !RESERVED.contains(&name) && !crate::browser_tools::is_tool(name)
+    }
+
+    // MARK: 跑
+
+    struct Run {
+        exit_code: i64,
+        stdout: String,
+        stderr: String,
+        timed_out: bool,
+    }
+
+    impl Run {
+        fn passed(&self) -> bool {
+            self.exit_code == 0 && !self.timed_out
+        }
+
+        fn summary(&self) -> String {
+            script_tools::run_summary(self.exit_code, &self.stdout, &self.stderr, self.timed_out, TIMEOUT.as_secs_f64())
+        }
+    }
+
+    fn which(name: &str) -> Option<PathBuf> {
+        let suffixes: &[&str] = if cfg!(windows) { &[".exe", ".cmd", ".bat", ""] } else { &[""] };
+        std::env::split_paths(&std::env::var_os("PATH")?)
+            .flat_map(|dir| suffixes.iter().map(move |suffix| dir.join(format!("{name}{suffix}"))))
+            .find(|path| path.is_file())
+    }
+
+    /// 解释器：python3 / bash / node（Windows 上 python 试 python3、python、py，跳过 WindowsApps 里的占位；bash 找 Git Bash）
+    fn interpreter(language: &str) -> Option<PathBuf> {
+        match language {
+            "bash" if cfg!(windows) => {
+                let candidates =
+                    ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"].iter().filter_map(std::env::var_os).flat_map(|base| {
+                        [
+                            PathBuf::from(&base).join("Git").join("bin").join("bash.exe"),
+                            PathBuf::from(&base).join("Programs").join("Git").join("bin").join("bash.exe"),
+                        ]
+                    });
+                candidates.into_iter().find(|path| path.is_file()).or_else(|| which("bash"))
+            }
+            "bash" => Some(PathBuf::from("/bin/bash")).filter(|path| path.is_file()).or_else(|| which("bash")),
+            "node" => which("node"),
+            _ if cfg!(windows) => ["python3", "python", "py"]
+                .iter()
+                .filter_map(|name| which(name))
+                .find(|path| !path.to_string_lossy().contains("WindowsApps")),
+            _ => which("python3"),
+        }
+    }
+
+    fn title_of(language: &str) -> &'static str {
+        match language {
+            "bash" => "Bash",
+            "node" => "JavaScript (Node)",
+            _ => "Python",
+        }
+    }
+
+    /// 按权限加的沙盒：只读 / 联网级别不能写文件（临时目录与 work/ 除外），只读 / 写文件级别不能联网，execute 级别不加
+    fn sandbox(permission: &str, writable: &Path) -> Vec<String> {
+        if permission == "execute" {
+            return Vec::new();
+        }
+        if cfg!(target_os = "macos") {
+            if !Path::new("/usr/bin/sandbox-exec").exists() {
+                return Vec::new();
+            }
+            let mut rules = vec!["(version 1)".to_string(), "(allow default)".to_string()];
+            if permission != "network" {
+                rules.push("(deny network-outbound (remote ip))".into());
+            }
+            if permission != "writeFiles" {
+                let path = crate::canonical(writable).to_string_lossy().replace('"', "\\\"");
+                rules.push("(deny file-write*)".into());
+                rules.push(format!("(allow file-write* (subpath \"/private/tmp\") (subpath \"/private/var/folders\") (subpath \"/dev\") (subpath \"{path}\"))"));
+            }
+            return vec!["/usr/bin/sandbox-exec".into(), "-p".into(), rules.join("\n")];
+        }
+        if cfg!(windows) {
+            return Vec::new();
+        }
+        let Some(bwrap) = which("bwrap") else { return Vec::new() };
+        // 有的机器上 bwrap 装了却用不了（没开用户命名空间）：试一下
+        let works = Command::new(&bwrap)
+            .args(["--ro-bind", "/", "/", "--dev-bind", "/dev", "/dev", "true"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !works {
+            return Vec::new();
+        }
+        let mut arguments = vec![bwrap.to_string_lossy().into_owned()];
+        if permission == "writeFiles" {
+            arguments.extend(["--bind", "/", "/", "--dev-bind", "/dev", "/dev"].map(str::to_string));
+        } else {
+            arguments.extend(["--ro-bind", "/", "/", "--dev-bind", "/dev", "/dev"].map(str::to_string));
+            let temporary = std::env::temp_dir();
+            for dir in [temporary.as_path(), Path::new("/tmp"), Path::new("/var/tmp"), writable] {
+                if dir.is_dir() {
+                    let path = crate::canonical(dir).to_string_lossy().into_owned();
+                    arguments.extend(["--bind".to_string(), path.clone(), path]);
+                }
+            }
+        }
+        if permission != "network" {
+            arguments.push("--unshare-net".into());
+        }
+        arguments.push("--die-with-parent".into());
+        arguments
+    }
+
+    /// 脚本声明的密钥：从 EDITH 的密钥库按同名环境变量给它（别的密钥它看不到）
+    fn secrets(names: &[String]) -> Vec<(String, String)> {
+        let store = crate::read_json_file(&crate::edith_home().join("secrets.json"));
+        names.iter().filter_map(|name| store[name].as_str().map(|value| (name.clone(), value.to_string()))).collect()
+    }
+
+    fn run(tool: &Value, arguments: &Value, caller: Option<&str>) -> Result<Run, String> {
+        let manifest = &tool["manifest"];
+        let language = manifest["language"].as_str().unwrap_or("python");
+        let directory = PathBuf::from(tool["directory"].as_str().unwrap_or(""));
+        let work = directory.join("work");
+        let _ = std::fs::create_dir_all(&work);
+        let entry = directory.join(script_tools::file_name(language));
+        let interpreter = interpreter(language).ok_or_else(|| {
+            format!("找不到 {}，请先安装 {}", if language == "python" { "python3" } else { language }, title_of(language))
+        })?;
+        let wrapper = sandbox(manifest["permission"].as_str().unwrap_or("execute"), &work);
+        let mut command = match wrapper.split_first() {
+            Some((program, rest)) => {
+                let mut command = Command::new(program);
+                command.args(rest).arg(&interpreter).arg(&entry);
+                command
+            }
+            None => {
+                let mut command = Command::new(&interpreter);
+                command.arg(&entry);
+                command
+            }
+        };
+        command.current_dir(&work).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        command.env("FRIDAY_TOOL_DIR", &directory).env("FRIDAY_WORK_DIR", &work);
+        // 对话的工作目录：脚本的当前目录是工具自己的工作文件夹，参数里的相对路径按它解析
+        if let Some(caller) = caller.filter(|caller| !caller.is_empty()) {
+            command.env("FRIDAY_CWD", caller);
+        }
+        let names: Vec<String> =
+            manifest["secrets"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect();
+        command.envs(secrets(&names));
+        #[cfg(unix)]
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            command.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000);
+        }
+        let mut child = command.spawn().map_err(|error| format!("无法启动 {}：{error}", interpreter.display()))?;
+        let input = serde_json::to_vec(if arguments.is_null() { &Value::Null } else { arguments }).unwrap_or_default();
+        if let Some(mut stdin) = child.stdin.take() {
+            std::thread::spawn(move || {
+                let _ = stdin.write_all(&input);
+            });
+        }
+        let read = |pipe: Option<Box<dyn Read + Send>>| {
+            std::thread::spawn(move || {
+                let mut text = Vec::new();
+                if let Some(mut pipe) = pipe {
+                    let _ = pipe.read_to_end(&mut text);
+                }
+                String::from_utf8_lossy(&text).trim().to_string()
+            })
+        };
+        let stdout = read(child.stdout.take().map(|pipe| Box::new(pipe) as Box<dyn Read + Send>));
+        let stderr = read(child.stderr.take().map(|pipe| Box::new(pipe) as Box<dyn Read + Send>));
+        let started = Instant::now();
+        let (code, timed_out) = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break (status.code().map(i64::from).unwrap_or(-1), false),
+                Ok(None) if started.elapsed() >= TIMEOUT => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break (-1, true);
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(error) => return Err(error.to_string()),
+            }
+        };
+        Ok(Run { exit_code: code, stdout: stdout.join().unwrap_or_default(), stderr: stderr.join().unwrap_or_default(), timed_out })
+    }
+
+    /// 存成新版本（先关着），用 testArguments 自测，通过才启用；回 (存好的工具, 自测)
+    fn save_and_test(manifest: &Map<String, Value>, code: &str, caller: Option<&str>) -> Result<(Value, Run), String> {
+        let mut pending = manifest.clone();
+        pending.insert("enabled".into(), json!(false));
+        let mut tool = script_tools::save(&root(), &pending, code)?;
+        let arguments =
+            Some(tool["manifest"]["testArguments"].clone()).filter(|arguments| !arguments.is_null()).unwrap_or_else(|| json!({}));
+        let test = run(&tool, &arguments, caller).unwrap_or_else(|error| Run {
+            exit_code: -1,
+            stdout: String::new(),
+            stderr: error,
+            timed_out: false,
+        });
+        let mut manifest = tool["manifest"].as_object().cloned().unwrap_or_default();
+        manifest.insert(
+            "lastTest".into(),
+            json!({ "passed": test.passed(), "output": test.summary(), "date": friday_core::archive::now_iso8601() }),
+        );
+        manifest.insert("enabled".into(), json!(test.passed()));
+        script_tools::update_manifest(&root(), &manifest)?;
+        tool["manifest"] = Value::Object(manifest);
+        changed();
+        Ok((tool, test))
+    }
+
+    // MARK: 动作
+
+    /// 启用了的脚本工具：常驻那份的动作
+    pub fn actions() -> Vec<Value> {
+        all()
+            .into_iter()
+            .filter(|tool| tool["manifest"]["enabled"] == true && usable(tool))
+            .map(|tool| {
+                let manifest = &tool["manifest"];
+                json!({
+                    "name": manifest["name"],
+                    "description": manifest["description"],
+                    "parameters": manifest["parameters"],
+                    "readOnly": manifest["permission"] == "readOnly",
+                    "timeoutSeconds": 90,
+                })
+            })
+            .collect()
+    }
+
+    fn property(description: &str, kind: &str) -> Value {
+        json!({ "type": kind, "description": description })
+    }
+
+    /// 扩展自己的能力（同 Friday 的 MetaTools；说明同 prompts-tools.md 的 tool.create_tool……）
+    pub fn meta_actions() -> Vec<Value> {
+        let permission = "readOnly（只读）| network（需要联网）| writeFiles（需要写文件）| execute（需要执行任意命令，不受沙盒限制）";
+        let code = "完整脚本源码：从标准输入读取 JSON 参数，把结果打印到标准输出；出错时写标准错误并以非零状态码退出。当前目录是工具自己的工作文件夹，参数里的相对路径按环境变量 FRIDAY_CWD（对话的工作目录）解析";
+        let fields = |update: bool| {
+            let mut properties = Map::new();
+            properties.insert(
+                "name".into(),
+                property(
+                    if update {
+                        "要修改的工具名"
+                    } else {
+                        "工具名，小写字母开头，只含小写字母、数字、下划线，如 get_weather"
+                    },
+                    "string",
+                ),
+            );
+            if !update {
+                properties.insert("title".into(), property("给用户看的中文名称", "string"));
+            }
+            properties.insert(
+                "description".into(),
+                property(if update { "新的描述" } else { "工具做什么、什么时候该用它，写清楚参数含义" }, "string"),
+            );
+            properties.insert("parameters".into(), property(if update { "新的参数 JSON Schema" } else { "参数的 JSON Schema，例如 {\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\",\"description\":\"城市\"}},\"required\":[\"city\"]}" }, "object"));
+            properties.insert("language".into(), property("python | bash | node", "string"));
+            properties.insert("code".into(), property(if update { "新的完整源码" } else { code }, "string"));
+            properties.insert("permission".into(), property(permission, "string"));
+            properties.insert("secrets".into(), json!({ "type": "array", "items": { "type": "string" }, "description": if update { "新的密钥名数组" } else { "脚本需要的密钥名数组（如 [\"DASHSCOPE_API_KEY\"]），运行时以同名环境变量注入；没有的密钥要用户在设置 › 服务与密钥里加" } }));
+            properties.insert("test_arguments".into(), property(if update { "新的自测参数" } else { "用于自测的一组真实参数" }, "object"));
+            let required: Vec<&str> = if update {
+                vec!["name"]
+            } else {
+                vec!["name", "description", "parameters", "language", "code", "permission", "test_arguments"]
+            };
+            json!({ "type": "object", "properties": properties, "required": required })
+        };
+        let name_only = |description: &str| json!({ "type": "object", "properties": { "name": property(description, "string") }, "required": ["name"] });
+        vec![
+            json!({ "name": "create_tool", "description": "当现有工具无法完成任务时，编写一个新的脚本工具并注册。创建后会自动用 test_arguments 自测，通过就启用，马上就能调用。", "parameters": fields(false), "timeoutSeconds": 120 }),
+            json!({ "name": "update_tool", "description": "修改已有的自定义工具（例如修复自测失败的代码）。只需提供要改的字段，旧版本会自动保留以便回滚。", "parameters": fields(true), "timeoutSeconds": 120 }),
+            json!({ "name": "delete_tool", "description": "删除一个自定义工具（移到工具目录的 .trash 里）。", "parameters": name_only("要删除的工具名") }),
+            json!({ "name": "list_tools", "description": "列出当前所有工具（内置、自定义脚本、MCP）及其状态。", "parameters": { "type": "object", "properties": {} }, "readOnly": true }),
+            json!({ "name": "read_tool", "description": "查看某个自定义工具的清单和源码，修改前先读一遍。", "parameters": name_only("工具名"), "readOnly": true }),
+        ]
+    }
+
+    pub fn is_meta(action: &str) -> bool {
+        RESERVED[1..].contains(&action)
+    }
+
+    pub fn is_script(action: &str) -> bool {
+        load(action).is_some_and(|tool| tool["manifest"]["enabled"] == true && usable(&tool))
+    }
+
+    /// 兜底修正模型写的 schema：必须是 type=object
+    fn normalized_schema(value: Option<&Value>) -> Value {
+        let mut schema = value.and_then(Value::as_object).cloned().unwrap_or_default();
+        schema.entry("type").or_insert(json!("object"));
+        if !schema.contains_key("properties") {
+            // 有些模型直接给出 properties 本身
+            let looks = schema.len() > 1 && schema.iter().filter(|(key, _)| *key != "type").all(|(_, value)| value.get("type").is_some());
+            if looks {
+                let properties: Map<String, Value> =
+                    schema.iter().filter(|(key, _)| *key != "type").map(|(key, value)| (key.clone(), value.clone())).collect();
+                schema = Map::new();
+                schema.insert("type".into(), json!("object"));
+                schema.insert("properties".into(), Value::Object(properties));
+            } else {
+                schema.insert("properties".into(), json!({}));
+            }
+        }
+        Value::Object(schema)
+    }
+
+    fn language(value: &str) -> Option<&'static str> {
+        match value.trim().to_lowercase().as_str() {
+            "python" | "python3" | "py" => Some("python"),
+            "bash" | "sh" | "shell" | "zsh" => Some("bash"),
+            "node" | "javascript" | "js" | "nodejs" => Some("node"),
+            _ => None,
+        }
+    }
+
+    fn secret_names(value: Option<&Value>) -> Option<Vec<Value>> {
+        let names: Vec<String> = match value? {
+            Value::Array(items) => items.iter().filter_map(Value::as_str).map(str::to_string).collect(),
+            Value::String(text) => text.split([',', ' ']).filter(|name| !name.is_empty()).map(str::to_string).collect(),
+            _ => return None,
+        };
+        Some(names.into_iter().map(|name| json!(name.trim().to_uppercase())).collect())
+    }
+
+    fn code_of(arguments: &Map<String, Value>) -> Option<String> {
+        let code = arguments.get("code")?.as_str()?;
+        if code.trim().is_empty() {
+            return None;
+        }
+        Some(if code.ends_with('\n') { code.to_string() } else { format!("{code}\n") })
+    }
+
+    fn report(tool: &Value, test: &Run, created: bool) -> (bool, String) {
+        let name = tool["manifest"]["name"].as_str().unwrap_or("");
+        let version = tool["manifest"]["version"].as_i64().unwrap_or(1);
+        let action = if created { "已创建".to_string() } else { format!("已更新到 v{version}") };
+        if test.passed() {
+            (true, format!("工具 {name} {action}，自测通过，已载入。\n自测输出：\n{}", test.summary()))
+        } else {
+            (
+                false,
+                format!(
+                    "工具 {name} {action}（已保存为 v{version}），但自测失败，暂未启用。请用 update_tool（name 仍为 {name}）修正后再试：\n{}",
+                    test.summary()
+                ),
+            )
+        }
+    }
+
+    /// 智能体的动作：脚本工具、扩展自己的能力（回 (成没成, 给模型看的, 产出的文件)）
+    pub fn act(action: &str, arguments: &Map<String, Value>, caller: Option<&str>, brain: &crate::Brain) -> (bool, String, Vec<String>) {
+        let text =
+            |key: &str| arguments.get(key).and_then(Value::as_str).map(str::trim).filter(|text| !text.is_empty()).map(str::to_string);
+        let failed = |message: String| (false, message, Vec::new());
+        match action {
+            "list_tools" => {
+                let listing = brain.request("tools.list", json!({}), Duration::from_secs(15)).unwrap_or_default();
+                let disabled: Vec<&str> = listing["disabled"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+                let mut lines: Vec<String> = listing["tools"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|tool| {
+                        !tool["name"].as_str().is_some_and(|name| name.starts_with("friday__") && is_script(&name["friday__".len()..]))
+                    })
+                    .map(|tool| {
+                        let name = tool["name"].as_str().unwrap_or("");
+                        let first = tool["description"].as_str().unwrap_or("").split(['。', '\n']).next().unwrap_or("").to_string();
+                        let state = if disabled.contains(&name) { "［已停用］" } else { "" };
+                        format!(
+                            "- {name}（{}，{}）{state}：{first}",
+                            tool["group"].as_str().unwrap_or("builtin"),
+                            if tool["readOnly"] == true { "只读" } else { "会改东西" }
+                        )
+                    })
+                    .collect();
+                for tool in all() {
+                    let manifest = &tool["manifest"];
+                    let state = if manifest["enabled"] == true { "" } else { "［已停用］" };
+                    lines.push(format!(
+                        "- friday__{}（自定义脚本，{}）{state}：{}",
+                        manifest["name"].as_str().unwrap_or(""),
+                        manifest["permission"].as_str().unwrap_or(""),
+                        manifest["description"].as_str().unwrap_or("")
+                    ));
+                }
+                (true, lines.join("\n"), Vec::new())
+            }
+            "read_tool" => {
+                let Some(tool) = text("name").and_then(|name| load(&name)) else {
+                    return failed(format!("没有名为 {} 的自定义工具（内置和 MCP 工具不能查看源码）", text("name").unwrap_or_default()));
+                };
+                let manifest = &tool["manifest"];
+                let mut out = format!(
+                    "清单：\n{}\n权限：{}，语言：{}，版本：v{}\n",
+                    serde_json::to_string_pretty(&manifest["parameters"]).unwrap_or_default(),
+                    manifest["permission"].as_str().unwrap_or(""),
+                    manifest["language"].as_str().unwrap_or(""),
+                    manifest["version"]
+                );
+                if manifest["lastTest"].is_object() {
+                    out += &format!(
+                        "上次自测：{}\n{}\n",
+                        if manifest["lastTest"]["passed"] == true { "通过" } else { "失败" },
+                        manifest["lastTest"]["output"].as_str().unwrap_or("")
+                    );
+                }
+                (true, out + "源码：\n" + tool["code"].as_str().unwrap_or(""), Vec::new())
+            }
+            "create_tool" => {
+                let Some(name) = text("name") else { return failed("缺少参数 name".into()) };
+                if !script_tools::is_valid_name(&name) || RESERVED.contains(&name.as_str()) || crate::browser_tools::is_tool(&name) {
+                    return failed(format!(
+                        "工具名 {name} 不合法：需小写字母开头，只含小写字母、数字、下划线，3–41 个字符，也不能和已有的工具重名"
+                    ));
+                }
+                if load(&name).is_some() {
+                    return failed(format!("已存在名为 {name} 的工具，请换个名字，或用 update_tool 修改"));
+                }
+                let Some(language) = text("language").and_then(|value| language(&value)) else {
+                    return failed("language 只能是 python | bash | node".into());
+                };
+                let permission = text("permission").unwrap_or_else(|| "readOnly".into());
+                if !script_tools::PERMISSIONS.contains(&permission.as_str()) {
+                    return failed("permission 只能是 readOnly | network | writeFiles | execute".into());
+                }
+                let Some(description) = text("description") else { return failed("缺少参数 description".into()) };
+                let Some(code) = code_of(arguments) else { return failed("缺少参数 code".into()) };
+                let mut manifest = Map::new();
+                manifest.insert("name".into(), json!(name));
+                manifest.insert("title".into(), json!(text("title").unwrap_or_else(|| name.clone())));
+                manifest.insert("description".into(), json!(description));
+                manifest.insert("permission".into(), json!(permission));
+                manifest.insert("language".into(), json!(language));
+                manifest.insert("parameters".into(), normalized_schema(arguments.get("parameters")));
+                manifest.insert(
+                    "testArguments".into(),
+                    arguments.get("test_arguments").filter(|value| value.is_object()).cloned().unwrap_or(json!({})),
+                );
+                if let Some(secrets) = secret_names(arguments.get("secrets")) {
+                    manifest.insert("secrets".into(), json!(secrets));
+                }
+                manifest.insert("createdBy".into(), json!("agent"));
+                match save_and_test(&manifest, &code, caller) {
+                    Ok((tool, test)) => {
+                        let (ok, text) = report(&tool, &test, true);
+                        (ok, text, Vec::new())
+                    }
+                    Err(error) => failed(error),
+                }
+            }
+            "update_tool" => {
+                let Some(name) = text("name") else { return failed("缺少参数 name".into()) };
+                let Some(existing) = load(&name) else {
+                    return failed(format!("没有名为 {name} 的自定义工具，请用 create_tool 创建"));
+                };
+                let mut manifest = existing["manifest"].as_object().cloned().unwrap_or_default();
+                if let Some(description) = text("description") {
+                    manifest.insert("description".into(), json!(description));
+                }
+                if let Some(value) = text("language") {
+                    let Some(language) = language(&value) else { return failed("language 只能是 python | bash | node".into()) };
+                    manifest.insert("language".into(), json!(language));
+                }
+                if let Some(permission) = text("permission") {
+                    if !script_tools::PERMISSIONS.contains(&permission.as_str()) {
+                        return failed("permission 只能是 readOnly | network | writeFiles | execute".into());
+                    }
+                    manifest.insert("permission".into(), json!(permission));
+                }
+                if arguments.contains_key("parameters") {
+                    manifest.insert("parameters".into(), normalized_schema(arguments.get("parameters")));
+                }
+                if let Some(test) = arguments.get("test_arguments").filter(|value| value.is_object()) {
+                    manifest.insert("testArguments".into(), test.clone());
+                }
+                if arguments.contains_key("secrets")
+                    && let Some(secrets) = secret_names(arguments.get("secrets"))
+                {
+                    manifest.insert("secrets".into(), json!(secrets));
+                }
+                manifest.insert("createdBy".into(), json!("agent"));
+                let code = code_of(arguments).unwrap_or_else(|| existing["code"].as_str().unwrap_or("").to_string());
+                match save_and_test(&manifest, &code, caller) {
+                    Ok((tool, test)) => {
+                        let (ok, text) = report(&tool, &test, false);
+                        (ok, text, Vec::new())
+                    }
+                    Err(error) => failed(error),
+                }
+            }
+            "delete_tool" => {
+                let Some(name) = text("name") else { return failed("缺少参数 name".into()) };
+                match remove(&name) {
+                    Ok(()) => (true, format!("已删除工具 {name}（已移到工具目录的 .trash 里）。"), Vec::new()),
+                    Err(error) => failed(error),
+                }
+            }
+            name => {
+                let Some(tool) = load(name).filter(|tool| tool["manifest"]["enabled"] == true) else {
+                    return failed(format!("没有启用的工具 {name}"));
+                };
+                match run(&tool, &Value::Object(arguments.clone()), caller) {
+                    Ok(result) => {
+                        let work = PathBuf::from(tool["directory"].as_str().unwrap_or("")).join("work");
+                        let media = if result.passed() {
+                            script_tools::media_paths(&result.stdout, &work, &crate::user_home())
+                        } else {
+                            Vec::new()
+                        };
+                        (result.passed(), result.summary(), media)
+                    }
+                    Err(error) => failed(error),
+                }
+            }
+        }
+    }
+
+    /// 移到工具目录的 .trash 里（误删还能找回来）
+    fn remove(name: &str) -> Result<(), String> {
+        let directory = root().join(name);
+        if !script_tools::is_valid_name(name) || !directory.is_dir() {
+            return Err(format!("没有名为 {name} 的自定义工具"));
+        }
+        let trash = root().join(".trash");
+        std::fs::create_dir_all(&trash).map_err(|error| error.to_string())?;
+        let target = trash.join(format!("{name}-{}", chrono::Local::now().format("%Y%m%d-%H%M%S")));
+        std::fs::rename(&directory, &target).map_err(|error| format!("未能将“{name}”移走：{error}"))?;
+        changed();
+        Ok(())
+    }
+
+    /// 工具变了：各个大脑换一份动作，网关的设置页重列
+    fn changed() {
+        crate::serve_update_actions();
+        crate::notify_all_clients("scripts", json!({}));
+    }
+
+    // MARK: 设置 › 工具
+
+    /// ScriptTool（同 Friday：清单的各键 + code、directory、entry、hasLastTest、lastTest……）
+    fn tool_json(tool: &Value) -> Value {
+        let manifest = tool["manifest"].as_object().cloned().unwrap_or_default();
+        let language = manifest.get("language").and_then(Value::as_str).unwrap_or("python").to_string();
+        let permission = manifest.get("permission").and_then(Value::as_str).unwrap_or("readOnly").to_string();
+        let directory = tool["directory"].as_str().unwrap_or("").to_string();
+        let mut value = Value::Object(manifest.clone());
+        let (permission_title, permission_symbol) = match permission.as_str() {
+            "readOnly" => ("只读", "eye"),
+            "network" => ("需要联网", "network"),
+            "writeFiles" => ("需要写文件", "square.and.pencil"),
+            _ => ("需要执行命令", "terminal"),
+        };
+        value["id"] = manifest.get("name").cloned().unwrap_or_default();
+        value["manifest"] = Value::Object(manifest.clone());
+        value["permissionTitle"] = json!(permission_title);
+        value["permissionSymbol"] = json!(permission_symbol);
+        value["languageTitle"] = json!(title_of(&language));
+        value["fileName"] = json!(script_tools::file_name(&language));
+        value["parametersText"] =
+            json!(serde_json::to_string_pretty(&manifest.get("parameters").cloned().unwrap_or(Value::Null)).unwrap_or_default());
+        value["testArgumentsText"] = json!(
+            manifest.get("testArguments").map(|arguments| serde_json::to_string_pretty(arguments).unwrap_or_default()).unwrap_or_default()
+        );
+        value["hasLastTest"] = json!(manifest.get("lastTest").is_some_and(Value::is_object));
+        value["lastTest"] = manifest.get("lastTest").cloned().unwrap_or(json!({}));
+        value["secrets"] = manifest.get("secrets").cloned().unwrap_or(json!([]));
+        value["code"] = tool["code"].clone();
+        value["directory"] = json!(directory);
+        value["entry"] = json!(format!("{directory}/{}", script_tools::file_name(&language)));
+        value["workDirectory"] = json!(format!("{directory}/work"));
+        value["plugin"] = json!("");
+        value
+    }
+
+    pub fn state() -> Value {
+        json!({ "scriptTools": all().iter().map(tool_json).collect::<Vec<_>>(), "toolsDirectory": root().to_string_lossy() })
+    }
+
+    /// 新建表单的模板源码（按这台的系统给）
+    fn template(language: &str) -> String {
+        match language {
+            "bash" if cfg!(target_os = "macos") => "#!/bin/bash\n# 参数 JSON 从标准输入读入；macOS 自带 plutil 可以解析 JSON\ninput=$(cat)\ntext=$(echo \"$input\" | plutil -extract text raw -o - - 2>/dev/null)\necho \"{\\\"result\\\": \\\"$text\\\"}\"\n".into(),
+            "bash" => "#!/bin/bash\n# 参数 JSON 从标准输入读入；系统自带的 sed 可以取出简单的字符串字段\ninput=$(cat)\ntext=$(echo \"$input\" | sed -n 's/.*\"text\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p')\necho \"{\\\"result\\\": \\\"$text\\\"}\"\n".into(),
+            "node" => "let input = \"\";\nprocess.stdin.on(\"data\", (chunk) => (input += chunk));\nprocess.stdin.on(\"end\", () => {\n  const args = JSON.parse(input || \"{}\");\n  console.log(JSON.stringify({ result: String(args.text ?? \"\").toUpperCase() }));\n});\n".into(),
+            _ => "import json, sys\n\nargs = json.load(sys.stdin)\ntext = args.get(\"text\", \"\")\nprint(json.dumps({\"result\": text.upper()}, ensure_ascii=False))\n".into(),
+        }
+    }
+
+    /// 界面传来的清单（键同 ScriptTool；parametersText / testArgumentsText 是 JSON 文本）叠到这台已有的上
+    fn manifest_from(given: &Map<String, Value>, base: Option<&Value>) -> Result<Map<String, Value>, String> {
+        let mut manifest = base.and_then(|base| base["manifest"].as_object().cloned()).unwrap_or_default();
+        for key in ["name", "title", "description", "symbol", "permission", "language", "enabled", "secrets"] {
+            if let Some(value) = given.get(key).filter(|value| !value.is_null()) {
+                manifest.insert(key.into(), value.clone());
+            }
+        }
+        if let Some(text) = given.get("parametersText").and_then(Value::as_str) {
+            manifest.insert("parameters".into(), serde_json::from_str(text).map_err(|_| "参数 schema 不是合法的 JSON".to_string())?);
+        } else if let Some(parameters) = given.get("parameters") {
+            manifest.insert("parameters".into(), parameters.clone());
+        }
+        if let Some(text) = given.get("testArgumentsText").and_then(Value::as_str) {
+            if text.trim().is_empty() {
+                manifest.remove("testArguments");
+            } else {
+                manifest.insert("testArguments".into(), serde_json::from_str(text).map_err(|_| "自测参数不是合法的 JSON".to_string())?);
+            }
+        }
+        manifest.insert("createdBy".into(), json!("user"));
+        Ok(manifest)
+    }
+
+    /// tools.*（设置 › 工具看着这台时；会马上在这台上跑代码的都会自测）
+    pub fn request(method: &str, params: &Value) -> crate::Reply {
+        let name =
+            || params["name"].as_str().filter(|name| !name.is_empty()).map(str::to_string).ok_or((-32602, "缺少参数 name".to_string()));
+        let result = |test: Run| json!({ "passed": test.passed(), "summary": test.summary() });
+        match method {
+            "scripts.state" => Ok(state()),
+            "tools.scriptVersions" => Ok(json!({
+                "versions": script_tools::versions(&root(), &name()?).iter().map(|version| {
+                    let mut value = tool_json(&json!({ "manifest": version["manifest"], "code": version["code"], "directory": "" }));
+                    value["id"] = version["manifest"]["version"].clone();
+                    value
+                }).collect::<Vec<_>>()
+            })),
+            "tools.saveScript" => {
+                let given = params["manifest"].as_object().cloned().unwrap_or_default();
+                let wanted = given.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+                let base = load(&wanted);
+                let manifest = manifest_from(&given, base.as_ref()).map_err(|error| (-32602, error))?;
+                let code = params["code"]
+                    .as_str()
+                    .map(str::to_string)
+                    .or_else(|| base.as_ref().and_then(|base| base["code"].as_str().map(str::to_string)))
+                    .unwrap_or_default();
+                let (_, test) = save_and_test(&manifest, &code, None).map_err(|error| (-32603, error))?;
+                Ok(result(test))
+            }
+            "tools.testScript" => {
+                let tool = load(&name()?).ok_or((crate::NOT_FOUND, "没有这个工具".to_string()))?;
+                let text = params["arguments"].as_str().unwrap_or("{}");
+                let arguments: Value = serde_json::from_str(if text.trim().is_empty() { "{}" } else { text })
+                    .map_err(|_| (-32602, "参数不是合法的 JSON".to_string()))?;
+                let test = run(&tool, &arguments, None).map_err(|error| (-32603, error))?;
+                // 记下这次的结果（设置页显示上次自测）
+                let mut manifest = tool["manifest"].as_object().cloned().unwrap_or_default();
+                manifest.insert(
+                    "lastTest".into(),
+                    json!({ "passed": test.passed(), "output": test.summary(), "date": friday_core::archive::now_iso8601() }),
+                );
+                let _ = script_tools::update_manifest(&root(), &manifest);
+                changed();
+                Ok(result(test))
+            }
+            "tools.rollback" => {
+                let name = name()?;
+                let wanted = params["version"].as_i64().unwrap_or(0);
+                let version = script_tools::versions(&root(), &name)
+                    .into_iter()
+                    .find(|version| version["manifest"]["version"].as_i64() == Some(wanted))
+                    .ok_or((crate::NOT_FOUND, format!("没有 v{wanted}")))?;
+                let mut manifest = version["manifest"].as_object().cloned().unwrap_or_default();
+                manifest.insert("createdBy".into(), json!("user"));
+                let (_, test) = save_and_test(&manifest, version["code"].as_str().unwrap_or(""), None).map_err(|error| (-32603, error))?;
+                Ok(result(test))
+            }
+            "tools.createScript" => {
+                let fields = params["fields"].as_object().cloned().unwrap_or_default();
+                let text = |key: &str| fields.get(key).and_then(Value::as_str).unwrap_or("").trim().to_string();
+                let name = text("name");
+                if !script_tools::is_valid_name(&name) || RESERVED.contains(&name.as_str()) {
+                    return Ok(json!({ "error": "工具名要小写字母开头，只含小写字母、数字、下划线，3–41 个字符" }));
+                }
+                if load(&name).is_some() {
+                    return Ok(json!({ "error": format!("已经有叫 {name} 的工具了") }));
+                }
+                let language = language(&text("language")).unwrap_or("python");
+                let permission = Some(text("permission"))
+                    .filter(|permission| script_tools::PERMISSIONS.contains(&permission.as_str()))
+                    .unwrap_or_else(|| "readOnly".into());
+                let mut manifest = Map::new();
+                manifest.insert("name".into(), json!(name));
+                manifest.insert("title".into(), json!(if text("title").is_empty() { name.clone() } else { text("title") }));
+                manifest.insert("description".into(), json!(text("description")));
+                manifest.insert("permission".into(), json!(permission));
+                manifest.insert("language".into(), json!(language));
+                manifest.insert(
+                    "parameters".into(),
+                    json!({ "type": "object", "properties": { "text": { "type": "string", "description": "输入文本" } }, "required": [] }),
+                );
+                manifest.insert("testArguments".into(), json!({ "text": "hello" }));
+                manifest.insert("createdBy".into(), json!("user"));
+                match save_and_test(&manifest, &template(language), None) {
+                    Ok(_) => Ok(json!({ "error": "" })),
+                    Err(error) => Ok(json!({ "error": error })),
+                }
+            }
+            "tools.deleteScript" => remove(&name()?).map(|_| json!({})).map_err(|error| (crate::NOT_ALLOWED, error)),
+            // 开关：是脚本工具的记在清单里（handled），别的交回网关（EDITH 的 disabledTools）
+            "tools.setEnabled" => {
+                let name = name()?;
+                let short = name.strip_prefix("friday__").unwrap_or(&name).to_string();
+                let Some(tool) = load(&short) else { return Ok(json!({ "handled": false })) };
+                let mut manifest = tool["manifest"].as_object().cloned().unwrap_or_default();
+                manifest.insert("enabled".into(), json!(params["enabled"].as_bool().unwrap_or(true)));
+                script_tools::update_manifest(&root(), &manifest).map_err(|error| (-32603, error))?;
+                changed();
+                Ok(json!({ "handled": true }))
+            }
+            other => Err((-32601, format!("没有这个方法：{other}"))),
         }
     }
 }

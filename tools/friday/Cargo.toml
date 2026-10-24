@@ -20,6 +20,8 @@ base64 = "0.23"
 # 常驻的那份下载本地能力、模型，问魔搭 / Hugging Face
 ureq = "3"
 regex = "1"
+# Friday 的规则（脚本工具的存储格式、提示词……），同 EDITH 用的那一版
+friday-core = { git = "https://github.com/integemjack/friday.core", rev = "607791651fbe4c2c780391fbe06d3c952c02cb4f" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
