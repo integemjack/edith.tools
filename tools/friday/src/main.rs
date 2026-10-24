@@ -1598,6 +1598,8 @@ struct State {
     config: bool,
     /// 看过记住的事（memory.*）：之后推 memory 事件，按它要的最近几条截
     memory: Option<usize>,
+    /// 各个大脑开着的终端（工作目录 → TerminalInfo 们）
+    terminals: HashMap<String, Vec<Value>>,
 }
 
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| Mutex::new(State::default()));
@@ -2381,6 +2383,88 @@ fn activity_snapshot(state: &State) -> Value {
     json!({ "sessions": sessions, "assistant": false })
 }
 
+// MARK: - 终端（term.*：EDITH 大脑开的伪终端，客户端断了照常跑）
+
+/// TerminalsState：全部大脑的终端（会话 id 换成 Friday 的大写）
+fn terminals_state_of(state: &State) -> Value {
+    let mut all: Vec<Value> = state
+        .terminals
+        .values()
+        .flatten()
+        .map(|terminal| {
+            let mut terminal = terminal.clone();
+            terminal["conversationID"] = json!(upper(terminal["conversationID"].as_str().unwrap_or("")));
+            terminal
+        })
+        .collect();
+    all.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+    json!({ "terminals": all, "available": true })
+}
+
+fn terminals_state() -> Value {
+    terminals_state_of(&STATE.lock().unwrap())
+}
+
+/// 这个终端在哪个大脑里
+fn terminal_brain(id: &str) -> Result<Arc<Brain>, (i64, String)> {
+    let state = STATE.lock().unwrap();
+    let workspace = state
+        .terminals
+        .iter()
+        .find(|(_, list)| list.iter().any(|terminal| terminal["id"] == json!(id)))
+        .map(|(workspace, _)| workspace.clone())
+        .ok_or((NOT_FOUND, format!("没有终端 {id}")))?;
+    state.brains.get(&workspace).cloned().ok_or((NOT_FOUND, format!("终端 {id} 的大脑没连着")))
+}
+
+fn terminal_request(method: &str, params: &Value) -> Reply {
+    let id = text_param(params, "id")?;
+    let forward = |brain: &Brain, target: &str, request: Value| {
+        brain.request(target, request, Duration::from_secs(30)).map_err(|error| (NOT_FOUND, error))
+    };
+    if method == "term.open" {
+        // 在这段会话所在目录的大脑里开（没发过话的空白会话也行：它记着工作目录）
+        let session = session_param(params, "conversationID")?;
+        let directory = params["workingDirectory"]
+            .as_str()
+            .filter(|dir| !dir.is_empty())
+            .map(str::to_string)
+            .or_else(|| (!session.cwd.is_empty()).then(|| session.cwd.clone()))
+            .unwrap_or_else(default_directory);
+        let brain = brain_for(&directory).map_err(|error| (NOT_ALLOWED, error))?;
+        let mut request = json!({ "id": id, "session": session.id, "cwd": directory, "cols": params["cols"], "rows": params["rows"] });
+        if let Some(command) = params["command"].as_str() {
+            request["command"] = json!(command);
+        }
+        let info = forward(&brain, "terminals.open", request)?;
+        {
+            let mut state = STATE.lock().unwrap();
+            let list = state.terminals.entry(brain.workspace.clone()).or_default();
+            list.retain(|terminal| terminal["id"] != json!(id));
+            list.push(info);
+        }
+        event("terminals", terminals_state());
+        return Ok(json!({}));
+    }
+    let brain = terminal_brain(&id)?;
+    let target = match method {
+        "term.attach" => "terminals.attach",
+        "term.detach" => "terminals.detach",
+        "term.write" => "terminals.write",
+        "term.resize" => "terminals.resize",
+        "term.close" => "terminals.close",
+        other => return Err((-32601, format!("这一版的 EDITH 网关没有 {other}"))),
+    };
+    let mut request = json!({ "id": id });
+    for key in ["data", "cols", "rows"] {
+        if !params[key].is_null() {
+            request[key] = params[key].clone();
+        }
+    }
+    let reply = forward(&brain, target, request)?;
+    Ok(if method == "term.attach" { reply } else { json!({}) })
+}
+
 // MARK: - 设置页（config.*、settings.*、tools.*、mcp.*：改的是 EDITH 的 config.json、mcp.json、技能目录）
 
 /// SettingsState（设置 › 智能体）
@@ -2967,6 +3051,13 @@ fn handle_brain_message(brain: &Arc<Brain>, message: Value) {
         }
         (Some("event"), None) => on_brain_event(&message["params"]),
         (Some("approve.cancel"), None) => on_approve_cancel(&message["params"]),
+        // 终端：接着的有输出（原样转）、开了关了（这个大脑的全部终端）
+        (Some("terminal.output"), None) => event("term.output", message["params"].clone()),
+        (Some("terminals"), None) => {
+            let list = message["params"]["terminals"].as_array().cloned().unwrap_or_default();
+            STATE.lock().unwrap().terminals.insert(brain.workspace.clone(), list);
+            event("terminals", terminals_state());
+        }
         (Some("approve"), Some(_)) => on_brain_approve(brain, &message),
         (Some("ping"), Some(id)) => {
             brain.write(&json!({ "jsonrpc": "2.0", "id": id, "result": {} }));
@@ -3049,8 +3140,10 @@ fn disconnected(brain: &Arc<Brain>) {
             state.brains.remove(&brain.workspace);
         }
         state.approvals.retain(|_, pending| !Arc::ptr_eq(&pending.brain, brain));
+        state.terminals.remove(&brain.workspace);
         state.live.keys().cloned().collect()
     };
+    event("terminals", terminals_state());
     let ended: Vec<String> =
         live.into_iter().filter(|id| stored_session(id).is_some_and(|session| workspace_key(&session.cwd) == brain.workspace)).collect();
     {
@@ -3108,6 +3201,11 @@ fn attach_brain(entry: &Value, wait: Duration) -> Result<Arc<Brain>, String> {
                 state.queue_revision += 1;
             }
         }
+    }
+    // 它开着的终端（旧版的 EDITH 没有）
+    if let Ok(listed) = brain.request("terminals.list", json!({}), Duration::from_secs(10)) {
+        let list = listed["terminals"].as_array().cloned().unwrap_or_default();
+        STATE.lock().unwrap().terminals.insert(brain.workspace.clone(), list);
     }
     // 它的子智能体（在跑的、这个进程里跑过的）：Agent 树、卡片里的运行记录接着显示；旧版的 EDITH 没有 agents.list
     let agents = brain.request("agents.list", json!({}), Duration::from_secs(10)).unwrap_or_default();
@@ -3451,7 +3549,7 @@ fn hello(params: &Value) -> Reply {
             "engines": engines_state(),
             "secrets": secret_names(),
             "directories": directories_state(),
-            "terminals": { "terminals": [], "available": false, "reason": "这一版的 EDITH 还没有内置终端" },
+            "terminals": terminals_state_of(&state),
             "browser": { "tabs": [], "available": false, "reason": "这一版的 EDITH 还没有内置浏览器" },
         },
     }))
@@ -3970,6 +4068,7 @@ fn handle(method: &str, params: &Value) -> Reply {
             Ok(json!({}))
         }
         "assistant.status" => Ok(json!({ "enabled": false, "reacting": false })),
+        method if method.starts_with("term.") => terminal_request(method, params),
         method
             if method.starts_with("config.")
                 || method.starts_with("settings.")

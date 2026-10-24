@@ -172,6 +172,12 @@ fn push(link: &mut Link, session: &str, turn: &str, kind: &str, data: Value) {
     link.send(json!({ "jsonrpc": "2.0", "method": "event", "params": { "session": session, "turn": turn, "type": kind, "data": data } }));
 }
 
+/// 连上来时大脑被问开着哪些终端：没有
+fn answer_terminals(link: &mut Link) {
+    let terminals = link.wait_for(10, |message| message["method"] == "terminals.list").expect("连上来没问终端");
+    reply(link, &terminals, json!({ "terminals": [] }));
+}
+
 fn reply(link: &mut Link, request: &Value, result: Value) {
     link.send(json!({ "jsonrpc": "2.0", "id": request["id"], "result": result }));
 }
@@ -215,6 +221,7 @@ fn friday_client_through_gateway() {
         &list,
         json!([{ "id": SESSION, "cwd": work.to_string_lossy(), "working": true, "turn": { "id": "t0", "text": "之前发的" } }]),
     );
+    answer_terminals(&mut link);
     let agents = link.wait_for(10, |message| message["method"] == "agents.list").expect("连上来没问子智能体");
     reply(&mut link, &agents, json!([]));
     let hello = client.reply(hello)["result"].clone();
@@ -537,6 +544,7 @@ fn sub_agents_and_file_changes() {
     let mut link = accept(&brain);
     let list = link.wait_for(10, |message| message["method"] == "sessions.list").unwrap();
     reply(&mut link, &list, json!([]));
+    answer_terminals(&mut link);
     let agents = link.wait_for(10, |message| message["method"] == "agents.list").unwrap();
     reply(
         &mut link,
@@ -765,6 +773,7 @@ fn errors_retry_branches_and_fork() {
     let mut link = accept(&brain);
     let list = link.wait_for(10, |message| message["method"] == "sessions.list").unwrap();
     reply(&mut link, &list, json!([]));
+    answer_terminals(&mut link);
     let agents = link.wait_for(10, |message| message["method"] == "agents.list").unwrap();
     reply(&mut link, &agents, json!([]));
     client.reply(hello);
@@ -884,6 +893,7 @@ fn models_secrets_and_turn_settings() {
     let mut link = accept(&brain);
     let list = link.wait_for(10, |message| message["method"] == "sessions.list").unwrap();
     reply(&mut link, &list, json!([]));
+    answer_terminals(&mut link);
     let agents = link.wait_for(10, |message| message["method"] == "agents.list").unwrap();
     reply(&mut link, &agents, json!([]));
     let hello = client.reply(hello)["result"].clone();
@@ -941,6 +951,7 @@ fn activity_for_the_assistant() {
     let mut link = accept(&brain);
     let list = link.wait_for(10, |message| message["method"] == "sessions.list").unwrap();
     reply(&mut link, &list, json!([]));
+    answer_terminals(&mut link);
     let agents = link.wait_for(10, |message| message["method"] == "agents.list").unwrap();
     reply(&mut link, &agents, json!([]));
     let hello = client.reply(hello)["result"].clone();
@@ -1059,5 +1070,61 @@ fn settings_mcp_and_memory() {
     let state = client.request("memory.remove", json!({ "id": id }));
     assert_eq!(state["count"], 0);
     let missing = client.send("memory.remove", json!({ "id": id }));
+    assert_eq!(client.reply(missing)["error"]["code"], 3);
+}
+
+#[test]
+fn terminals_live_in_the_brain() {
+    let home = scratch("friday-terminals");
+    let work = home.join("work");
+    std::fs::create_dir_all(work.join(".git")).unwrap();
+    write_session(&home, &work);
+    let brain = FakeBrain::new();
+    register(&home, &brain, &work);
+    let mut client = Client::start(&home, &work);
+    let hello = client.send("hello", json!({ "protocol": 1 }));
+    let mut link = accept(&brain);
+    let list = link.wait_for(10, |message| message["method"] == "sessions.list").unwrap();
+    reply(&mut link, &list, json!([]));
+    // 连上来问它开着哪些终端（之前开的、客户端断了还在跑的）
+    let terminals = link.wait_for(10, |message| message["method"] == "terminals.list").unwrap();
+    let running = json!({ "id": "T0", "conversationID": SESSION, "title": "zsh", "shell": "zsh", "running": true, "cols": 80, "rows": 24 });
+    reply(&mut link, &terminals, json!({ "terminals": [running] }));
+    let agents = link.wait_for(10, |message| message["method"] == "agents.list").unwrap();
+    reply(&mut link, &agents, json!([]));
+    let hello = client.reply(hello)["result"].clone();
+    let listed = &hello["state"]["terminals"];
+    assert_eq!(
+        (listed["available"].as_bool(), listed["terminals"][0]["conversationID"].clone()),
+        (Some(true), json!(SESSION.to_uppercase()))
+    );
+
+    // 开一个：交给会话所在目录的大脑
+    let open = client.send("term.open", json!({ "id": "T1", "conversationID": SESSION, "cols": 90, "rows": 20, "command": "ls" }));
+    let asked = link.wait_for(10, |message| message["method"] == "terminals.open").unwrap();
+    assert_eq!(
+        (asked["params"]["session"].as_str(), asked["params"]["command"].as_str(), asked["params"]["cols"].as_u64()),
+        (Some(SESSION), Some("ls"), Some(90))
+    );
+    let info = json!({ "id": "T1", "conversationID": SESSION, "title": "zsh", "shell": "zsh", "running": true, "cols": 90, "rows": 20 });
+    reply(&mut link, &asked, info);
+    client.reply(open);
+    client.event("terminals", |params| params["terminals"].as_array().unwrap().len() == 2);
+    // 输出原样转；接上、写、改大小、关都转给那个大脑
+    link.send(json!({ "jsonrpc": "2.0", "method": "terminal.output", "params": { "id": "T1", "data": "aGk=" } }));
+    assert_eq!(client.event("term.output", |params| params["id"] == "T1")["params"]["data"], "aGk=");
+    let attach = client.send("term.attach", json!({ "id": "T0" }));
+    let asked = link.wait_for(10, |message| message["method"] == "terminals.attach").unwrap();
+    reply(&mut link, &asked, json!({ "data": "b2xk", "cols": 80, "rows": 24 }));
+    assert_eq!(client.reply(attach)["result"]["data"], "b2xk");
+    let write = client.send("term.write", json!({ "id": "T1", "data": "bHMK" }));
+    let asked = link.wait_for(10, |message| message["method"] == "terminals.write").unwrap();
+    assert_eq!(asked["params"]["data"], "bHMK");
+    reply(&mut link, &asked, json!({}));
+    client.reply(write);
+    // 大脑说关了：列表跟着变；没有的终端回 3
+    link.send(json!({ "jsonrpc": "2.0", "method": "terminals", "params": { "terminals": [running] } }));
+    client.event("terminals", |params| params["terminals"].as_array().unwrap().len() == 1);
+    let missing = client.send("term.write", json!({ "id": "T1", "data": "" }));
     assert_eq!(client.reply(missing)["error"]["code"], 3);
 }
