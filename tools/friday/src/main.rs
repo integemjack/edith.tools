@@ -538,6 +538,14 @@ fn tool_look(name: &str) -> Option<(&'static str, &'static str)> {
         "load_tools" => ("取回工具", "wrench.and.screwdriver"),
         "use_skill" => ("用技能", "book"),
         "save_memory" => ("记住", "brain"),
+        "browser_navigate" => ("打开网页", "globe"),
+        "browser_read" => ("读网页", "globe"),
+        "browser_act" => ("操作网页", "cursorarrow.click"),
+        "browser_screenshot" => ("网页截图", "camera.viewfinder"),
+        "browser_resize" => ("调整网页视口", "arrow.up.left.and.arrow.down.right"),
+        "browser_tabs" => ("浏览器标签", "globe"),
+        "browser_hand_over" => ("请你在浏览器里操作", "hand.raised"),
+        "browser_run_js" => ("在网页里运行脚本", "curlybraces"),
         "search_memory" => ("查记忆", "brain"),
         _ => return None,
     })
@@ -3115,6 +3123,12 @@ fn handle_brain_message(brain: &Arc<Brain>, message: Value) {
         (Some("terminal.output"), None) => event("term.output", message["params"].clone()),
         // 浏览器：看着的标签的画面、下载（原样转）、标签变了（这个大脑的全部标签）
         (Some("browser.frame"), None) | (Some("browser.download"), None) => event(method.unwrap_or(""), message["params"].clone()),
+        // 智能体请用户在浏览器里做件事：客户端弹出那张卡片（会话 id 换成 Friday 的大写）
+        (Some("browser.handOver"), None) => {
+            let mut params = message["params"].clone();
+            params["conversationID"] = json!(upper(params["conversationID"].as_str().unwrap_or("")));
+            event("browser.handOver", params);
+        }
         (Some("browser"), None) => {
             {
                 let mut state = STATE.lock().unwrap();
