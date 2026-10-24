@@ -785,6 +785,16 @@ fn report_from(text: &str) -> Option<String> {
         .map(|(_, label)| label.to_string())
 }
 
+/// 「/loop …」问答记进会话时，命令和回复之间的分隔（网关拆成一问一答）
+const LOOP_REPLY: &str = "\n\n［/loop 的回复］\n";
+
+/// 定时任务到点发来的那条（提示词 loop.run* 开头的「（定时任务 #n…」）：第几个
+fn loop_number(text: &str) -> Option<u64> {
+    let rest = text.strip_prefix("（定时任务 #")?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
 /// 用户在干活时补充的（大脑给模型包了一行「（…在你工作时补充了下面这段…）」）：Friday 里标「工作中补充」
 fn is_interjection(text: &str) -> bool {
     text.split_once('\n').is_some_and(|(first, _)| first.starts_with('（') && first.contains("在你工作时补充了下面这段"))
@@ -797,6 +807,8 @@ struct Node {
     notice: Vec<String>,
     from_agent: Option<String>,
     interjected: bool,
+    /// 定时任务到点发来的：「定时任务 #n」（Friday 消息上的 sentBy）
+    sent_by: Option<String>,
     /// 这条消息到历史的第几条为止（不含）：截短、分叉按它
     end: usize,
     /// 这一轮出错了 / 被用户停下（存档里不记，网关记在 friday.json）
@@ -841,9 +853,27 @@ fn group_in(session: &str, owner: &str, history: &[Value], team: &Team) -> Vec<N
                     }
                     continue;
                 }
-                let blocks = vec![text_block(session, &format!("{index}"), "text", &shown_user_text(&text))];
+                let shown = shown_user_text(&text);
+                // 输入框里打的「/loop …」：记成一问一答（问是命令，答是回复）
+                if let Some((command, reply)) = shown.split_once(LOOP_REPLY) {
+                    nodes.push(Node {
+                        role: "user",
+                        blocks: vec![text_block(session, &format!("{index}"), "text", command)],
+                        ..Default::default()
+                    });
+                    nodes.last_mut().unwrap().end = index + 1;
+                    nodes.push(Node {
+                        role: "assistant",
+                        blocks: vec![text_block(session, &format!("{index}.loop"), "text", reply)],
+                        ..Default::default()
+                    });
+                    nodes.last_mut().unwrap().end = index + 1;
+                    continue;
+                }
+                let blocks = vec![text_block(session, &format!("{index}"), "text", &shown)];
                 let (from_agent, interjected) = (report_from(&text), is_interjection(&text));
-                nodes.push(Node { role: "user", blocks, from_agent, interjected, ..Default::default() });
+                let sent_by = loop_number(&shown).map(|number| format!("定时任务 #{number}"));
+                nodes.push(Node { role: "user", blocks, from_agent, interjected, sent_by, ..Default::default() });
             }
             Some("assistant") => {
                 if nodes.last().is_none_or(|node| node.role != "assistant") {
@@ -928,6 +958,9 @@ fn message_with(id: &str, parent: Option<&str>, node: Node, created: &str) -> Va
     }
     if node.interjected {
         message["interjected"] = json!(true);
+    }
+    if let Some(sent_by) = node.sent_by {
+        message["sentBy"] = json!(sent_by);
     }
     message
 }
@@ -1621,6 +1654,8 @@ struct State {
     /// 开着设置 › 能力（powers.subscribe）、订了本地模型（models.subscribe，客户端连上就订）
     powers: bool,
     models: bool,
+    /// 调过 loops.*（设置 › 定时任务）
+    loops: bool,
     /// 常驻那份开着的终端（TerminalInfo 们）、浏览器（BrowserState；还没连上它时是 None）
     terminals: Vec<Value>,
     browser: Option<Value>,
@@ -3557,7 +3592,7 @@ fn server_info() -> Value {
 fn features() -> Vec<&'static str> {
     let mut list = vec!["mkdir", "submitFrom", "activity", "assistant", "config", "memory", "memorySearch"];
     if serve_mode() != "off" {
-        list.extend(["powers", "models", "userVoices"]);
+        list.extend(["powers", "models", "userVoices", "loops"]);
     }
     list
 }
@@ -3647,6 +3682,29 @@ fn with_prefs(request: &mut Value, session: &str, attachments: &[&str]) {
 fn submit(params: &Value) -> Reply {
     let session = session_param(params, "conversationID")?;
     let mut text = params["text"].as_str().unwrap_or("").trim().to_string();
+    // 「/loop …」不交给模型：常驻的那份建、列、停，问答记进会话（在干活时等这一轮做完再记）
+    if loops::is_command(&text) && serve_mode() != "off" {
+        let hub = hub().map_err(|error| (NOT_ALLOWED, error))?;
+        let reply = hub
+            .request("loops.command", json!({ "conversationID": session.id, "text": text, "by": "user" }), Duration::from_secs(30))
+            .map_err(|error| (NOT_ALLOWED, error))?;
+        let (brain, session) = materialize(&session)?;
+        // 第一句就是 /loop：标题用这条命令（不然 EDITH 按记下的问答起标题）
+        if session.title.is_empty()
+            && let Some(path) = &session.path
+        {
+            append_title(path, &text.replace('\n', " ").chars().take(40).collect::<String>());
+        }
+        let note = format!("{text}{LOOP_REPLY}{}", reply["reply"].as_str().unwrap_or(""));
+        brain
+            .request("sense", json!({ "session": session.id, "text": note, "urgency": "note", "kind": "user" }), Duration::from_secs(30))
+            .map_err(|error| (NOT_ALLOWED, error))?;
+        META.set_draft(&session.id, "");
+        changed(&session.id, true);
+        // 问答记好了再跑第一次（间隔、自己定节奏的现在就跑）
+        let _ = hub.request("loops.tick", json!({}), Duration::from_secs(10));
+        return Ok(json!({}));
+    }
     let attachments: Vec<&str> = params["attachments"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
     if !attachments.is_empty() {
         text.push_str(&format!("\n\n（附件，在这台机器上：{}）", attachments.join("、")));
@@ -3866,6 +3924,10 @@ fn handle(method: &str, params: &Value) -> Reply {
         }
         "conversation.remove" => {
             let session = session_param(params, "id")?;
+            // 它的定时任务一起删
+            if let Some(hub) = HUB.lock().unwrap().clone() {
+                let _ = hub.request("loops.forget", json!({ "conversationID": session.id }), Duration::from_secs(10));
+            }
             if let Some(path) = &session.path {
                 // 交给大脑删（停下、存档、改动基线、子智能体的运行记录一起，分出去的各支也删）；旧版的 EDITH 没有 sessions.remove：停下后这里删
                 let brain = brain_for(&session.cwd).ok();
@@ -4125,7 +4187,9 @@ fn handle(method: &str, params: &Value) -> Reply {
         "assistant.channels.list" => Ok(json!({ "channels": [] })),
         method if method.starts_with("assistant.") => Err((NOT_ALLOWED, "这台的 EDITH 没有助手：助手开在客户端那台上".into())),
         method if method.starts_with("term.") => terminal_request(method, params),
-        method if method.starts_with("powers.") || method.starts_with("models.") => hub_forward(method, params),
+        method if method.starts_with("powers.") || method.starts_with("models.") || method.starts_with("loops.") => {
+            hub_forward(method, params)
+        }
         method if method.starts_with("browser.") => browser_request(method, params),
         method
             if method.starts_with("config.")
@@ -4290,13 +4354,21 @@ fn serve_initialize() -> Value {
             })
         })
         .collect();
+    let mut actions = actions;
+    // 定时任务（只给主智能体：子 Agent 调了退回）
+    actions.push(json!({
+        "name": "loop",
+        "description": loops::TOOL_DESCRIPTION,
+        "parameters": { "type": "object", "properties": { "command": { "type": "string", "description": loops::TOOL_COMMAND } }, "required": ["command"] },
+        "timeoutSeconds": 30,
+    }));
     json!({
         "protocolVersion": "1",
         "name": "friday",
         "capability": {
             "title": "Friday",
             "version": VERSION,
-            "description": "Friday 的内置浏览器（用户在浏览器卡片里看得见、能一起操作）",
+            "description": "Friday 的内置浏览器（用户在浏览器卡片里看得见、能一起操作）、定时任务",
         },
         "actions": actions,
         "receives": ["turn.started", "done"],
@@ -4311,7 +4383,8 @@ fn serve_initialize() -> Value {
 /// 大脑里的工具名（friday__browser_navigate）是不是自己的浏览器工具：是的话回动作名
 fn own_action(tool: &str) -> Option<&str> {
     let (owner, action) = tool.split_once("__")?;
-    (owner.starts_with("friday") && !owner.starts_with("friday-client") && browser_tools::is_tool(action)).then_some(action)
+    let own = owner.starts_with("friday") && !owner.starts_with("friday-client");
+    (own && (browser_tools::is_tool(action) || action == "loop")).then_some(action)
 }
 
 fn serve_hook(params: &Value) -> Value {
@@ -4320,6 +4393,10 @@ fn serve_hook(params: &Value) -> Value {
     }
     let tool = params["tool_name"].as_str().unwrap_or("");
     let Some(action) = own_action(tool) else { return json!({}) };
+    // 建定时任务不用批准（同 Friday：它本来就是照用户说的做；智能体建的有上限）
+    if action == "loop" {
+        return json!({ "need": false });
+    }
     let arguments = params["tool_input"].as_object().cloned().unwrap_or_default();
     json!({ "need": browser_tools::need(tool, action, &arguments, params["session_id"].as_str().unwrap_or("")) })
 }
@@ -4328,6 +4405,14 @@ fn serve_act(params: &Value) -> Value {
     let action = params["action"].as_str().unwrap_or("");
     let arguments = params["arguments"].as_object().cloned().unwrap_or_default();
     let session = params["session"].as_str().unwrap_or("");
+    if action == "loop" {
+        if params["agent"].as_str().is_some_and(|agent| !agent.is_empty()) {
+            return json!({ "text": "定时任务只有主智能体能建、能停：把这件事交回给它", "ok": false });
+        }
+        let command = arguments.get("command").and_then(Value::as_str).unwrap_or("").trim();
+        let command = if loops::is_command(command) { command.to_string() } else { format!("/loop {command}") };
+        return json!({ "text": loops::handle(&command, session, "agent", true), "ok": true });
+    }
     match browser_tools::run(action, &arguments, session) {
         Some(outcome) => {
             let media: Vec<Value> = outcome.image.into_iter().map(|path| json!({ "path": path, "mime": "image/jpeg" })).collect();
@@ -4378,6 +4463,7 @@ fn serve_brain_message(brain: &Arc<Brain>, message: Value, ready: &mut Option<Se
                 }
                 Some("done") => {
                     TURNS.lock().unwrap().remove(&(brain.workspace.clone(), session.clone()));
+                    loops::on_done(&session, params["turn"].as_str().unwrap_or(""), &params["data"]);
                     // 智能体这一轮开的网页：关掉（带 keep 的、正交给用户的留着）
                     std::thread::spawn(move || browser::close_agent_tabs(&session));
                 }
@@ -4507,6 +4593,7 @@ fn serve_request(client: &str, method: &str, params: &Value) -> Reply {
         }
         method if method.starts_with("powers.") => powers_request(method, params),
         method if method.starts_with("models.") => models::request(client, method, params),
+        method if method.starts_with("loops.") => loops::request(method, params),
         other => Err((-32601, format!("常驻的那份没有 {other}"))),
     }
 }
@@ -4629,6 +4716,7 @@ fn serve() -> Result<(), String> {
     serve_log("serve", &format!("起来了：{address}（{VERSION}）"));
     powers::start();
     models::start();
+    loops::start();
     {
         let token = token.clone();
         std::thread::spawn(move || {
@@ -4658,6 +4746,7 @@ fn serve() -> Result<(), String> {
             || !TURNS.lock().unwrap().is_empty()
             || powers::busy()
             || models::busy()
+            || loops::active()
         {
             idle_since = Instant::now();
         } else if idle_since.elapsed() >= idle {
@@ -4673,6 +4762,47 @@ fn serve() -> Result<(), String> {
     }
     drop(lock);
     Ok(())
+}
+
+/// 这个目录的大脑（常驻那份连着的；没起就在那里起）
+fn serve_brain_for(directory: &str) -> Result<Arc<Brain>, String> {
+    let key = workspace_key(directory);
+    if let Some(brain) = SERVED.lock().unwrap().get(&key).cloned() {
+        return Ok(brain);
+    }
+    let entry = match registry().into_iter().find(|entry| entry["workspace"].as_str() == Some(key.as_str())) {
+        Some(entry) => entry,
+        None => launch_brain(Path::new(&key))?,
+    };
+    serve_attach(&entry, Duration::from_secs(30))?;
+    SERVED.lock().unwrap().get(&key).cloned().ok_or_else(|| format!("连不上 {key} 的大脑"))
+}
+
+/// 定时任务到点：交给那段会话所在目录的大脑（排在手上这一轮之后；照会话上选的权限模式、思考档位、模型），回这一轮的 id。
+/// 会话不在了回 Err("")
+fn fire_loop(conversation: &str, text: &str) -> Result<String, String> {
+    let session = find_session(conversation).ok_or_else(String::new)?;
+    let directory = if session.cwd.is_empty() { default_directory() } else { session.cwd.clone() };
+    let brain = serve_brain_for(&directory)?;
+    // 还没发过话的空白会话：先在 EDITH 里建出来
+    if session.blank() {
+        brain.request("sessions.create", json!({ "id": session.id, "cwd": directory }), Duration::from_secs(30))?;
+        if !session.title.is_empty()
+            && let Some(path) = stored_session(&session.id).and_then(|stored| stored.path)
+        {
+            append_title(&path, &session.title);
+        }
+        META.remove_blank(&session.id);
+    }
+    let mut request = json!({ "session": session.id, "text": text, "urgency": "queue", "kind": "loop" });
+    with_prefs(&mut request, &session.id, &[]);
+    let reply = brain.request("sense", request, Duration::from_secs(30))?;
+    reply["turn"].as_str().filter(|turn| !turn.is_empty()).map(str::to_string).ok_or_else(|| "大脑没收下".to_string())
+}
+
+/// 会话的标题（设置 › 定时任务的「会话：标题」）
+fn conversation_title(id: &str) -> String {
+    find_session(id).map(|session| session.title).filter(|title| !title.is_empty()).unwrap_or_else(|| "新对话".into())
 }
 
 // MARK: - 网关连常驻的那份
@@ -4736,6 +4866,7 @@ fn on_hub_message(hub: &Arc<Brain>, message: Value) {
         // 本地能力、本地模型：订了的客户端收；下载 / 换上失败只给发起的那个
         Some("powers") if STATE.lock().unwrap().powers => event("powers", message["params"].clone()),
         Some("models") if STATE.lock().unwrap().models => event("models", message["params"].clone()),
+        Some("loops") if STATE.lock().unwrap().loops => event("loops", message["params"].clone()),
         Some("modelsFailed") => event("modelsFailed", message["params"].clone()),
         // 本地模型下好了：建了本地引擎、给会话换上了（会话上选的记在 friday.json）
         Some("engines.changed") => {
@@ -4845,6 +4976,10 @@ fn hub_forward(method: &str, params: &Value) -> Reply {
     // 慢的：等装好的音色、删模型（friday-llm 先停掉）
     let wait = if matches!(method, "powers.importVoice" | "models.delete" | "powers.deleteVoice") { 660 } else { 30 };
     let reply = hub.request(target, params.clone(), Duration::from_secs(wait)).map_err(|error| hub_error(&error))?;
+    // 调过 loops.* 的客户端之后收 loops 事件
+    if method.starts_with("loops.") {
+        STATE.lock().unwrap().loops = true;
+    }
     if let Some((what, on)) = subscribe {
         let mut state = STATE.lock().unwrap();
         if what == "powers" {
@@ -4858,7 +4993,11 @@ fn hub_forward(method: &str, params: &Value) -> Reply {
 
 /// 常驻那份回的错误：没有这个模型回 3，别的原样
 fn hub_error(error: &str) -> (i64, String) {
-    if error.starts_with("这台机器上没有这个本地模型") { (NOT_FOUND, error.to_string()) } else { (-32603, error.to_string()) }
+    if error.starts_with("这台机器上没有这个本地模型") || error.starts_with("没有定时任务") {
+        (NOT_FOUND, error.to_string())
+    } else {
+        (-32603, error.to_string())
+    }
 }
 
 /// 让常驻的那份马上连上这个大脑（新起的大脑第一轮就要它的钩子、浏览器工具，不等它下一次看登记）
@@ -8090,6 +8229,1037 @@ mod models {
     /// 有在下的（常驻的那份闲着不退）
     pub fn busy() -> bool {
         MODELS.lock().unwrap().tasks.values().any(|task| task.running)
+    }
+}
+
+// MARK: - 定时任务（/loop）
+
+mod loops {
+    //! 定时任务（照 Friday 的 LoopCommand / LoopScheduler，Friday 仓库的 qt/docs/LOOPS.md）：都用「/loop [时间] 内容」建——用户在会话里打的
+    //! （网关不交给模型，转到这里，问答记进会话），主智能体用 `loop` 工具建的（这里的动作，标成智能体建的，最多 5 个、每个一天最多 24 次）。
+    //! 到点把内容（提示词 loop.run*）交给那段会话的大脑（排在手上这一轮之后；上一次没做完就跳过），这一轮的回答（done）就是这次的结果；
+    //! 自己定节奏的按回复里单独一行的 `/loop next 20m` 定下次，智能体建的写 `/loop done` 就结束（用户建的只有用户能停）。
+    //! 错过的 12 小时内补一次。存在 `~/.edith/friday/loops.json`；有没暂停的任务时常驻的那份不退。
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{LazyLock, Mutex};
+    use std::time::Duration;
+
+    use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveTime, TimeZone, Utc};
+    use regex::{Captures, Regex};
+    use serde_json::{Value, json};
+
+    const MAX_PER_OWNER: usize = 5;
+    const MAX_RUNS_PER_DAY: usize = 24;
+    const CATCH_UP_HOURS: i64 = 12;
+    const SELF_DEFAULT_MINUTES: i64 = 30;
+    const RUN_TIMEOUT_HOURS: i64 = 6;
+    const HISTORY_LIMIT: usize = 20;
+
+    // 提示词（同 Friday / EDITH 的 prompts-framework.md 的 loop.run*）
+    const RUN: &str = "（定时任务 #{{number}}（{{schedule}}）第 {{count}} 次到点，照下面的做。这件事已经不用再做了，就在回复最后单独一行写 /loop done。）\n{{last}}\n{{content}}";
+    const RUN_SELF: &str = "（定时任务 #{{number}} 第 {{count}} 次：盯着下面这件事，节奏你自己定。做完这一次，在回复最后单独一行写 /loop next 多久（比如 /loop next 20m、/loop next 2h，最短 1 分钟、最长 24 小时）定下次什么时候再来；事情办完了、不用再盯了就写 /loop done。不写的话半小时后再来。）\n{{last}}\n{{content}}";
+    const RUN_USER: &str = "（定时任务 #{{number}}（{{schedule}}）第 {{count}} 次到点，照下面的做。这是用户建的定时任务，停不停由用户定，你只管把这一次做好。）\n{{last}}\n{{content}}";
+    const RUN_SELF_USER: &str = "（定时任务 #{{number}} 第 {{count}} 次：盯着下面这件事，节奏你自己定。做完这一次，在回复最后单独一行写 /loop next 多久（比如 /loop next 20m、/loop next 2h，最短 1 分钟、最长 24 小时）定下次什么时候再来；不写的话半小时后再来。这是用户建的定时任务，停不停由用户定：事情办完了就简短说一声，把下次定远一点（比如 /loop next 24h）。）\n{{last}}\n{{content}}";
+    const RUN_LAST: &str = "（上一次的结果：{{result}}）";
+
+    /// 工具 loop 的说明（同 prompts-tools.md 的 tool.loop）
+    pub const TOOL_DESCRIPTION: &str = "建、列、停定时任务和循环任务。command 是一条「/loop …」命令，和用户在输入框里打的一样：\n- /loop 内容：节奏你自己定（每次做完在回复最后写 /loop next 20m 定下次，办完了写 /loop done）\n- /loop 10m 内容、/loop 每2小时 内容：固定间隔\n- /loop 每天9:00 内容、/loop 工作日9:00 内容、/loop 每周一10:00 内容：定点\n- /loop 明天8:00 内容、/loop 30分钟后 内容：只做一次\n- /loop 列出来；/loop stop 3、/loop stop 全部 停掉（只能停智能体建的；用户自己建的只有用户能停）\n用户让你「每隔一会儿看看」「每天早上…」「明天提醒我…」「盯着…直到…」时用，不要只口头答应。到点时内容作为一条消息交回给你（在会话里建的发给这段会话）。你建的标成智能体建的，最多 5 个，每个一天最多跑 24 次。";
+    pub const TOOL_COMMAND: &str = "一条完整的「/loop …」命令，比如「/loop 每天9:00 看一下昨晚的 CI，挂了就修」";
+
+    fn fill(template: &str, pairs: &[(&str, String)]) -> String {
+        let mut text = template.to_string();
+        for (key, value) in pairs {
+            text = text.replace(&format!("{{{{{key}}}}}"), value);
+        }
+        // 空的参数整行去掉（同 Friday 的提示词渲染）
+        text.lines().filter(|line| !line.trim().is_empty()).collect::<Vec<_>>().join("\n")
+    }
+
+    fn brief(text: &str, limit: usize) -> String {
+        let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if line.chars().count() > limit { format!("{}…", line.chars().take(limit - 1).collect::<String>()) } else { line }
+    }
+
+    // MARK: 触发方式
+
+    const EVERY_DAY: u32 = 0x7f;
+    const WORKDAYS: u32 = 0x1f;
+    const WEEKEND: u32 = 0x60;
+    const DAY_NAMES: [char; 7] = ['一', '二', '三', '四', '五', '六', '日'];
+
+    #[derive(Clone, PartialEq, Debug)]
+    enum Trigger {
+        /// 自己定节奏：跑完由它在回复里写下次
+        Itself,
+        /// 固定间隔（分钟）
+        Interval(i64),
+        /// 每周这几天（bit0 = 周一）的这个钟点（本地，分钟）
+        Weekly { days: u32, minute_of_day: u32 },
+        /// 只做一次
+        Once(DateTime<Utc>),
+    }
+
+    fn local_at(date: NaiveDate, minute: u32) -> Option<DateTime<Utc>> {
+        let time = NaiveTime::from_hms_opt(minute / 60, minute % 60, 0)?;
+        Local.from_local_datetime(&date.and_time(time)).earliest().map(|at| at.with_timezone(&Utc))
+    }
+
+    impl Trigger {
+        fn next_after(&self, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
+            match self {
+                Trigger::Itself => None,
+                Trigger::Interval(minutes) => Some(after + chrono::Duration::minutes(*minutes)),
+                Trigger::Once(at) => (*at > after).then_some(*at),
+                Trigger::Weekly { days, minute_of_day } => {
+                    if *days == 0 {
+                        return None;
+                    }
+                    let local = after.with_timezone(&Local);
+                    (0..=7).find_map(|offset| {
+                        let date = local.date_naive() + chrono::Duration::days(offset);
+                        let weekday = date.weekday().num_days_from_monday();
+                        if days & (1 << weekday) == 0 {
+                            return None;
+                        }
+                        local_at(date, *minute_of_day).filter(|candidate| *candidate > after)
+                    })
+                }
+            }
+        }
+
+        fn describe(&self) -> String {
+            match self {
+                Trigger::Itself => "自己定节奏".into(),
+                Trigger::Interval(minutes) if minutes % 1440 == 0 => {
+                    if *minutes == 1440 {
+                        "每天一次".into()
+                    } else {
+                        format!("每 {} 天", minutes / 1440)
+                    }
+                }
+                Trigger::Interval(minutes) if minutes % 60 == 0 => format!("每 {} 小时", minutes / 60),
+                Trigger::Interval(minutes) => format!("每 {minutes} 分钟"),
+                Trigger::Weekly { days, minute_of_day } => {
+                    let when = match *days {
+                        EVERY_DAY => "每天".to_string(),
+                        WORKDAYS => "工作日".to_string(),
+                        WEEKEND => "周末".to_string(),
+                        _ => format!(
+                            "每周{}",
+                            (0..7)
+                                .filter(|index| days & (1 << index) != 0)
+                                .map(|index| DAY_NAMES[index].to_string())
+                                .collect::<Vec<_>>()
+                                .join("、")
+                        ),
+                    };
+                    format!("{when} {}", clock(*minute_of_day))
+                }
+                Trigger::Once(at) => format!("{} 一次", at.with_timezone(&Local).format("%-m月%-d日 %H:%M")),
+            }
+        }
+
+        fn to_json(&self) -> Value {
+            match self {
+                Trigger::Itself => json!({ "kind": "self" }),
+                Trigger::Interval(minutes) => json!({ "kind": "interval", "minutes": minutes }),
+                Trigger::Weekly { days, minute_of_day } => json!({ "kind": "weekly", "days": days, "minuteOfDay": minute_of_day }),
+                Trigger::Once(at) => json!({ "kind": "once", "at": iso(at) }),
+            }
+        }
+
+        fn from_json(value: &Value) -> Option<Trigger> {
+            match value["kind"].as_str()? {
+                "self" => Some(Trigger::Itself),
+                "interval" => value["minutes"].as_i64().filter(|minutes| *minutes > 0).map(Trigger::Interval),
+                "weekly" => {
+                    let days = value["days"].as_u64().filter(|days| *days > 0)? as u32;
+                    Some(Trigger::Weekly { days: days & EVERY_DAY, minute_of_day: value["minuteOfDay"].as_u64().unwrap_or(0) as u32 })
+                }
+                "once" => parse_time(&value["at"]).map(Trigger::Once),
+                _ => None,
+            }
+        }
+    }
+
+    fn clock(minute_of_day: u32) -> String {
+        format!("{}:{:02}", minute_of_day / 60, minute_of_day % 60)
+    }
+
+    fn iso(at: &DateTime<Utc>) -> String {
+        at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
+
+    fn parse_time(value: &Value) -> Option<DateTime<Utc>> {
+        DateTime::parse_from_rfc3339(value.as_str()?).ok().map(|at| at.with_timezone(&Utc))
+    }
+
+    /// 给人看的时刻：今天的「14:20」、明天的「明天 14:20」、别的「10月15日 14:20」
+    fn when(at: &DateTime<Utc>, now: DateTime<Utc>) -> String {
+        let local = at.with_timezone(&Local);
+        let today = now.with_timezone(&Local).date_naive();
+        if local.date_naive() == today {
+            local.format("%H:%M").to_string()
+        } else if local.date_naive() == today + chrono::Duration::days(1) {
+            format!("明天 {}", local.format("%H:%M"))
+        } else {
+            local.format("%-m月%-d日 %H:%M").to_string()
+        }
+    }
+
+    // MARK: 「/loop …」
+
+    enum Command {
+        Create(Trigger, String),
+        List,
+        Stop { number: i64, all: bool },
+        Next(i64),
+        Done,
+    }
+
+    const UNITS: &str =
+        "秒钟|秒|seconds|second|secs|sec|s|分钟|分|minutes|minute|mins|min|m|个小时|小时|个钟头|钟头|hours|hour|hrs|hr|h|天|days|day|d";
+    const TIME: &str = r"(早上|早晨|上午|中午|下午|傍晚|晚上|凌晨)?\s*(\d{1,2})(?:[:：](\d{2})|\s*点(?:\s*(半)|\s*(\d{1,2})\s*分?)?)";
+
+    fn pattern(text: &str) -> Regex {
+        Regex::new(&format!("(?is){text}")).unwrap()
+    }
+
+    fn unit_seconds(unit: &str) -> f64 {
+        let unit = unit.to_lowercase();
+        if unit.starts_with('秒') || unit.starts_with('s') {
+            1.0
+        } else if unit.starts_with('分') || unit.starts_with('m') {
+            60.0
+        } else if unit.contains('时') || unit.contains("钟头") || unit.starts_with('h') {
+            3600.0
+        } else {
+            86400.0
+        }
+    }
+
+    /// 时间段那几组（时段、时、分、半、分）→ 当天的分钟数
+    fn minute_of_day(captures: &Captures, first: usize, forced: &str) -> Option<u32> {
+        let period = captures.get(first).map(|period| period.as_str()).unwrap_or(forced);
+        let mut hour: u32 = captures.get(first + 1)?.as_str().parse().ok()?;
+        let minute: u32 = if let Some(minute) = captures.get(first + 2) {
+            minute.as_str().parse().ok()?
+        } else if captures.get(first + 3).is_some() {
+            30
+        } else if let Some(minute) = captures.get(first + 4) {
+            minute.as_str().parse().ok()?
+        } else {
+            0
+        };
+        match period {
+            "下午" | "傍晚" | "晚上" if hour < 12 => hour += 12,
+            "中午" if hour < 11 => hour += 12,
+            "凌晨" if hour == 12 => hour = 0,
+            _ => {}
+        }
+        (hour <= 23 && minute <= 59).then_some(hour * 60 + minute)
+    }
+
+    fn day_mask(text: &str) -> u32 {
+        text.chars()
+            .filter_map(|c| DAY_NAMES.iter().position(|day| *day == if c == '天' { '日' } else { c }))
+            .fold(0, |mask, index| mask | (1 << index))
+    }
+
+    /// 「10m」「2小时」「1.5h」→ 秒
+    fn duration(text: &str) -> Option<i64> {
+        static DURATION: LazyLock<Regex> = LazyLock::new(|| pattern(&format!(r"^(\d+(?:\.\d+)?)\s*({UNITS})$")));
+        let captures = DURATION.captures(text.trim())?;
+        let seconds = captures[1].parse::<f64>().ok()? * unit_seconds(&captures[2]);
+        (seconds > 0.0 && seconds <= 366.0 * 86400.0).then(|| seconds.ceil() as i64)
+    }
+
+    pub fn is_command(text: &str) -> bool {
+        static HEAD: LazyLock<Regex> = LazyLock::new(|| pattern(r"^\s*/loop(?:\s|$)"));
+        HEAD.is_match(text)
+    }
+
+    fn created(trigger: Trigger, content: &str) -> Result<Command, String> {
+        let content = content.trim();
+        if content.is_empty() {
+            return Err("时间后面要写让它做什么".into());
+        }
+        Ok(Command::Create(trigger, content.to_string()))
+    }
+
+    fn parse(text: &str, now: DateTime<Utc>) -> Result<Command, String> {
+        static HEAD: LazyLock<Regex> = LazyLock::new(|| pattern(r"^\s*/loop"));
+        static LIST: LazyLock<Regex> = LazyLock::new(|| pattern(r"^(?:list|ls|列表|列出来|看看|全部)?$"));
+        static STOP: LazyLock<Regex> =
+            LazyLock::new(|| pattern(r"^(?:stop|cancel|停|停掉|停止|取消|删|删掉|删除)\s*(?:#?(\d+)|(全部|所有|all))$"));
+        static NEXT: LazyLock<Regex> = LazyLock::new(|| pattern(r"^(?:next|下次|下一次)\s*(.+)$"));
+        static DONE: LazyLock<Regex> = LazyLock::new(|| pattern(r"^(?:done|完成|结束|办完了)$"));
+        static EVERY: LazyLock<Regex> =
+            LazyLock::new(|| pattern(&format!(r"^(?:每隔|每|every\s*)\s*(\d+(?:\.\d+)?)\s*({UNITS})(?:一次|钟)?(\s*)(.*)$")));
+        static LATER: LazyLock<Regex> = LazyLock::new(|| pattern(&format!(r"^(\d+(?:\.\d+)?)\s*({UNITS})(\s+|$)(.*)$")));
+        static LATER_WORD: LazyLock<Regex> = LazyLock::new(|| {
+            pattern(&format!(r"^(?:(\d+(?:\.\d+)?)\s*({UNITS})(?:后|以后|之后)|in\s+(\d+(?:\.\d+)?)\s*({UNITS}))\s*(.*)$"))
+        });
+        static WEEKLY: LazyLock<Regex> = LazyLock::new(|| {
+            pattern(&format!(
+                r"^(每天|每日|天天|daily|every\s*day|每个?工作日|工作日|weekdays|每个?周末|周末|weekends|(?:每周|每星期|每个星期|周|星期)([一二三四五六日天](?:\s*[、,，和]?\s*[一二三四五六日天])*))\s*{TIME}\s*(.*)$"
+            ))
+        });
+        static DATED: LazyLock<Regex> = LazyLock::new(|| {
+            pattern(&format!(
+                r"^(今天|今晚|明天|明早|明晚|后天|(\d{{4}})[-/.](\d{{1,2}})[-/.](\d{{1,2}})|(\d{{1,2}})[-/](\d{{1,2}})|(\d{{1,2}})月(\d{{1,2}})[日号]?)\s*{TIME}\s*(.*)$"
+            ))
+        });
+        static BARE: LazyLock<Regex> = LazyLock::new(|| pattern(&format!(r"^{TIME}\s*(.*)$")));
+        let rest = HEAD.replace(text, "").trim().to_string();
+        let local = now.with_timezone(&Local);
+        if LIST.is_match(&rest) {
+            return Ok(Command::List);
+        }
+        if let Some(captures) = STOP.captures(&rest) {
+            return Ok(Command::Stop {
+                number: captures.get(1).and_then(|number| number.as_str().parse().ok()).unwrap_or(0),
+                all: captures.get(2).is_some(),
+            });
+        }
+        if let Some(captures) = NEXT.captures(&rest) {
+            return duration(&captures[1]).map(Command::Next).ok_or_else(|| "「/loop next」后面要写多久，比如 /loop next 20m".to_string());
+        }
+        if DONE.is_match(&rest) {
+            return Ok(Command::Done);
+        }
+        let minutes = |number: &str, unit: &str| ((number.parse::<f64>().unwrap_or(0.0) * unit_seconds(unit) / 60.0).ceil() as i64).max(1);
+        // 「每 10 分钟」「every 2h」：单位后面紧跟着英文字母的不算（10min… 是 10 分钟，10mail 不是）
+        if let Some(captures) = EVERY.captures(&rest)
+            && (!captures[3].is_empty() || !captures[4].starts_with(|c: char| c.is_ascii_alphabetic()))
+        {
+            if captures[1].parse::<f64>().unwrap_or(0.0) <= 0.0 {
+                return Err("间隔要大于 0".into());
+            }
+            return created(Trigger::Interval(minutes(&captures[1], &captures[2])), &captures[4]);
+        }
+        if let Some(captures) = LATER_WORD.captures(&rest) {
+            let (number, unit) = match captures.get(1) {
+                Some(number) => (number.as_str().to_string(), captures[2].to_string()),
+                None => (captures[3].to_string(), captures[4].to_string()),
+            };
+            let seconds = number.parse::<f64>().unwrap_or(0.0) * unit_seconds(&unit);
+            if seconds <= 0.0 {
+                return Err("时间要大于 0".into());
+            }
+            return created(Trigger::Once(now + chrono::Duration::seconds(seconds.ceil() as i64)), &captures[5]);
+        }
+        if let Some(captures) = LATER.captures(&rest) {
+            if captures[1].parse::<f64>().unwrap_or(0.0) <= 0.0 {
+                return Err("间隔要大于 0".into());
+            }
+            return created(Trigger::Interval(minutes(&captures[1], &captures[2])), &captures[4]);
+        }
+        let wrong_time = || "时间不对：几点要在 0–23，几分在 0–59".to_string();
+        if let Some(captures) = WEEKLY.captures(&rest) {
+            let which = captures[1].to_lowercase();
+            let days = if which.contains("工作日") || which == "weekdays" {
+                WORKDAYS
+            } else if which.contains("周末") || which == "weekends" {
+                WEEKEND
+            } else if let Some(days) = captures.get(2) {
+                day_mask(days.as_str())
+            } else {
+                EVERY_DAY
+            };
+            let minute = minute_of_day(&captures, 3, "").ok_or_else(wrong_time)?;
+            return created(Trigger::Weekly { days, minute_of_day: minute }, &captures[8]);
+        }
+        if let Some(captures) = DATED.captures(&rest) {
+            let day = &captures[1];
+            let mut date = local.date_naive();
+            let mut period = "";
+            match day {
+                "今晚" => period = "晚上",
+                "明天" | "明早" => date += chrono::Duration::days(1),
+                "明晚" => {
+                    date += chrono::Duration::days(1);
+                    period = "晚上";
+                }
+                "后天" => date += chrono::Duration::days(2),
+                _ => {}
+            }
+            let number = |index: usize| captures.get(index).and_then(|value| value.as_str().parse::<u32>().ok());
+            let mut guess_year = false;
+            let parsed = if let (Some(year), Some(month), Some(day)) = (number(2), number(3), number(4)) {
+                NaiveDate::from_ymd_opt(year as i32, month, day)
+            } else if let (Some(month), Some(day)) = (number(5).or(number(7)), number(6).or(number(8))) {
+                guess_year = true;
+                NaiveDate::from_ymd_opt(local.year(), month, day)
+            } else {
+                Some(date)
+            };
+            let date = parsed.ok_or("日期不对")?;
+            let minute = minute_of_day(&captures, 9, period).ok_or_else(wrong_time)?;
+            let mut at = local_at(date, minute).ok_or("日期不对")?;
+            if at <= now && guess_year {
+                at = date.with_year(date.year() + 1).and_then(|next| local_at(next, minute)).unwrap_or(at);
+            }
+            if at <= now {
+                return Err("这个时间已经过了".into());
+            }
+            return created(Trigger::Once(at), &captures[14]);
+        }
+        if let Some(captures) = BARE.captures(&rest) {
+            let minute = minute_of_day(&captures, 1, "").ok_or_else(wrong_time)?;
+            let mut at = local_at(local.date_naive(), minute).ok_or("日期不对")?;
+            if at <= now {
+                at = local_at(local.date_naive() + chrono::Duration::days(1), minute).ok_or("日期不对")?;
+            }
+            return created(Trigger::Once(at), &captures[6]);
+        }
+        created(Trigger::Itself, &rest)
+    }
+
+    /// 一次跑完的回复里单独一行的「/loop next 20m」「/loop done」（有几个取最后一个）
+    fn directive(reply: &str) -> Option<Command> {
+        static LINE: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"(?im)^[\s`*>_-]*(/loop\s+(?:next|下次)\s*[^`*\n]+?|/loop\s+done)[\s`*_]*$").unwrap());
+        LINE.captures_iter(reply)
+            .filter_map(|captures| parse(&captures[1], Utc::now()).ok())
+            .filter(|command| matches!(command, Command::Next(_) | Command::Done))
+            .last()
+    }
+
+    fn without_directives(reply: &str) -> String {
+        static LINE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?im)^[\s`*>_-]*/loop\s+(?:next|下次|done)\b[^\n]*$\n?").unwrap());
+        LINE.replace_all(reply, "").trim().to_string()
+    }
+
+    fn usage() -> &'static str {
+        "用法：/loop [时间] 要做的事\n· 不写时间：它自己定多久再来（/loop 盯着 CI，过了告诉我）\n· 间隔：/loop 10m …、/loop 每2小时 …\n· 定点：/loop 每天9:00 …、/loop 工作日9:00 …、/loop 每周一10:00 …\n· 一次：/loop 明天8:00 …、/loop 10-15 14:00 …、/loop 30分钟后 …\n· /loop 列出来，/loop stop 3 停掉 #3，/loop stop 全部"
+    }
+
+    // MARK: 任务
+
+    #[derive(Clone)]
+    struct Task {
+        id: String,
+        number: i64,
+        trigger: Trigger,
+        content: String,
+        /// 会话 id（小写）
+        conversation: String,
+        /// user / agent
+        created_by: String,
+        created_at: DateTime<Utc>,
+        next_run: Option<DateTime<Utc>>,
+        last_run: Option<DateTime<Utc>>,
+        run_started_at: Option<DateTime<Utc>>,
+        /// 正在跑的这次在大脑里是哪一轮
+        run_turn: String,
+        paused: bool,
+        run_count: i64,
+        last_result: String,
+        history: Vec<Value>,
+        run_times: Vec<DateTime<Utc>>,
+    }
+
+    impl Task {
+        fn running(&self) -> bool {
+            self.run_started_at.is_some()
+        }
+
+        /// 智能体建的、自己定节奏的：一天最多跑 24 次
+        fn capped(&self) -> bool {
+            self.created_by != "user" || self.trigger == Trigger::Itself
+        }
+
+        /// 用户建的只有用户能停
+        fn agent_can_stop(&self) -> bool {
+            self.created_by != "user"
+        }
+
+        fn line(&self, now: DateTime<Utc>) -> String {
+            let mut parts = vec![format!("#{}", self.number), self.trigger.describe(), brief(&self.content, 60)];
+            if self.created_by != "user" {
+                parts.push("智能体建的".into());
+            }
+            if self.paused {
+                parts.push("暂停了".into());
+            } else if self.running() {
+                parts.push("正在做".into());
+            } else if let Some(next) = &self.next_run {
+                parts.push(format!("下次 {}", when(next, now)));
+            }
+            if !self.last_result.is_empty() {
+                parts.push(format!("上次：{}", brief(&self.last_result, 60)));
+            }
+            parts.join(" · ")
+        }
+
+        fn to_json(&self) -> Value {
+            let mut value = json!({
+                "id": self.id, "number": self.number, "trigger": self.trigger.to_json(), "content": self.content,
+                "target": "conversation", "conversationID": crate::upper(&self.conversation), "createdBy": self.created_by,
+                "createdAt": iso(&self.created_at), "runCount": self.run_count, "history": self.history,
+            });
+            for (key, at) in [("nextRun", &self.next_run), ("lastRun", &self.last_run), ("runStartedAt", &self.run_started_at)] {
+                if let Some(at) = at {
+                    value[key] = json!(iso(at));
+                }
+            }
+            if !self.run_turn.is_empty() {
+                value["runTurn"] = json!(self.run_turn);
+            }
+            if self.paused {
+                value["paused"] = json!(true);
+            }
+            if !self.last_result.is_empty() {
+                value["lastResult"] = json!(self.last_result);
+            }
+            if !self.run_times.is_empty() {
+                value["runTimes"] = json!(self.run_times.iter().map(iso).collect::<Vec<_>>());
+            }
+            value
+        }
+
+        fn from_json(value: &Value) -> Option<Task> {
+            let text = |key: &str| value[key].as_str().unwrap_or("").to_string();
+            let task = Task {
+                id: text("id"),
+                number: value["number"].as_i64().unwrap_or(0),
+                trigger: Trigger::from_json(&value["trigger"])?,
+                content: text("content"),
+                conversation: crate::lower(&text("conversationID")),
+                created_by: if text("createdBy").is_empty() { "user".into() } else { text("createdBy") },
+                created_at: parse_time(&value["createdAt"]).unwrap_or_else(Utc::now),
+                next_run: parse_time(&value["nextRun"]),
+                last_run: parse_time(&value["lastRun"]),
+                run_started_at: parse_time(&value["runStartedAt"]),
+                run_turn: text("runTurn"),
+                paused: value["paused"].as_bool().unwrap_or(false),
+                run_count: value["runCount"].as_i64().unwrap_or(0),
+                last_result: text("lastResult"),
+                history: value["history"].as_array().cloned().unwrap_or_default(),
+                run_times: value["runTimes"].as_array().into_iter().flatten().filter_map(parse_time).collect(),
+            };
+            (!task.id.is_empty() && !task.content.is_empty() && !task.conversation.is_empty()).then_some(task)
+        }
+
+        fn record(&mut self, at: DateTime<Utc>, status: &str, result: &str) {
+            self.history.push(json!({ "at": iso(&at), "status": status, "result": result }));
+            let excess = self.history.len().saturating_sub(HISTORY_LIMIT);
+            self.history.drain(..excess);
+        }
+
+        fn runs_in_last_day(&self, now: DateTime<Utc>) -> usize {
+            self.run_times.iter().filter(|at| (now - **at).num_seconds() < 86400).count()
+        }
+
+        /// 到点发出去的那条
+        fn run_text(&self) -> String {
+            let last = if !self.last_result.is_empty() && self.run_count > 1 {
+                fill(RUN_LAST, &[("result", brief(&self.last_result, 300))])
+            } else {
+                String::new()
+            };
+            let template = match (self.trigger == Trigger::Itself, self.agent_can_stop()) {
+                (true, true) => RUN_SELF,
+                (true, false) => RUN_SELF_USER,
+                (false, true) => RUN,
+                (false, false) => RUN_USER,
+            };
+            fill(
+                template,
+                &[
+                    ("number", self.number.to_string()),
+                    ("schedule", self.trigger.describe()),
+                    ("count", self.run_count.to_string()),
+                    ("last", last),
+                    ("content", self.content.clone()),
+                ],
+            )
+        }
+    }
+
+    #[derive(Default)]
+    struct Loops {
+        tasks: Vec<Task>,
+        next_number: i64,
+        loaded: bool,
+    }
+
+    static LOOPS: LazyLock<Mutex<Loops>> = LazyLock::new(|| Mutex::new(Loops::default()));
+    static DIRTY: AtomicBool = AtomicBool::new(false);
+
+    fn path() -> std::path::PathBuf {
+        crate::serve_dir().join("loops.json")
+    }
+
+    fn with<T>(change: impl FnOnce(&mut Loops) -> T) -> T {
+        let mut loops = LOOPS.lock().unwrap();
+        if !loops.loaded {
+            loops.loaded = true;
+            let saved = crate::read_json_file(&path());
+            loops.next_number = saved["nextNumber"].as_i64().unwrap_or(1).max(1);
+            loops.tasks = saved["tasks"].as_array().into_iter().flatten().filter_map(Task::from_json).collect();
+            let highest = loops.tasks.iter().map(|task| task.number + 1).max().unwrap_or(1);
+            loops.next_number = loops.next_number.max(highest);
+        }
+        change(&mut loops)
+    }
+
+    fn save(loops: &Loops) {
+        let value = json!({ "nextNumber": loops.next_number, "tasks": loops.tasks.iter().map(Task::to_json).collect::<Vec<_>>() });
+        let _ = crate::write_json_file(&path(), &value);
+        DIRTY.store(true, Ordering::Relaxed);
+    }
+
+    /// 起来时：每 30 秒看一次到点的（马上看一次），80 毫秒合并一次推 loops
+    pub fn start() {
+        std::thread::spawn(|| {
+            loop {
+                check_running();
+                tick();
+                std::thread::sleep(Duration::from_secs(30));
+            }
+        });
+        std::thread::spawn(|| {
+            loop {
+                std::thread::sleep(Duration::from_millis(80));
+                if DIRTY.swap(false, Ordering::Relaxed) {
+                    crate::notify_all_clients("loops", state());
+                }
+            }
+        });
+    }
+
+    /// 有没暂停的任务（常驻的那份不退）
+    pub fn active() -> bool {
+        with(|loops| loops.tasks.iter().any(|task| !task.paused))
+    }
+
+    /// 处理一条「/loop …」：建、列、停；回给人看的。conversation：在哪段会话里打的；by：user / agent。
+    /// kick：刚建的马上看一次（网关交来的不：它先把问答记进会话，再叫 loops.tick）
+    pub fn handle(text: &str, conversation: &str, by: &str, kick: bool) -> String {
+        let now = Utc::now();
+        let command = match parse(text, now) {
+            Ok(command) => command,
+            Err(error) => return format!("没建成：{error}。\n{}", usage()),
+        };
+        let conversation = crate::lower(conversation);
+        let reply = with(|loops| {
+            let owns = |task: &Task| task.conversation == conversation;
+            match command {
+                Command::List => list_text(loops, &conversation, now),
+                Command::Next(_) | Command::Done => {
+                    format!("「/loop next」「/loop done」是定时任务跑的那次写在回复最后的，用来定下次什么时候来、或者结束。\n{}", usage())
+                }
+                Command::Stop { number, all } => {
+                    // 智能体（工具）停：只停智能体建的，用户建的留着
+                    let by_agent = by != "user";
+                    let stoppable = |task: &Task| owns(task) && (!by_agent || task.agent_can_stop());
+                    let mut stopped = Vec::new();
+                    let mut kept = Vec::new();
+                    if all {
+                        for task in &loops.tasks {
+                            if stoppable(task) {
+                                stopped.push(format!("#{}", task.number));
+                            } else if owns(task) {
+                                kept.push(format!("#{}", task.number));
+                            }
+                        }
+                        loops.tasks.retain(|task| !stoppable(task));
+                    } else {
+                        let Some(found) = loops.tasks.iter().find(|task| task.number == number && owns(task)).cloned() else {
+                            return format!("没有定时任务 #{number}。\n{}", list_text(loops, &conversation, now));
+                        };
+                        if !stoppable(&found) {
+                            return user_only(&format!("#{}", found.number));
+                        }
+                        stopped.push(format!("#{}", found.number));
+                        loops.tasks.retain(|task| task.id != found.id);
+                    }
+                    if !stopped.is_empty() {
+                        save(loops);
+                    }
+                    if !kept.is_empty() {
+                        let head = if stopped.is_empty() {
+                            String::new()
+                        } else {
+                            format!("停掉了智能体建的定时任务 {}。", stopped.join("、"))
+                        };
+                        return head + &user_only(&kept.join("、"));
+                    }
+                    if stopped.is_empty() {
+                        "没有在跑的定时任务。".into()
+                    } else {
+                        format!("停掉了定时任务 {}。", stopped.join("、"))
+                    }
+                }
+                Command::Create(trigger, content) => {
+                    // 智能体建的有上限
+                    if by != "user" && loops.tasks.iter().filter(|task| task.created_by != "user" && owns(task)).count() >= MAX_PER_OWNER {
+                        return format!("没建成：智能体在这里建的定时任务最多 {MAX_PER_OWNER} 个，先停掉不用的（/loop stop 编号）。");
+                    }
+                    // 间隔、自己定节奏的马上跑第一次；定点、一次的到点再跑
+                    let next_run =
+                        if matches!(trigger, Trigger::Itself | Trigger::Interval(_)) { Some(now) } else { trigger.next_after(now) };
+                    let task = Task {
+                        id: uuid::Uuid::new_v4().to_string().to_uppercase(),
+                        number: loops.next_number,
+                        trigger,
+                        content,
+                        conversation: conversation.clone(),
+                        created_by: by.to_string(),
+                        created_at: now,
+                        next_run,
+                        last_run: None,
+                        run_started_at: None,
+                        run_turn: String::new(),
+                        paused: false,
+                        run_count: 0,
+                        last_result: String::new(),
+                        history: Vec::new(),
+                        run_times: Vec::new(),
+                    };
+                    loops.next_number += 1;
+                    let mut reply = format!("建好了定时任务 #{}（{}）：{}", task.number, task.trigger.describe(), brief(&task.content, 80));
+                    match &task.next_run {
+                        Some(next) if *next == now => reply += "。现在先做第一次",
+                        Some(next) => reply += &format!("。第一次 {}", when(next, now)),
+                        None => {}
+                    }
+                    if task.trigger == Trigger::Itself {
+                        reply += if task.agent_can_stop() {
+                            "，之后每次做完它自己定多久再来，办完了就停"
+                        } else {
+                            "，之后每次做完它自己定多久再来"
+                        };
+                    }
+                    if task.capped() {
+                        reply += &format!("（一天最多 {MAX_RUNS_PER_DAY} 次）");
+                    }
+                    reply += &format!("。\n/loop 看全部，/loop stop {} 停掉。", task.number);
+                    loops.tasks.push(task);
+                    save(loops);
+                    reply
+                }
+            }
+        });
+        // 刚建的马上看一次（间隔、自己定节奏的现在就跑）
+        if kick {
+            std::thread::spawn(tick);
+        }
+        reply
+    }
+
+    fn user_only(numbers: &str) -> String {
+        format!(
+            "定时任务 {numbers} 是用户建的，只有用户能停：不要再试着停它，照常做好每一次；用户想停可以自己打 /loop stop 编号，或在设置 › 定时任务里删。"
+        )
+    }
+
+    fn list_text(loops: &Loops, conversation: &str, now: DateTime<Utc>) -> String {
+        let lines: Vec<String> = loops.tasks.iter().filter(|task| task.conversation == conversation).map(|task| task.line(now)).collect();
+        if lines.is_empty() {
+            return format!("这里还没有定时任务。\n{}", usage());
+        }
+        format!("定时任务（{} 个）：\n{}\n停掉：/loop stop 编号，或 /loop stop 全部。", lines.len(), lines.join("\n"))
+    }
+
+    /// 到点的跑起来
+    fn tick() {
+        let now = Utc::now();
+        let due: Vec<Task> = with(|loops| {
+            let mut dirty = false;
+            let mut due = Vec::new();
+            for task in loops.tasks.iter_mut() {
+                let Some(next) = task.next_run.filter(|next| !task.paused && *next <= now) else { continue };
+                // 错过太久（常驻的那份没开）：不补，从现在算下一次
+                if (now - next).num_hours() >= CATCH_UP_HOURS {
+                    task.record(now, "missed", &format!("错过了 {} 那次（超过 {CATCH_UP_HOURS} 小时，不补）", when(&next, now)));
+                    task.next_run = match task.trigger {
+                        Trigger::Once(_) => None,
+                        Trigger::Itself => Some(now),
+                        _ => task.trigger.next_after(now),
+                    };
+                    dirty = true;
+                    if task.trigger != Trigger::Itself {
+                        continue;
+                    }
+                }
+                if task.running() {
+                    task.record(now, "skipped", "上一次还没做完，跳过这次");
+                    task.next_run = task.trigger.next_after(now);
+                    dirty = true;
+                    continue;
+                }
+                if task.capped() && task.runs_in_last_day(now) >= MAX_RUNS_PER_DAY {
+                    // 到了一天的上限：等最早那次满 24 小时
+                    let earliest = task.run_times.iter().filter(|at| (now - **at).num_seconds() < 86400).min().copied().unwrap_or(now);
+                    task.record(now, "skipped", &format!("今天已经跑满 {MAX_RUNS_PER_DAY} 次"));
+                    let after_cap = earliest + chrono::Duration::hours(24);
+                    task.next_run = Some(task.trigger.next_after(now).map_or(after_cap, |next| next.max(after_cap)));
+                    dirty = true;
+                    continue;
+                }
+                // 开始这一次：定点、间隔的从这次开始算下一次；自己定节奏的等它说；一次的跑完就删
+                task.last_run = Some(now);
+                task.run_count += 1;
+                task.run_times.retain(|at| (now - *at).num_seconds() < 86400);
+                task.run_times.push(now);
+                task.next_run = match task.trigger {
+                    Trigger::Itself | Trigger::Once(_) => None,
+                    _ => task.trigger.next_after(now),
+                };
+                task.run_started_at = Some(now);
+                task.run_turn.clear();
+                dirty = true;
+                due.push(task.clone());
+            }
+            // 一次性的、错过了的删掉
+            let before = loops.tasks.len();
+            loops.tasks.retain(|task| !(matches!(task.trigger, Trigger::Once(_)) && task.next_run.is_none() && !task.running()));
+            if dirty || loops.tasks.len() != before {
+                save(loops);
+            }
+            due
+        });
+        for task in due {
+            std::thread::spawn(move || {
+                let outcome = crate::fire_loop(&task.conversation, &task.run_text());
+                with(|loops| {
+                    let Some(current) = loops.tasks.iter_mut().find(|item| item.id == task.id) else { return };
+                    match outcome {
+                        Ok(turn) => current.run_turn = turn,
+                        Err(gone) if gone.is_empty() => {
+                            // 会话不在了：任务也删掉
+                            loops.tasks.retain(|item| item.id != task.id);
+                        }
+                        Err(error) => {
+                            current.run_started_at = None;
+                            current.record(Utc::now(), "failed", &error);
+                            if current.trigger == Trigger::Itself {
+                                current.next_run = Some(Utc::now() + chrono::Duration::minutes(SELF_DEFAULT_MINUTES));
+                            }
+                        }
+                    }
+                    save(loops);
+                });
+            });
+        }
+    }
+
+    /// 在跑的超过 6 小时没结果：这次算没做成
+    fn check_running() {
+        let now = Utc::now();
+        let stale: Vec<String> = with(|loops| {
+            loops
+                .tasks
+                .iter()
+                .filter(|task| task.run_started_at.is_some_and(|started| (now - started).num_hours() >= RUN_TIMEOUT_HOURS))
+                .map(|task| task.id.clone())
+                .collect()
+        });
+        for id in stale {
+            finish(&id, &format!("超过 {RUN_TIMEOUT_HOURS} 小时没等到结果"), "failed");
+        }
+    }
+
+    /// 大脑里一轮做完了（done）：是哪个任务的那一次就收下结果
+    pub fn on_done(session: &str, turn: &str, data: &Value) {
+        let id = with(|loops| {
+            loops
+                .tasks
+                .iter()
+                .find(|task| task.running() && !task.run_turn.is_empty() && task.run_turn == turn && task.conversation == session)
+                .map(|task| task.id.clone())
+        });
+        let Some(id) = id else { return };
+        match data["error"].as_str().filter(|error| !error.is_empty()) {
+            Some(error) => finish(&id, &format!("出错了：{error}"), "failed"),
+            None if data["stopped"].as_bool() == Some(true) => finish(&id, "被停下了", "failed"),
+            None => finish(&id, data["answer"].as_str().unwrap_or(""), "ok"),
+        }
+    }
+
+    fn finish(id: &str, reply: &str, status: &str) {
+        let now = Utc::now();
+        with(|loops| {
+            let Some(task) = loops.tasks.iter_mut().find(|task| task.id == id) else { return };
+            let started = task.run_started_at.take().unwrap_or(now);
+            task.run_turn.clear();
+            let result = without_directives(reply);
+            task.last_result = brief(&result, 400);
+            let last = task.last_result.clone();
+            task.record(started, status, &last);
+            let directive = if status == "ok" { directive(reply) } else { None };
+            let mut ended = matches!(task.trigger, Trigger::Once(_));
+            // 用户建的只有用户能停：写了 /loop done 也不算
+            if matches!(directive, Some(Command::Done)) && task.agent_can_stop() {
+                ended = true;
+            }
+            if !ended && task.trigger == Trigger::Itself {
+                // 它定的下次（1 分钟到 24 小时）；没说就半小时后
+                let seconds = match directive {
+                    Some(Command::Next(seconds)) => seconds.clamp(60, 86400),
+                    _ => SELF_DEFAULT_MINUTES * 60,
+                };
+                task.next_run = Some(now + chrono::Duration::seconds(seconds));
+            }
+            if ended {
+                loops.tasks.retain(|task| task.id != id);
+            }
+            save(loops);
+        });
+    }
+
+    /// 会话删了：它的任务一起删
+    pub fn forget_conversation(conversation: &str) {
+        let conversation = crate::lower(conversation);
+        with(|loops| {
+            let before = loops.tasks.len();
+            loops.tasks.retain(|task| task.conversation != conversation);
+            if loops.tasks.len() != before {
+                save(loops);
+            }
+        });
+    }
+
+    /// LoopsState：loops.json 里的那份加 targetLabel（「会话：标题」）
+    pub fn state() -> Value {
+        let tasks: Vec<Value> = with(|loops| loops.tasks.clone())
+            .iter()
+            .map(|task| {
+                let mut value = task.to_json();
+                value["targetLabel"] = json!(format!("会话：{}", crate::conversation_title(&task.conversation)));
+                value
+            })
+            .collect();
+        json!({ "tasks": tasks })
+    }
+
+    /// loops.*（设置 › 定时任务看着这台时）
+    pub fn request(method: &str, params: &Value) -> crate::Reply {
+        let id = || params["id"].as_str().filter(|id| !id.is_empty()).map(str::to_string).ok_or((-32602, "缺少参数 id".to_string()));
+        let missing = |id: &str| (crate::NOT_FOUND, format!("没有定时任务 {id}"));
+        match method {
+            "loops.list" => {}
+            "loops.setPaused" => {
+                let id = id()?;
+                let paused = params["paused"].as_bool().ok_or((-32602, "缺少参数 paused（布尔）".to_string()))?;
+                let found = with(|loops| {
+                    let Some(task) = loops.tasks.iter_mut().find(|task| task.id == id) else { return false };
+                    if task.paused != paused {
+                        task.paused = paused;
+                        // 恢复时错过的不补：从现在算下一次
+                        let now = Utc::now();
+                        if !paused && task.next_run.is_none_or(|next| next < now) {
+                            task.next_run = if matches!(task.trigger, Trigger::Itself | Trigger::Interval(_)) {
+                                Some(now)
+                            } else {
+                                task.trigger.next_after(now)
+                            };
+                        }
+                        save(loops);
+                    }
+                    true
+                });
+                if !found {
+                    return Err(missing(&id));
+                }
+                std::thread::spawn(tick);
+            }
+            "loops.runNow" => {
+                let id = id()?;
+                let found = with(|loops| {
+                    let Some(task) = loops.tasks.iter_mut().find(|task| task.id == id) else { return false };
+                    if !task.running() {
+                        task.next_run = Some(Utc::now());
+                        task.paused = false;
+                        save(loops);
+                    }
+                    true
+                });
+                if !found {
+                    return Err(missing(&id));
+                }
+                tick();
+            }
+            "loops.remove" => {
+                let id = id()?;
+                let removed = with(|loops| {
+                    let before = loops.tasks.len();
+                    loops.tasks.retain(|task| task.id != id);
+                    let removed = loops.tasks.len() != before;
+                    if removed {
+                        save(loops);
+                    }
+                    removed
+                });
+                if !removed {
+                    return Err(missing(&id));
+                }
+            }
+            "loops.command" => {
+                let text = params["text"].as_str().unwrap_or("");
+                let conversation = params["conversationID"].as_str().unwrap_or("");
+                return Ok(json!({ "reply": handle(text, conversation, params["by"].as_str().unwrap_or("user"), false) }));
+            }
+            "loops.tick" => {
+                std::thread::spawn(tick);
+            }
+            "loops.forget" => forget_conversation(params["conversationID"].as_str().unwrap_or("")),
+            other => return Err((-32601, format!("没有这个方法：{other}"))),
+        }
+        Ok(state())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn parses_like_friday() {
+            let now = Local.with_ymd_and_hms(2026, 10, 15, 10, 0, 0).unwrap().with_timezone(&Utc);
+            let create = |text: &str| match parse(text, now) {
+                Ok(Command::Create(trigger, content)) => (trigger, content),
+                _ => panic!("没认出：{text}"),
+            };
+            assert_eq!(create("/loop 10m 看 CI"), (Trigger::Interval(10), "看 CI".into()));
+            assert_eq!(create("/loop 每2小时 看看").0, Trigger::Interval(120));
+            assert_eq!(create("/loop every 15 minutes check").0, Trigger::Interval(15));
+            assert_eq!(create("/loop 盯着 CI，过了告诉我").0, Trigger::Itself);
+            assert_eq!(create("/loop 每天9:00 写日报").0, Trigger::Weekly { days: EVERY_DAY, minute_of_day: 540 });
+            assert_eq!(create("/loop 工作日 9点半 开会").0, Trigger::Weekly { days: WORKDAYS, minute_of_day: 570 });
+            assert_eq!(create("/loop 每周一三10:00 周会").0, Trigger::Weekly { days: 0b101, minute_of_day: 600 });
+            assert_eq!(create("/loop 周末下午3点 打球").0, Trigger::Weekly { days: WEEKEND, minute_of_day: 900 });
+            let tomorrow = Local.with_ymd_and_hms(2026, 10, 16, 8, 0, 0).unwrap().with_timezone(&Utc);
+            assert_eq!(create("/loop 明天8:00 叫我").0, Trigger::Once(tomorrow));
+            let afternoon = Local.with_ymd_and_hms(2026, 10, 20, 14, 0, 0).unwrap().with_timezone(&Utc);
+            assert_eq!(create("/loop 10月20日 下午2点 交报告").0, Trigger::Once(afternoon));
+            assert_eq!(create("/loop 30分钟后 提醒我").0, Trigger::Once(now + chrono::Duration::minutes(30)));
+            // 只写钟点：过了算明天
+            let bare = Local.with_ymd_and_hms(2026, 10, 16, 9, 30, 0).unwrap().with_timezone(&Utc);
+            assert_eq!(create("/loop 9:30 起床").0, Trigger::Once(bare));
+            assert!(matches!(parse("/loop", now), Ok(Command::List)));
+            assert!(matches!(parse("/loop stop 3", now), Ok(Command::Stop { number: 3, all: false })));
+            assert!(matches!(parse("/loop stop 全部", now), Ok(Command::Stop { all: true, .. })));
+            assert!(parse("/loop 10m", now).is_err());
+            assert!(
+                parse("/loop 10-01 8:00 过去了", now)
+                    .is_ok_and(|command| matches!(command, Command::Create(Trigger::Once(at), _) if at.year() == 2027))
+            );
+            // 回复里的指令
+            assert!(matches!(directive("看过了。\n/loop next 20m"), Some(Command::Next(1200))));
+            assert!(matches!(directive("办完了\n`/loop done`"), Some(Command::Done)));
+            assert!(directive("正文里提到 /loop done 不算").is_none());
+            assert_eq!(without_directives("结果\n/loop next 2h\n"), "结果");
+            // 下一次
+            let weekly = Trigger::Weekly { days: WORKDAYS, minute_of_day: 540 };
+            let saturday = Local.with_ymd_and_hms(2026, 10, 17, 12, 0, 0).unwrap().with_timezone(&Utc);
+            let monday = Local.with_ymd_and_hms(2026, 10, 19, 9, 0, 0).unwrap().with_timezone(&Utc);
+            assert_eq!(weekly.next_after(saturday), Some(monday));
+            assert_eq!(weekly.describe(), "工作日 9:00");
+        }
     }
 }
 
