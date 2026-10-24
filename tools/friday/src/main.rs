@@ -387,6 +387,24 @@ impl Meta {
         }
     }
 
+    /// 主会话一张卡片的增删行数（不刷新缓存：卡片多时每张都看一眼文件太慢）
+    fn line(&self, session: &str, card: &str) -> Option<[i64; 2]> {
+        let cache = self.cache.lock().unwrap();
+        let entry = &cache.0["lines"][lower(session)][card];
+        Some([entry[0].as_i64()?, entry[1].as_i64()?])
+    }
+
+    fn set_line(&self, session: &str, card: &str, lines: [i64; 2]) {
+        self.update(|value| {
+            let sessions = Self::object(value, "lines");
+            let entry = sessions.entry(lower(session)).or_insert_with(|| json!({}));
+            if !entry.is_object() {
+                *entry = json!({});
+            }
+            entry[card] = json!(lines);
+        });
+    }
+
     /// 最近一轮做完时的用量（上下文进度环）
     fn stats(&self, id: &str) -> Option<Value> {
         let stats = self.value()["stats"][lower(id)].clone();
@@ -406,7 +424,7 @@ impl Meta {
             if let Some(ids) = value["pinned"].as_array_mut() {
                 ids.retain(|item| item.as_str() != Some(id.as_str()));
             }
-            for key in ["drafts", "settings", "blank", "stats"] {
+            for key in ["drafts", "settings", "blank", "stats", "lines"] {
                 if let Some(entries) = value[key].as_object_mut() {
                     entries.remove(&id);
                 }
@@ -455,6 +473,8 @@ struct Card<'a> {
     arguments: &'a Value,
     status: &'a str,
     result: &'a str,
+    /// 这一步加了几行、删了几行（卡片上的「+N −M」）
+    lines: Option<[i64; 2]>,
 }
 
 /// 卡片在哪：主会话的第几条消息（agent 是 None），或哪个子智能体的运行记录里；team：这台上知道的子智能体
@@ -469,6 +489,11 @@ struct Place<'a> {
 /// 子智能体运行记录里的卡片的 id
 fn agent_call_uuid(session: &str, agent: &str, call: &str, nth: usize) -> String {
     stable_uuid(&[session, "agent-call", agent, call, &nth.to_string()])
+}
+
+/// 子智能体还没看的一条追加指示的 id（Friday 的 QueuedInput）
+fn agent_inbox_uuid(session: &str, agent: &str, item: &str) -> String {
+    stable_uuid(&[session, "agent-inbox", agent, item])
 }
 
 /// 一个子智能体的卡片的 id（Agent 树里它的 id 也是这个）
@@ -491,6 +516,13 @@ fn tool_block(place: Place, card: Card) -> Value {
     if let Some((title, symbol)) = tool_look(card.name) {
         event["title"] = json!(title);
         event["symbol"] = json!(symbol);
+    }
+    // 主会话的卡片：存档里不记行数，正在干时记在 friday.json 里
+    let lines =
+        card.lines.or_else(|| place.agent.is_none().then(|| META.line(place.session, event["id"].as_str().unwrap_or(""))).flatten());
+    if let Some([added, removed]) = lines {
+        event["linesAdded"] = json!(added);
+        event["linesRemoved"] = json!(removed);
     }
     if DISPATCH.contains(&card.name) {
         attach_agents(place, card.call, card.name, &mut event);
@@ -586,9 +618,9 @@ fn agent_transcript(place: Place, agent: &AgentView) -> Vec<Value> {
         .map(|(index, piece)| match piece {
             Piece::Text(text) => text_block(place.session, &format!("agent.{id}.{index}"), "text", text),
             Piece::Thinking(text) => text_block(place.session, &format!("agent.{id}.{index}"), "thinking", text),
-            Piece::Tool { call, name, arguments, status, result } => {
+            Piece::Tool { call, name, arguments, status, result, lines } => {
                 let nth = uses.entry(call.as_str()).or_insert(0);
-                let block = tool_block(inner, Card { call, nth: *nth, name, arguments, status, result });
+                let block = tool_block(inner, Card { call, nth: *nth, name, arguments, status, result, lines: *lines });
                 *nth += 1;
                 block
             }
@@ -717,7 +749,7 @@ fn group(session: &str, history: &[Value], team: &Team) -> Vec<Node> {
                     // 没有结果的（做到一半被停下）：算失败
                     open.insert(id.to_string(), (position, node.blocks.len()));
                     let nth = uses.entry((position, id.to_string())).or_insert(0);
-                    let card = Card { call: id, nth: *nth, name, arguments: &arguments, status: "failed", result: "" };
+                    let card = Card { call: id, nth: *nth, name, arguments: &arguments, status: "failed", result: "", lines: None };
                     let place = Place { session, node: position, agent: None, team };
                     node.blocks.push(tool_block(place, card));
                     *nth += 1;
@@ -792,7 +824,7 @@ fn messages(session: &Stored, live: Option<&Live>, team: &Team) -> (Vec<Value>, 
 enum Piece {
     Text(String),
     Thinking(String),
-    Tool { call: String, name: String, arguments: Value, status: String, result: String },
+    Tool { call: String, name: String, arguments: Value, status: String, result: String, lines: Option<[i64; 2]> },
 }
 
 /// 最近一次用这个调用 id 的那一块
@@ -813,6 +845,19 @@ fn set_piece(pieces: &mut [Piece], call: &str, new_status: &str, new_result: Opt
         if let Some(text) = new_result {
             *result = text.into();
         }
+    }
+}
+
+/// result 事件里的增删行数（{added, removed}）
+fn lines_of(data: &Value) -> Option<[i64; 2]> {
+    Some([data["lines"]["added"].as_i64()?, data["lines"]["removed"].as_i64()?])
+}
+
+fn set_piece_lines(pieces: &mut [Piece], call: &str, value: Option<[i64; 2]>) {
+    if let Some(index) = find_piece(pieces, call)
+        && let Piece::Tool { lines, .. } = &mut pieces[index]
+    {
+        *lines = value;
     }
 }
 
@@ -888,7 +933,8 @@ impl Live {
     }
 
     fn push_tool(&mut self, call: &str, name: &str, arguments: Value) {
-        let tool = Piece::Tool { call: call.into(), name: name.into(), arguments, status: "running".into(), result: String::new() };
+        let tool =
+            Piece::Tool { call: call.into(), name: name.into(), arguments, status: "running".into(), result: String::new(), lines: None };
         self.current().pieces.push(tool);
     }
 
@@ -980,10 +1026,10 @@ impl Live {
             .map(|(index, piece)| match piece {
                 Piece::Text(text) => text_block(session, &format!("live.{}.{segment}.{index}", self.turn), "text", text),
                 Piece::Thinking(text) => text_block(session, &format!("live.{}.{segment}.{index}", self.turn), "thinking", text),
-                Piece::Tool { call, name, arguments, status, result } => {
+                Piece::Tool { call, name, arguments, status, result, lines } => {
                     let nth = uses.entry(call.as_str()).or_insert(0);
                     let place = Place { session, node, agent: None, team };
-                    let block = tool_block(place, Card { call, nth: *nth, name, arguments, status, result });
+                    let block = tool_block(place, Card { call, nth: *nth, name, arguments, status, result, lines: *lines });
                     *nth += 1;
                     block
                 }
@@ -1076,6 +1122,7 @@ impl AgentView {
                         arguments: piece["arguments"].clone(),
                         status: field("status"),
                         result: field("result"),
+                        lines: lines_of(piece),
                     },
                     _ => return None,
                 })
@@ -1096,10 +1143,13 @@ impl AgentView {
                 arguments: data["arguments"].clone(),
                 status: "running".into(),
                 result: String::new(),
+                lines: None,
             }),
             "result" => {
                 let status = if data["ok"].as_bool().unwrap_or(true) { "succeeded" } else { "failed" };
-                set_piece(&mut self.pieces, data["id"].as_str().unwrap_or(""), status, Some(text));
+                let call = data["id"].as_str().unwrap_or("");
+                set_piece(&mut self.pieces, call, status, Some(text));
+                set_piece_lines(&mut self.pieces, call, lines_of(data));
             }
             _ => {}
         }
@@ -1176,7 +1226,11 @@ fn team_state(state: &State) -> Value {
                 "steps": agent.meta["steps"].as_u64().unwrap_or(0),
                 "speed": 0,
                 "passTokens": 0,
-                "queue": [],
+                // 它还没看的追加指示（Agent 树里能拿掉）
+                "queue": agent.meta["inbox"].as_array().into_iter().flatten().map(|item| json!({
+                    "id": agent_inbox_uuid(session, agent.id(), item["id"].as_str().unwrap_or("")),
+                    "text": item["text"], "attachments": [], "createdAt": agent.meta["started"],
+                })).collect::<Vec<_>>(),
             });
             if let Some(started) = agent.meta["started"].as_str() {
                 run["started"] = json!(started);
@@ -1270,6 +1324,8 @@ struct State {
     approvals: HashMap<String, Pending>,
     /// 忙时排着的话（Friday 的 QueuedInput）：开始那一轮时拿掉
     queued: HashMap<String, Vec<Value>>,
+    /// 排着的那句（QueuedInput 的 id）→ EDITH 排队时回的轮（拿掉时按它）
+    queued_turns: HashMap<String, String>,
     queue_revision: u64,
     /// 正在流式写、该推一次 message 的会话
     dirty: HashSet<String>,
@@ -1491,12 +1547,19 @@ fn on_brain_event(params: &Value) {
                     live.segments[0].from_agent = from_agent;
                 }
                 state.generating.insert(session.clone());
-                // 排着的那句开始了：从队列里拿掉
+                // 排着的那句开始了：从队列里拿掉（按 EDITH 排队时回的轮对，对不上再按原话）
                 let text = data["text"].as_str().unwrap_or("");
+                let by_turn: Option<String> = state.queued_turns.iter().find(|(_, queued)| **queued == turn).map(|(item, _)| item.clone());
                 if let Some(queue) = state.queued.get_mut(&session)
-                    && let Some(index) = queue.iter().position(|item| item["text"] == text)
+                    && let Some(index) = queue
+                        .iter()
+                        .position(|item| by_turn.as_ref().is_some_and(|id| item["id"] == json!(id)))
+                        .or_else(|| queue.iter().position(|item| item["text"] == text))
                 {
-                    queue.remove(index);
+                    let removed = queue.remove(index);
+                    if let Some(id) = removed["id"].as_str() {
+                        state.queued_turns.remove(id);
+                    }
                     state.queue_revision += 1;
                 }
                 true
@@ -1530,7 +1593,14 @@ fn on_brain_event(params: &Value) {
                     }
                     "result" => {
                         let status = if data["ok"].as_bool().unwrap_or(true) { "succeeded" } else { "failed" };
-                        live.set_tool(data["id"].as_str().unwrap_or(""), status, Some(text));
+                        let call = data["id"].as_str().unwrap_or("");
+                        live.set_tool(call, status, Some(text));
+                        if let Some(lines) = lines_of(data)
+                            && let Some((segment, _)) = live.find_tool(call)
+                        {
+                            set_piece_lines(&mut live.segments[segment].pieces, call, Some(lines));
+                            META.set_line(&session, &live.card_id(&session, call), lines);
+                        }
                     }
                     "stats" => live.stats(data),
                     "notice" => live.notice(text),
@@ -1601,6 +1671,39 @@ fn on_brain_approve(brain: &Arc<Brain>, request: &Value) {
     changed(&session, false);
 }
 
+/// 这件事已经有人答了（同一台的另一个客户端，或停下了）：收掉这边的待确认
+fn on_approve_cancel(params: &Value) {
+    let session = params["session"].as_str().unwrap_or("").to_string();
+    let call = params["call"].as_str().unwrap_or("");
+    let agent = params["agent"].as_str().filter(|agent| !agent.is_empty()).map(str::to_string);
+    let removed = {
+        let mut state = STATE.lock().unwrap();
+        let before = state.approvals.len();
+        state.approvals.retain(|_, pending| !(pending.session == session && pending.call == call && pending.agent == agent));
+        let removed = state.approvals.len() != before;
+        if removed {
+            match &agent {
+                Some(agent) => {
+                    if let Some(view) = state.agents.get_mut(agent) {
+                        set_piece(&mut view.pieces, call, "running", None);
+                    }
+                    state.team_dirty.insert(session.clone());
+                }
+                None => {
+                    if let Some(live) = state.live.get_mut(&session) {
+                        live.set_tool(call, "running", None);
+                    }
+                }
+            }
+            state.dirty.insert(session.clone());
+        }
+        removed
+    };
+    if removed {
+        changed(&session, false);
+    }
+}
+
 // MARK: - 大脑
 
 /// 连着的一个 EDITH 大脑（一个工作目录）
@@ -1653,6 +1756,7 @@ fn handle_brain_message(brain: &Arc<Brain>, message: Value) {
             }}));
         }
         (Some("event"), None) => on_brain_event(&message["params"]),
+        (Some("approve.cancel"), None) => on_approve_cancel(&message["params"]),
         (Some("approve"), Some(_)) => on_brain_approve(brain, &message),
         (Some("ping"), Some(id)) => {
             brain.write(&json!({ "jsonrpc": "2.0", "id": id, "result": {} }));
@@ -1776,6 +1880,24 @@ fn attach_brain(entry: &Value, wait: Duration) -> Result<Arc<Brain>, String> {
         let mut state = STATE.lock().unwrap();
         state.live.entry(id.clone()).or_insert(fresh);
         state.generating.insert(id.clone());
+    }
+    // 排着的（别的客户端排的、连上之前排的）
+    {
+        let mut state = STATE.lock().unwrap();
+        for session in listed.as_array().into_iter().flatten() {
+            let id = session["id"].as_str().unwrap_or("").to_string();
+            for entry in session["queue"].as_array().into_iter().flatten() {
+                let turn = entry["turn"].as_str().unwrap_or("").to_string();
+                if turn.is_empty() || state.queued_turns.values().any(|known| *known == turn) {
+                    continue;
+                }
+                let item_id = uuid::Uuid::new_v4().to_string().to_uppercase();
+                let item = json!({ "id": item_id, "text": entry["text"], "attachments": [], "createdAt": iso(SystemTime::now()) });
+                state.queued.entry(id.clone()).or_default().push(item);
+                state.queued_turns.insert(item_id, turn);
+                state.queue_revision += 1;
+            }
+        }
     }
     // 它的子智能体（在跑的、这个进程里跑过的）：Agent 树、卡片里的运行记录接着显示；旧版的 EDITH 没有 agents.list
     let agents = brain.request("agents.list", json!({}), Duration::from_secs(10)).unwrap_or_default();
@@ -2164,14 +2286,16 @@ fn submit(params: &Value) -> Reply {
         .map_err(|error| (NOT_ALLOWED, error))?;
     META.set_draft(&session.id, "");
     if reply["disposition"] == "queued" {
+        let item_id = uuid::Uuid::new_v4().to_string().to_uppercase();
         let item = json!({
-            "id": uuid::Uuid::new_v4().to_string().to_uppercase(),
+            "id": item_id,
             "text": text,
             "attachments": attachments,
             "createdAt": iso(SystemTime::now()),
         });
         let mut state = STATE.lock().unwrap();
         state.queued.entry(session.id.clone()).or_default().push(item);
+        state.queued_turns.insert(item_id, reply["turn"].as_str().unwrap_or("").to_string());
         state.queue_revision += 1;
     }
     changed(&session.id, true);
@@ -2464,9 +2588,48 @@ fn handle(method: &str, params: &Value) -> Reply {
         }
         "conversation.fork" => Err(not_allowed("从某条消息分叉")),
         "runner.retry" | "runner.resetSession" | "runner.selectBranch" => Err(not_allowed("重试、分支")),
-        "runner.removeQueued" | "runner.resumeQueue" => Err(not_allowed("把排着的话拿掉")),
+        "runner.removeQueued" => {
+            let session = session_param(params, "conversationID")?;
+            let item = upper(&text_param(params, "itemID")?);
+            let turn = STATE.lock().unwrap().queued_turns.get(&item).cloned().ok_or((NOT_FOUND, "没有这句排着的".to_string()))?;
+            let brain = connected_brain(&session).ok_or((NOT_FOUND, "这段会话没在干活".to_string()))?;
+            brain
+                .request("sessions.dequeue", json!({ "id": session.id, "turn": turn }), Duration::from_secs(10))
+                .map_err(|error| (NOT_ALLOWED, error))?;
+            {
+                let mut state = STATE.lock().unwrap();
+                state.queued_turns.remove(&item);
+                if let Some(queue) = state.queued.get_mut(&session.id) {
+                    queue.retain(|entry| entry["id"] != json!(item));
+                }
+                state.queue_revision += 1;
+            }
+            changed(&session.id, false);
+            Ok(json!({}))
+        }
+        // EDITH 不会暂停队列（Friday 出错时暂停），继续就是照常
+        "runner.resumeQueue" => Ok(json!({})),
+        "agent.removeQueued" => {
+            let card = upper(&text_param(params, "agentID")?);
+            let item = upper(&text_param(params, "itemID")?);
+            let found = STATE.lock().unwrap().agents.values().find(|agent| agent_card_uuid(agent.session(), agent.id()) == card).and_then(
+                |agent| {
+                    let inbox = agent.meta["inbox"]
+                        .as_array()?
+                        .iter()
+                        .find(|entry| agent_inbox_uuid(agent.session(), agent.id(), entry["id"].as_str().unwrap_or("")) == item)?;
+                    Some((agent.id().to_string(), agent.session().to_string(), inbox["id"].as_str().unwrap_or("").to_string()))
+                },
+            );
+            let (agent, session, inbox) = found.ok_or((NOT_FOUND, "没有这句排着的".to_string()))?;
+            let stored = stored_session(&session).ok_or((NOT_FOUND, "没有这段会话".to_string()))?;
+            let brain = brain_for(&stored.cwd).map_err(|error| (NOT_ALLOWED, error))?;
+            brain
+                .request("agents.dequeue", json!({ "id": agent, "item": inbox }), Duration::from_secs(10))
+                .map_err(|error| (NOT_ALLOWED, error))?;
+            Ok(json!({}))
+        }
         "runner.cancelQuotaWait" => Err(not_allowed("这个操作")),
-        "agent.removeQueued" => Err(not_allowed("把子智能体排着的话拿掉")),
         "secrets.set" | "secrets.remove" | "engines.update" | "engines.remove" | "engines.setSubAgentAllowed" => {
             Err(not_allowed("在这里改密钥和模型（改 ~/.edith/config.json）"))
         }

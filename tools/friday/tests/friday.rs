@@ -295,7 +295,16 @@ fn friday_client_through_gateway() {
     assert_eq!(link.reply_to(approve, 10)["result"]["decision"], "allow");
     let id = client.send("runner.resolveApproval", json!({ "eventID": card["id"], "approved": true }));
     assert_eq!(client.reply(id)["error"]["code"], 3);
-    push(&mut link, SESSION, "t1", "result", json!({ "id": "call_0", "name": "write_file", "ok": true, "text": "已写入" }));
+    // 写完：卡片上显示加了几行、删了几行
+    push(
+        &mut link,
+        SESSION,
+        "t1",
+        "result",
+        json!({ "id": "call_0", "name": "write_file", "ok": true, "text": "已写入", "lines": { "added": 3, "removed": 1 } }),
+    );
+    let counted = client.event("message", |params| tools(&params["message"]).iter().any(|tool| tool["linesAdded"] == 3));
+    assert_eq!(tools(&counted["params"]["message"])[0]["linesRemoved"], 1);
 
     // 干活时补充的话塞进来了：另起一段（一条用户消息 + 接着的回复），又一个 call_0
     push(&mut link, SESSION, "t1", "input", json!({ "text": "顺便也写 c.txt", "origin": { "capability": "friday", "kind": "user" } }));
@@ -317,9 +326,26 @@ fn friday_client_through_gateway() {
     let queued = client.send("runner.submit", json!({ "conversationID": upper, "text": "排着的", "attachments": [], "whenBusy": "queue" }));
     let sense = link.wait_for(10, |message| message["method"] == "sense").expect("排队的没交给大脑");
     assert_eq!(sense["params"]["urgency"], "queue");
-    reply(&mut link, &sense, json!({ "session": SESSION, "disposition": "queued", "turn": null }));
+    reply(&mut link, &sense, json!({ "session": SESSION, "disposition": "queued", "turn": "q1" }));
     assert!(client.reply(queued).get("error").is_none());
     client.event("runtime", |params| params["runtime"]["queue"].as_array().unwrap().iter().any(|item| item["text"] == "排着的"));
+    // 再排一句、拿掉它：交给大脑（按排队时回的轮）
+    let second = client.send("runner.submit", json!({ "conversationID": upper, "text": "不要了", "attachments": [], "whenBusy": "queue" }));
+    let sense = link.wait_for(10, |message| message["method"] == "sense").unwrap();
+    reply(&mut link, &sense, json!({ "session": SESSION, "disposition": "queued", "turn": "q2" }));
+    assert!(client.reply(second).get("error").is_none());
+    let runtime = client.event("runtime", |params| params["runtime"]["queue"].as_array().unwrap().len() == 2);
+    let item =
+        runtime["params"]["runtime"]["queue"].as_array().unwrap().iter().find(|item| item["text"] == "不要了").unwrap()["id"].clone();
+    let remove = client.send("runner.removeQueued", json!({ "conversationID": upper, "itemID": item }));
+    let request = link.wait_for(10, |message| message["method"] == "sessions.dequeue").expect("没让大脑拿掉");
+    assert_eq!((request["params"]["id"].as_str(), request["params"]["turn"].as_str()), (Some(SESSION), Some("q2")));
+    reply(&mut link, &request, json!({ "removed": true }));
+    assert!(client.reply(remove).get("error").is_none());
+    client.event("runtime", |params| {
+        let queue = params["runtime"]["queue"].as_array().unwrap();
+        queue.len() == 1 && queue[0]["text"] == "排着的"
+    });
 
     // 做完：大脑存档（这里替它追加），网关按存档重发整段；消息、卡片 id 前后一致
     push(&mut link, SESSION, "t1", "result", json!({ "id": "call_0", "name": "write_file", "ok": true, "text": "已写入" }));
@@ -591,6 +617,32 @@ fn sub_agents_and_file_changes() {
     client.event("team", |params| params["runs"].as_array().unwrap().iter().any(|run| run["activity"]["kind"] == "waitingApproval"));
     client.request("runner.resolveApproval", json!({ "eventID": inner["id"], "approved": true }));
     assert_eq!(link.reply_to(approve, 10)["result"]["decision"], "allow");
+    // 又要批一件，但别的客户端先批了：大脑推 approve.cancel，这边收掉待确认
+    push(
+        &mut link,
+        SESSION,
+        "t0",
+        "agent.event",
+        json!({ "agent": "a1", "type": "tool", "data": { "id": "c3", "name": "run_shell", "arguments": { "command": "ls" } } }),
+    );
+    let _other = link.start("approve", json!({ "session": SESSION, "turn": "t0", "call": "c3", "tool": "run_shell", "agent": "a1" }));
+    client.event("runner", |params| has(&params["pendingApproval"], SESSION));
+    link.send(json!({ "jsonrpc": "2.0", "method": "approve.cancel", "params": { "session": SESSION, "call": "c3", "agent": "a1" } }));
+    client.event("runner", |params| !has(&params["pendingApproval"], SESSION));
+    // 它还没看的追加指示进 Agent 树的队列，能拿掉
+    let mut queued = agent("a1", "小助手", "call_d", 0, "delegate", "running", Value::Null);
+    queued.as_object_mut().unwrap().remove("transcript");
+    queued["inbox"] = json!([{ "id": "m1", "text": "顺便看看 c" }]);
+    push(&mut link, SESSION, "t0", "agent", queued);
+    let team =
+        client.event("team", |params| params["runs"].as_array().unwrap().iter().any(|run| !run["queue"].as_array().unwrap().is_empty()));
+    let run = team["params"]["runs"].as_array().unwrap().iter().find(|run| run["name"] == "小助手").unwrap().clone();
+    assert_eq!(run["queue"][0]["text"], "顺便看看 c");
+    let remove = client.send("agent.removeQueued", json!({ "agentID": run["id"], "itemID": run["queue"][0]["id"] }));
+    let request = link.wait_for(10, |message| message["method"] == "agents.dequeue").expect("没让大脑拿掉");
+    assert_eq!((request["params"]["id"].as_str(), request["params"]["item"].as_str()), (Some("a1"), Some("m1")));
+    reply(&mut link, &request, json!({ "removed": true }));
+    assert!(client.reply(remove).get("error").is_none());
 
     // Agent 树里追加指示、停掉：交给大脑
     let card = small["id"].clone();
