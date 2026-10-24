@@ -3652,7 +3652,7 @@ fn server_info() -> Value {
 fn features() -> Vec<&'static str> {
     let mut list = vec!["mkdir", "submitFrom", "activity", "assistant", "config", "memory", "memorySearch"];
     if serve_mode() != "off" {
-        list.extend(["powers", "models", "userVoices", "loops"]);
+        list.extend(["powers", "models", "userVoices", "loops", "hooks", "plugins"]);
     }
     list
 }
@@ -4247,7 +4247,7 @@ fn handle(method: &str, params: &Value) -> Reply {
         "assistant.channels.list" => Ok(json!({ "channels": [] })),
         method if method.starts_with("assistant.") => Err((NOT_ALLOWED, "这台的 EDITH 没有助手：助手开在客户端那台上".into())),
         method if method.starts_with("term.") => terminal_request(method, params),
-        method if method.starts_with("powers.") || method.starts_with("models.") || method.starts_with("loops.") => {
+        method if ["powers.", "models.", "loops.", "hooks.", "plugins."].iter().any(|prefix| method.starts_with(prefix)) => {
             hub_forward(method, params)
         }
         method if method.starts_with("browser.") => browser_request(method, params),
@@ -4334,6 +4334,19 @@ static HTTP: LazyLock<ureq::Agent> = LazyLock::new(|| {
 
 fn http_agent() -> &'static ureq::Agent {
     &HTTP
+}
+
+/// 文件夹里的子文件夹名（按名字排）
+fn sorted_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
 }
 
 fn serve_dir() -> PathBuf {
@@ -4449,7 +4462,7 @@ fn serve_initialize() -> Value {
         "actions": actions,
         "receives": ["turn.started", "done"],
         "sessions": "all",
-        "hooks": ["PreToolUse"],
+        "hooks": hooks::EVENTS,
         // 本地模型（power://llm）的真地址由这里给（能力协议 §6.6）
         "models": ["power://"],
         "resident": true,
@@ -4541,7 +4554,20 @@ fn serve_brain_message(brain: &Arc<Brain>, message: Value, ready: &mut Option<Se
             });
         }
         (Some("hook"), Some(id)) => {
-            brain.write(&json!({ "jsonrpc": "2.0", "id": id, "result": serve_hook(&message["params"]) }));
+            // 用户配的钩子可能跑几分钟：另起线程（这个线程还要读别的请求、回话）
+            let brain = brain.clone();
+            std::thread::spawn(move || {
+                let params = &message["params"];
+                let event = params["hook_event_name"].as_str().unwrap_or("");
+                let mut reply = hooks::run(params).reply(event);
+                // 自己的动作怎么批准（钩子拦下了就不用说了）
+                if reply.get("permissionDecision").is_none_or(|decision| decision != "deny")
+                    && let Some(need) = serve_hook(params).get("need")
+                {
+                    reply["need"] = need.clone();
+                }
+                brain.write(&json!({ "jsonrpc": "2.0", "id": id, "result": reply }));
+            });
         }
         (Some("model.endpoint"), Some(id)) => {
             let brain = brain.clone();
@@ -4694,6 +4720,8 @@ fn serve_request(client: &str, method: &str, params: &Value) -> Reply {
         method if method.starts_with("models.") => models::request(client, method, params),
         method if method.starts_with("loops.") => loops::request(method, params),
         method if method == "scripts.state" || method.starts_with("tools.") => scripts::request(method, params),
+        method if method.starts_with("hooks.") => hooks::request(method, params),
+        method if method.starts_with("plugins.") => plugins::request(method, params),
         other => Err((-32601, format!("常驻的那份没有 {other}"))),
     }
 }
@@ -4774,7 +4802,16 @@ fn serve_client(stream: TcpStream, token: &str) {
         };
         // 慢的（连大脑、起浏览器开标签）另起线程；别的按收到的顺序（打的字、鼠标键盘不能乱）
         let slow = ["attach", "browser.open", "powers.importVoice", "powers.deleteVoice", "models.delete", "powers.uninstall"];
-        let tests = ["tools.saveScript", "tools.testScript", "tools.rollback", "tools.createScript"];
+        let tests = [
+            "tools.saveScript",
+            "tools.testScript",
+            "tools.rollback",
+            "tools.createScript",
+            "plugins.inspectGithub",
+            "plugins.inspectData",
+            "plugins.update",
+            "plugins.install",
+        ];
         if slow.contains(&method.as_str()) || tests.contains(&method.as_str()) {
             let (client, name) = (client.clone(), name.clone());
             std::thread::spawn(move || answer(&client, serve_request(&name, &method, &params)));
@@ -4816,6 +4853,7 @@ fn serve() -> Result<(), String> {
     powers::start();
     models::start();
     loops::start();
+    plugins::start();
     {
         let token = token.clone();
         std::thread::spawn(move || {
@@ -5077,7 +5115,16 @@ fn hub_forward(method: &str, params: &Value) -> Reply {
         other => (other, None),
     };
     // 慢的：等装好的音色、删模型（friday-llm 先停掉）
-    let wait = if matches!(method, "powers.importVoice" | "models.delete" | "powers.deleteVoice") { 660 } else { 30 };
+    let slow = [
+        "powers.importVoice",
+        "models.delete",
+        "powers.deleteVoice",
+        "plugins.inspectGithub",
+        "plugins.inspectData",
+        "plugins.update",
+        "plugins.install",
+    ];
+    let wait = if slow.contains(&method) { 660 } else { 30 };
     let reply = hub.request(target, params.clone(), Duration::from_secs(wait)).map_err(|error| hub_error(&error))?;
     // 调过 loops.* 的客户端之后收 loops 事件
     if method.starts_with("loops.") {
@@ -9395,12 +9442,33 @@ mod scripts {
         }
     }
 
+    /// 自己建的 + 启用的插件带来的（插件的只读；和自己的重名的不载入）
     fn all() -> Vec<Value> {
-        script_tools::load_all(&root())
+        let mut tools = script_tools::load_all(&root());
+        for (plugin, directory) in crate::plugins::tools_dirs() {
+            for mut tool in script_tools::load_all(&directory) {
+                if tools.iter().any(|other| other["manifest"]["name"] == tool["manifest"]["name"]) {
+                    continue;
+                }
+                tool["plugin"] = json!(plugin);
+                tools.push(tool);
+            }
+        }
+        tools
+    }
+
+    /// 自己建的（能改、能删）
+    fn own(name: &str) -> Option<Value> {
+        script_tools::is_valid_name(name).then(|| script_tools::load(&root().join(name))).flatten()
     }
 
     fn load(name: &str) -> Option<Value> {
-        script_tools::is_valid_name(name).then(|| script_tools::load(&root().join(name))).flatten()
+        own(name).or_else(|| all().into_iter().find(|tool| tool["manifest"]["name"] == json!(name)))
+    }
+
+    /// 插件带来的：不能在这里改
+    fn plugin_of(name: &str) -> Option<String> {
+        own(name).is_none().then(|| load(name).and_then(|tool| tool["plugin"].as_str().map(str::to_string))).flatten()
     }
 
     fn usable(tool: &Value) -> bool {
@@ -9875,7 +9943,10 @@ mod scripts {
             }
             "update_tool" => {
                 let Some(name) = text("name") else { return failed("缺少参数 name".into()) };
-                let Some(existing) = load(&name) else {
+                if let Some(plugin) = plugin_of(&name) {
+                    return failed(format!("工具 {name} 是插件「{plugin}」带来的，不能改：要改就改插件，或者换个名字新建"));
+                }
+                let Some(existing) = own(&name) else {
                     return failed(format!("没有名为 {name} 的自定义工具，请用 create_tool 创建"));
                 };
                 let mut manifest = existing["manifest"].as_object().cloned().unwrap_or_default();
@@ -9942,6 +10013,9 @@ mod scripts {
 
     /// 移到工具目录的 .trash 里（误删还能找回来）
     fn remove(name: &str) -> Result<(), String> {
+        if let Some(plugin) = plugin_of(name) {
+            return Err(format!("工具 {name} 是插件「{plugin}」带来的，不能单独删：不想要就在 设置 › 插件 里停用或卸载这个插件"));
+        }
         let directory = root().join(name);
         if !script_tools::is_valid_name(name) || !directory.is_dir() {
             return Err(format!("没有名为 {name} 的自定义工具"));
@@ -9993,7 +10067,7 @@ mod scripts {
         value["directory"] = json!(directory);
         value["entry"] = json!(format!("{directory}/{}", script_tools::file_name(&language)));
         value["workDirectory"] = json!(format!("{directory}/work"));
-        value["plugin"] = json!("");
+        value["plugin"] = json!(tool["plugin"].as_str().unwrap_or(""));
         value
     }
 
@@ -10052,7 +10126,10 @@ mod scripts {
             "tools.saveScript" => {
                 let given = params["manifest"].as_object().cloned().unwrap_or_default();
                 let wanted = given.get("name").and_then(Value::as_str).unwrap_or("").to_string();
-                let base = load(&wanted);
+                if let Some(plugin) = plugin_of(&wanted) {
+                    return Err((crate::NOT_ALLOWED, format!("工具 {wanted} 是插件「{plugin}」带来的，不能在这里改")));
+                }
+                let base = own(&wanted);
                 let manifest = manifest_from(&given, base.as_ref()).map_err(|error| (-32602, error))?;
                 let code = params["code"]
                     .as_str()
@@ -10080,6 +10157,9 @@ mod scripts {
             }
             "tools.rollback" => {
                 let name = name()?;
+                if let Some(plugin) = plugin_of(&name) {
+                    return Err((crate::NOT_ALLOWED, format!("工具 {name} 是插件「{plugin}」带来的，不能在这里改")));
+                }
                 let wanted = params["version"].as_i64().unwrap_or(0);
                 let version = script_tools::versions(&root(), &name)
                     .into_iter()
@@ -10126,12 +10206,1311 @@ mod scripts {
             "tools.setEnabled" => {
                 let name = name()?;
                 let short = name.strip_prefix("friday__").unwrap_or(&name).to_string();
-                let Some(tool) = load(&short) else { return Ok(json!({ "handled": false })) };
+                if let Some(plugin) = plugin_of(&short) {
+                    return Err((crate::NOT_ALLOWED, format!("工具 {short} 是插件「{plugin}」带来的：在 设置 › 插件 里停用这个插件")));
+                }
+                let Some(tool) = own(&short) else { return Ok(json!({ "handled": false })) };
                 let mut manifest = tool["manifest"].as_object().cloned().unwrap_or_default();
                 manifest.insert("enabled".into(), json!(params["enabled"].as_bool().unwrap_or(true)));
                 script_tools::update_manifest(&root(), &manifest).map_err(|error| (-32603, error))?;
                 changed();
                 Ok(json!({ "handled": true }))
+            }
+            other => Err((-32601, format!("没有这个方法：{other}"))),
+        }
+    }
+}
+
+// MARK: - 钩子（用户配的命令）
+
+mod hooks {
+    //! 钩子（照 Friday 的 Hooks，Friday 仓库的 qt/docs/HOOKS.md；格式同 Claude Code）：这台全局的 `~/.edith/friday/hooks.json`、
+    //! 项目里的 `.friday/hooks.json`（仓库带来的命令：信任了、内容没变才跑）、启用的插件带的。大脑在四个时机问常驻的那份（能力协议 §6.7
+    //! 的 hook），这里跑匹配的命令：标准输入是 Claude Code 那个 JSON，退出码 2 拦下 / 接着做，JSON 输出按 Claude Code 的键认。
+
+    use std::collections::HashMap;
+    use std::io::{Read, Write};
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+    use std::sync::{LazyLock, Mutex};
+    use std::time::{Duration, Instant};
+
+    use regex::Regex;
+    use serde_json::{Map, Value, json};
+    use sha2::Digest;
+
+    const MAX_RECORDS: usize = 20;
+    const MAX_OUTPUT: usize = 2000;
+    const MAX_FEEDBACK: usize = 4000;
+    const DEFAULT_TIMEOUT: u64 = 60;
+    const MAX_TIMEOUT: u64 = 600;
+    pub const EVENTS: [&str; 4] = ["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"];
+
+    fn event_title(event: &str) -> &'static str {
+        match event {
+            "PreToolUse" => "调用工具前",
+            "PostToolUse" => "调用工具后",
+            "Stop" => "一轮结束",
+            _ => "用户发消息",
+        }
+    }
+
+    #[derive(Clone)]
+    struct Group {
+        event: String,
+        matcher: String,
+        commands: Vec<(String, u64)>,
+        source: String,
+        /// 插件带来的：插件的文件夹（${CLAUDE_PLUGIN_ROOT}）
+        plugin_root: Option<PathBuf>,
+    }
+
+    #[derive(Clone, Default)]
+    struct Config {
+        exists: bool,
+        groups: Vec<Group>,
+        problems: Vec<String>,
+        hash: String,
+    }
+
+    fn cut(text: &str, limit: usize) -> String {
+        let count = text.chars().count();
+        if count <= limit {
+            text.to_string()
+        } else {
+            format!("{}…（后面还有 {} 字）", text.chars().take(limit).collect::<String>(), count - limit)
+        }
+    }
+
+    /// 解析一份 hooks.json（和 Claude Code 的 settings.json 一样放在 hooks 下；直接写时机名的也认）
+    fn parse(data: &[u8], source: &str) -> Config {
+        let mut config = Config {
+            exists: true,
+            hash: sha2::Sha256::digest(data).iter().map(|byte| format!("{byte:02x}")).collect(),
+            ..Default::default()
+        };
+        if String::from_utf8_lossy(data).trim().is_empty() {
+            return config;
+        }
+        let document: Value = match serde_json::from_slice(data) {
+            Ok(Value::Object(object)) => Value::Object(object),
+            Ok(_) => {
+                config.problems.push("不是 JSON 对象：最外层要是 {…}".into());
+                return config;
+            }
+            Err(error) => {
+                config.problems.push(format!("不是 JSON 对象：{error}"));
+                return config;
+            }
+        };
+        let events = if document.get("hooks").is_some() { document["hooks"].clone() } else { document };
+        for (event, groups) in events.as_object().into_iter().flatten() {
+            if !EVENTS.contains(&event.as_str()) {
+                config.problems.push(format!("不认识的时机「{event}」（认 UserPromptSubmit、PreToolUse、PostToolUse、Stop），跳过"));
+                continue;
+            }
+            let Some(groups) = groups.as_array() else {
+                config.problems.push(format!("{event} 要是一个数组"));
+                continue;
+            };
+            for item in groups {
+                let matcher = item["matcher"].as_str().unwrap_or("").trim().to_string();
+                let mut commands = Vec::new();
+                for hook in item["hooks"].as_array().into_iter().flatten() {
+                    let kind = hook["type"].as_str().unwrap_or("command");
+                    let command = hook["command"].as_str().unwrap_or("").trim().to_string();
+                    if kind != "command" {
+                        config.problems.push(format!("{event} 里有一个 type 是「{kind}」的钩子：只认 command，跳过"));
+                        continue;
+                    }
+                    if command.is_empty() {
+                        config.problems.push(format!("{event} 里有一个钩子没写 command，跳过"));
+                        continue;
+                    }
+                    let timeout = hook["timeout"].as_f64().map(|seconds| (seconds as u64).clamp(1, MAX_TIMEOUT)).unwrap_or(DEFAULT_TIMEOUT);
+                    commands.push((command, timeout));
+                }
+                if !matcher.is_empty() && matcher != "*" && Regex::new(&format!("^(?:{matcher})$")).is_err() {
+                    config.problems.push(format!("{event} 的 matcher「{matcher}」不是合法的正则"));
+                }
+                if !commands.is_empty() {
+                    config.groups.push(Group { event: event.clone(), matcher, commands, source: source.to_string(), plugin_root: None });
+                }
+            }
+        }
+        config
+    }
+
+    /// 按修改时间 + 大小缓存
+    /// 文件 → (修改时间, 大小, 解析好的)
+    type Cached = (std::time::SystemTime, u64, Config);
+    static CACHE: LazyLock<Mutex<HashMap<PathBuf, Cached>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    fn load(path: &Path, source: &str) -> Config {
+        let Some(meta) = std::fs::metadata(path).ok().filter(|meta| meta.is_file()) else {
+            CACHE.lock().unwrap().remove(path);
+            return Config::default();
+        };
+        let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+        if let Some((time, size, config)) = CACHE.lock().unwrap().get(path)
+            && *time == modified
+            && *size == meta.len()
+        {
+            return config.clone();
+        }
+        let config = match std::fs::read(path) {
+            Ok(data) => parse(&data, source),
+            Err(error) => Config { exists: true, problems: vec![format!("读不了 {}：{error}", path.display())], ..Default::default() },
+        };
+        CACHE.lock().unwrap().insert(path.to_path_buf(), (modified, meta.len(), config.clone()));
+        config
+    }
+
+    pub fn global_path() -> PathBuf {
+        crate::serve_dir().join("hooks.json")
+    }
+
+    fn project_path(directory: &str) -> Option<PathBuf> {
+        (!directory.is_empty()).then(|| PathBuf::from(directory).join(".friday").join("hooks.json"))
+    }
+
+    fn settings_path() -> PathBuf {
+        crate::serve_dir().join("settings.json")
+    }
+
+    fn trust_key(path: &Path) -> String {
+        let text = crate::canonical(path.parent().unwrap_or(path)).join("hooks.json").to_string_lossy().into_owned();
+        if cfg!(windows) { text.to_lowercase() } else { text }
+    }
+
+    /// 项目钩子：none（没有）/ untrusted / trusted（信任时记下的内容哈希和现在的一样）
+    fn project_trust(directory: &str) -> &'static str {
+        let Some(path) = project_path(directory) else { return "none" };
+        let config = load(&path, "project");
+        if !config.exists {
+            return "none";
+        }
+        let trusted = crate::read_json_file(&settings_path())["trustedProjectHooks"][trust_key(&path)].as_str().map(str::to_string);
+        if trusted.is_some_and(|hash| !config.hash.is_empty() && hash == config.hash) { "trusted" } else { "untrusted" }
+    }
+
+    fn set_trust(directory: &str, trusted: bool) {
+        let Some(path) = project_path(directory) else { return };
+        let config = load(&path, "project");
+        let settings_file = settings_path();
+        let mut settings = crate::read_json_file(&settings_file);
+        if !settings.is_object() {
+            settings = json!({});
+        }
+        if !settings["trustedProjectHooks"].is_object() {
+            settings["trustedProjectHooks"] = json!({});
+        }
+        let table = settings["trustedProjectHooks"].as_object_mut().unwrap();
+        if trusted && config.exists && !config.hash.is_empty() {
+            table.insert(trust_key(&path), json!(config.hash));
+        } else {
+            table.remove(&trust_key(&path));
+        }
+        let _ = crate::write_json_file(&settings_file, &settings);
+    }
+
+    /// 启用的插件带来的（装的时候确认过，不用再信任）
+    fn plugin_groups() -> Vec<Group> {
+        crate::plugins::enabled()
+            .into_iter()
+            .filter_map(|(name, directory)| crate::plugins::hooks_file(&directory).map(|file| (name, directory, file)))
+            .flat_map(|(name, directory, file)| {
+                load(&file, &format!("plugin:{name}")).groups.into_iter().map(move |mut group| {
+                    group.plugin_root = Some(directory.clone());
+                    group
+                })
+            })
+            .collect()
+    }
+
+    /// 工具名对得上 matcher（正则整段匹配；也认 Claude Code 的工具名：Bash、Write、Edit…）
+    fn matches(matcher: &str, tool: &str) -> bool {
+        let pattern = matcher.trim();
+        if pattern.is_empty() || pattern == "*" {
+            return true;
+        }
+        if Regex::new(&format!("^(?:{pattern})$")).is_ok_and(|expression| expression.is_match(tool)) {
+            return true;
+        }
+        pattern
+            .split('|')
+            .map(str::trim)
+            .filter(|name| !name.is_empty() && name.chars().all(|c| c.is_ascii_alphabetic() || c == '_'))
+            .any(|name| friday_core::tool_aliases::canonical_name(name) == tool)
+    }
+
+    fn groups_for(event: &str, directory: &str, tool: &str) -> Vec<Group> {
+        let mut all = load(&global_path(), "global").groups;
+        if project_trust(directory) == "trusted"
+            && let Some(path) = project_path(directory)
+        {
+            all.extend(load(&path, "project").groups);
+        }
+        all.extend(plugin_groups());
+        all.into_iter().filter(|group| group.event == event && (!event.ends_with("ToolUse") || matches(&group.matcher, tool))).collect()
+    }
+
+    #[derive(Default, PartialEq, PartialOrd, Clone, Copy)]
+    enum Decision {
+        #[default]
+        None,
+        Allow,
+        Ask,
+        Block,
+    }
+
+    #[derive(Default)]
+    pub struct Outcome {
+        decision: Decision,
+        reason: String,
+        updated_input: Option<Map<String, Value>>,
+        context: String,
+    }
+
+    impl Outcome {
+        fn decide(&mut self, decision: Decision, reason: &str) {
+            if decision < self.decision {
+                return;
+            }
+            if decision > self.decision {
+                self.reason.clear();
+            }
+            self.decision = decision;
+            if !reason.is_empty() {
+                self.reason = if self.reason.is_empty() { reason.to_string() } else { format!("{}\n{reason}", self.reason) };
+            }
+        }
+
+        fn add_context(&mut self, text: &str) {
+            let text = text.trim();
+            if !text.is_empty() {
+                self.context = if self.context.is_empty() { text.to_string() } else { format!("{}\n{text}", self.context) };
+            }
+        }
+
+        /// 交回大脑的（能力协议 §6.7 的回话）
+        pub fn reply(&self, event: &str) -> Value {
+            let mut reply = json!({});
+            match (event, self.decision) {
+                ("PreToolUse", Decision::Block) => {
+                    reply["permissionDecision"] = json!("deny");
+                    reply["permissionDecisionReason"] = json!(self.reason);
+                }
+                ("PreToolUse", Decision::Ask) => {
+                    reply["permissionDecision"] = json!("ask");
+                    reply["permissionDecisionReason"] = json!(self.reason);
+                }
+                ("PreToolUse", Decision::Allow) => reply["permissionDecision"] = json!("allow"),
+                (_, Decision::Block) => {
+                    reply["decision"] = json!("block");
+                    reply["reason"] = json!(self.reason);
+                }
+                _ => {}
+            }
+            if let Some(input) = &self.updated_input {
+                reply["updatedInput"] = Value::Object(input.clone());
+            }
+            if !self.context.is_empty() {
+                reply["additionalContext"] = json!(self.context);
+            }
+            reply
+        }
+    }
+
+    struct Ran {
+        started: bool,
+        error: String,
+        exit_code: i64,
+        timed_out: bool,
+        stdout: String,
+        stderr: String,
+    }
+
+    /// 按 Claude Code 的规矩认一个钩子的结果；回运行记录里的「结果」
+    fn interpret(event: &str, ran: &Ran, command: &str, outcome: &mut Outcome) -> String {
+        let (out, err) = (ran.stdout.trim(), ran.stderr.trim());
+        if !ran.started {
+            crate::serve_log("hooks", &format!("钩子「{command}」启动不了：{}", ran.error));
+            return "出错".into();
+        }
+        if ran.timed_out {
+            return "超时".into();
+        }
+        if ran.exit_code != 0 && ran.exit_code != 2 {
+            return "出错".into();
+        }
+        if ran.exit_code == 2 {
+            let reason = cut(if err.is_empty() { "（钩子没写原因）" } else { err }, MAX_FEEDBACK);
+            if event == "PostToolUse" {
+                outcome.add_context(&reason);
+                return "补了说明".into();
+            }
+            outcome.decide(Decision::Block, &reason);
+            return if event == "Stop" { "接着做".into() } else { "拦下".into() };
+        }
+        // 退出码 0：JSON 输出按 JSON 认
+        if out.starts_with('{')
+            && let Ok(Value::Object(json)) = serde_json::from_str::<Value>(out)
+        {
+            let mut label = "通过".to_string();
+            let reason = cut(json.get("reason").and_then(Value::as_str).unwrap_or("").trim(), MAX_FEEDBACK);
+            let specific = json.get("hookSpecificOutput").cloned().unwrap_or_default();
+            match json.get("decision").and_then(Value::as_str) {
+                Some("block") if event == "PostToolUse" => {
+                    outcome.add_context(&reason);
+                    label = "补了说明".into();
+                }
+                Some("block") => {
+                    outcome.decide(Decision::Block, if reason.is_empty() { "（钩子没写原因）" } else { &reason });
+                    label = if event == "Stop" { "接着做".into() } else { "拦下".into() };
+                }
+                Some("approve") if event == "PreToolUse" => {
+                    outcome.decide(Decision::Allow, &reason);
+                    label = "免确认".into();
+                }
+                _ => {}
+            }
+            if event == "PreToolUse" {
+                let why = cut(specific["permissionDecisionReason"].as_str().unwrap_or("").trim(), MAX_FEEDBACK);
+                match specific["permissionDecision"].as_str() {
+                    Some("deny") => {
+                        outcome.decide(Decision::Block, if why.is_empty() { "（钩子没写原因）" } else { &why });
+                        label = "拦下".into();
+                    }
+                    Some("ask") => {
+                        outcome.decide(Decision::Ask, &why);
+                        label = "要确认".into();
+                    }
+                    Some("allow") => {
+                        outcome.decide(Decision::Allow, &why);
+                        label = "免确认".into();
+                    }
+                    _ => {}
+                }
+                if let Some(input) = specific["updatedInput"].as_object() {
+                    outcome.updated_input = Some(input.clone());
+                    label += "、改了参数";
+                }
+            }
+            if let Some(context) = specific["additionalContext"].as_str().map(str::trim).filter(|context| !context.is_empty())
+                && (event == "PostToolUse" || event == "UserPromptSubmit")
+            {
+                outcome.add_context(&cut(context, MAX_FEEDBACK));
+                if label == "通过" {
+                    label = "补了说明".into();
+                }
+            }
+            return label;
+        }
+        // 普通文字：用户发消息时补到消息后面，其余只记日志
+        if event == "UserPromptSubmit" && !out.is_empty() {
+            outcome.add_context(&cut(out, MAX_FEEDBACK));
+            return "补了说明".into();
+        }
+        "通过".into()
+    }
+
+    /// 跑一条命令（这台的 shell：Windows PowerShell，其他 sh）
+    fn execute(command: &str, directory: &Path, input: &[u8], environment: &[(String, String)], timeout: Duration) -> Ran {
+        let mut process = if cfg!(windows) {
+            let mut process = Command::new("powershell");
+            process.args(["-NoProfile", "-NonInteractive", "-Command", &format!("try{{[Console]::InputEncoding=[Text.UTF8Encoding]::new($false)}}catch{{}};[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);{command}")]);
+            process
+        } else {
+            let mut process = Command::new("/bin/sh");
+            process.args(["-c", command]);
+            process
+        };
+        process
+            .current_dir(if directory.is_dir() { directory.to_path_buf() } else { crate::user_home() })
+            .envs(environment.iter().cloned());
+        process.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        #[cfg(unix)]
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            process.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            process.creation_flags(0x0800_0000);
+        }
+        let mut child = match process.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                return Ran {
+                    started: false,
+                    error: error.to_string(),
+                    exit_code: -1,
+                    timed_out: false,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                };
+            }
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let input = input.to_vec();
+            std::thread::spawn(move || {
+                let _ = stdin.write_all(&input);
+            });
+        }
+        let read = |pipe: Option<Box<dyn Read + Send>>| {
+            std::thread::spawn(move || {
+                let mut data = Vec::new();
+                if let Some(pipe) = pipe {
+                    let _ = pipe.take(1 << 20).read_to_end(&mut data);
+                }
+                String::from_utf8_lossy(&data).into_owned()
+            })
+        };
+        let stdout = read(child.stdout.take().map(|pipe| Box::new(pipe) as Box<dyn Read + Send>));
+        let stderr = read(child.stderr.take().map(|pipe| Box::new(pipe) as Box<dyn Read + Send>));
+        let started = Instant::now();
+        let (exit_code, timed_out) = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break (status.code().map(i64::from).unwrap_or(-1), false),
+                Ok(None) if started.elapsed() >= timeout => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break (-1, true);
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(_) => break (-1, false),
+            }
+        };
+        Ran {
+            started: true,
+            error: String::new(),
+            exit_code,
+            timed_out,
+            stdout: stdout.join().unwrap_or_default(),
+            stderr: stderr.join().unwrap_or_default(),
+        }
+    }
+
+    static RECORDS: LazyLock<Mutex<Vec<Value>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+    /// 跑一个时机的钩子（大脑问的：params 是 Claude Code 交给钩子命令的标准输入）
+    pub fn run(params: &Value) -> Outcome {
+        let mut outcome = Outcome::default();
+        let event = params["hook_event_name"].as_str().unwrap_or("");
+        let directory = params["cwd"].as_str().unwrap_or("").to_string();
+        // 常驻那份自己的动作（friday__browser_navigate）按动作名比
+        let raw_tool = params["tool_name"].as_str().unwrap_or("");
+        let tool =
+            raw_tool.split_once("__").filter(|(owner, _)| owner.starts_with("friday")).map_or(raw_tool, |(_, action)| action).to_string();
+        let groups = groups_for(event, &directory, &tool);
+        if groups.is_empty() {
+            return outcome;
+        }
+        let mut input = params.clone();
+        input["tool_name"] = json!(tool);
+        let stdin = serde_json::to_vec(&input).unwrap_or_default();
+        let mut environment = vec![
+            ("FRIDAY_HOOK_EVENT".to_string(), event.to_string()),
+            ("FRIDAY_CWD".to_string(), directory.clone()),
+            ("CLAUDE_PROJECT_DIR".to_string(), directory.clone()),
+        ];
+        if !tool.is_empty() {
+            environment.push(("FRIDAY_TOOL".into(), tool.clone()));
+        }
+        // 写文件的工具：FRIDAY_FILE 是完整路径
+        if let Some(file) =
+            ["path", "file_path", "file"].iter().find_map(|key| params["tool_input"][key].as_str().filter(|value| !value.is_empty()))
+        {
+            let path = PathBuf::from(file);
+            let full = if path.is_absolute() { path } else { PathBuf::from(&directory).join(path) };
+            environment.push(("FRIDAY_FILE".into(), full.to_string_lossy().into_owned()));
+        }
+        for group in groups {
+            for (command, timeout) in &group.commands {
+                let mut environment = environment.clone();
+                let command_text = match &group.plugin_root {
+                    Some(root) => {
+                        let root = root.to_string_lossy().into_owned();
+                        environment.push(("CLAUDE_PLUGIN_ROOT".into(), root.clone()));
+                        environment.push(("FRIDAY_PLUGIN_ROOT".into(), root.clone()));
+                        command.replace("${CLAUDE_PLUGIN_ROOT}", &root).replace("${FRIDAY_PLUGIN_ROOT}", &root)
+                    }
+                    None => command.clone(),
+                };
+                let started = Instant::now();
+                let ran = execute(&command_text, Path::new(&directory), &stdin, &environment, Duration::from_secs(*timeout));
+                let result = interpret(event, &ran, command, &mut outcome);
+                let output =
+                    [ran.stdout.trim(), ran.stderr.trim()].into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join("\n");
+                let record = json!({
+                    "at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true), "event": event, "eventTitle": event_title(event),
+                    "command": command, "source": group.source, "toolName": tool, "exitCode": ran.exit_code, "timedOut": ran.timed_out,
+                    "milliseconds": started.elapsed().as_millis() as u64, "result": result, "output": cut(&output, MAX_OUTPUT),
+                });
+                {
+                    let mut records = RECORDS.lock().unwrap();
+                    records.insert(0, record);
+                    records.truncate(MAX_RECORDS);
+                }
+                // 拦下了：同一时机后面的不跑
+                if outcome.decision == Decision::Block {
+                    return outcome;
+                }
+            }
+        }
+        outcome
+    }
+
+    /// 设置 › 钩子
+    pub fn state(directory: &str) -> Value {
+        let read_text = |path: &Path| std::fs::read_to_string(path).unwrap_or_default();
+        let global = load(&global_path(), "global");
+        let project_file = project_path(directory);
+        let project = project_file.as_ref().map(|path| load(path, "project")).unwrap_or_default();
+        let trust = project_trust(directory);
+        let mut hooks = Vec::new();
+        let mut add = |config: &Config, active: bool| {
+            for group in &config.groups {
+                for (command, timeout) in &group.commands {
+                    hooks.push(
+                        json!({ "event": group.event, "eventTitle": event_title(&group.event), "matcher": group.matcher, "command": command,
+                        "timeout": timeout, "source": group.source, "active": active }),
+                    );
+                }
+            }
+        };
+        add(&global, true);
+        add(&project, trust == "trusted");
+        add(&Config { groups: plugin_groups(), ..Default::default() }, true);
+        json!({
+            "globalPath": global_path().to_string_lossy(),
+            "globalExists": global_path().is_file(),
+            "globalText": read_text(&global_path()),
+            "globalProblems": global.problems,
+            "projectDirectory": directory,
+            "projectPath": project_file.as_ref().map(|path| path.to_string_lossy().into_owned()).unwrap_or_default(),
+            "projectExists": trust != "none",
+            "projectText": if trust != "none" { project_file.as_ref().map(|path| read_text(path)).unwrap_or_default() } else { String::new() },
+            "projectTrust": trust,
+            "projectProblems": project.problems,
+            "hooks": hooks,
+            "recent": RECORDS.lock().unwrap().clone(),
+            "example": example(),
+        })
+    }
+
+    fn example() -> String {
+        let (guard, test) = if cfg!(windows) {
+            (
+                "$i = [Console]::In.ReadToEnd() | ConvertFrom-Json; if ($i.tool_input.command -match 'rm -rf|Remove-Item -Recurse') { [Console]::Error.WriteLine('不许递归删除'); exit 2 }",
+                "npm test --silent; if ($LASTEXITCODE -ne 0) { [Console]::Error.WriteLine('测试没过，修好再交'); exit 2 }",
+            )
+        } else {
+            (
+                "grep -q 'rm -rf' && { echo '不许 rm -rf' >&2; exit 2; } || exit 0",
+                "npm test --silent || { echo 测试没过，修好再交 >&2; exit 2; }",
+            )
+        };
+        serde_json::to_string_pretty(&json!({ "hooks": {
+            "PreToolUse": [{ "matcher": "run_shell", "hooks": [{ "type": "command", "command": guard }] }],
+            "Stop": [{ "hooks": [{ "type": "command", "command": test, "timeout": 300 }] }],
+        } }))
+        .unwrap_or_default()
+    }
+
+    fn save_global(text: &str) -> String {
+        if !text.trim().is_empty() {
+            match serde_json::from_str::<Value>(text) {
+                Ok(Value::Object(_)) => {}
+                Ok(_) => return "最外层要是 {…}".into(),
+                Err(error) => return format!("不是合法的 JSON：{error}"),
+            }
+        }
+        let path = global_path();
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        match std::fs::write(&path, text) {
+            Ok(()) => {
+                CACHE.lock().unwrap().remove(&path);
+                String::new()
+            }
+            Err(error) => format!("写不了 {}：{error}", path.display()),
+        }
+    }
+
+    /// hooks.*（设置 › 钩子看着这台时；项目文件夹不给用默认的工作目录）
+    pub fn request(method: &str, params: &Value) -> crate::Reply {
+        let directory = params["directory"]
+            .as_str()
+            .filter(|directory| !directory.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(crate::default_directory);
+        match method {
+            "hooks.state" => Ok(state(&directory)),
+            "hooks.saveGlobal" => {
+                let error = save_global(params["text"].as_str().unwrap_or(""));
+                Ok(json!({ "error": error, "state": state(&directory) }))
+            }
+            "hooks.trust" => {
+                set_trust(&directory, params["trusted"].as_bool().unwrap_or(false));
+                Ok(state(&directory))
+            }
+            "hooks.example" => Ok(json!({ "text": example() })),
+            other => Err((-32601, format!("没有这个方法：{other}"))),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn parses_and_interprets_like_claude_code() {
+            let config = parse(br#"{"hooks":{"PreToolUse":[{"matcher":"Bash|write_file","hooks":[{"type":"command","command":"x","timeout":9999}]}],"Nope":[],"Stop":[{"hooks":[{"type":"prompt"}]}]}}"#, "global");
+            assert_eq!(config.groups.len(), 1);
+            assert_eq!(config.groups[0].commands[0].1, MAX_TIMEOUT);
+            assert!(
+                config.problems.iter().any(|problem| problem.contains("Nope"))
+                    && config.problems.iter().any(|problem| problem.contains("prompt"))
+            );
+            assert!(
+                matches("Bash|write_file", "run_shell")
+                    && matches("write_file", "write_file")
+                    && !matches("edit_file", "write_file")
+                    && matches("", "x")
+            );
+            let ran = |code: i64, stdout: &str, stderr: &str| Ran {
+                started: true,
+                error: String::new(),
+                exit_code: code,
+                timed_out: false,
+                stdout: stdout.into(),
+                stderr: stderr.into(),
+            };
+            let mut outcome = Outcome::default();
+            assert_eq!(interpret("PreToolUse", &ran(2, "", "不许"), "c", &mut outcome), "拦下");
+            assert_eq!(outcome.reply("PreToolUse")["permissionDecision"], "deny");
+            let mut outcome = Outcome::default();
+            interpret(
+                "PreToolUse",
+                &ran(
+                    0,
+                    r#"{"hookSpecificOutput":{"permissionDecision":"ask","permissionDecisionReason":"看看","updatedInput":{"a":1}}}"#,
+                    "",
+                ),
+                "c",
+                &mut outcome,
+            );
+            let reply = outcome.reply("PreToolUse");
+            assert_eq!((reply["permissionDecision"].as_str(), reply["updatedInput"]["a"].as_i64()), (Some("ask"), Some(1)));
+            let mut outcome = Outcome::default();
+            interpret("UserPromptSubmit", &ran(0, "分支 main", ""), "c", &mut outcome);
+            assert_eq!(outcome.reply("UserPromptSubmit")["additionalContext"], "分支 main");
+            let mut outcome = Outcome::default();
+            interpret("Stop", &ran(2, "", "测试没过"), "c", &mut outcome);
+            assert_eq!(outcome.reply("Stop")["decision"], "block");
+            let mut outcome = Outcome::default();
+            interpret("PostToolUse", &ran(0, "格式化了 a.py", ""), "c", &mut outcome);
+            assert_eq!(outcome.reply("PostToolUse"), json!({}));
+        }
+    }
+}
+
+// MARK: - 插件
+
+mod plugins {
+    //! 插件（照 Friday 的 Plugins，Friday 仓库的 qt/docs/PLUGINS.md）：技能、脚本工具、MCP 服务、钩子、命令打成的包，Friday 的写法
+    //! （plugin.json）和 Claude Code 的（.claude-plugin/plugin.json、hooks/hooks.json、.mcp.json）都认。装到 `~/.edith/friday/plugins/<名字>/`，
+    //! 先「看一眼」列清单、用户点了才装。启用的：钩子、脚本工具这里直接用；技能链进 EDITH 的 `~/.edith/skills/`（`<插件>-<技能>`），
+    //! MCP 服务并进 `~/.edith/mcp.json`（名字「插件名-服务名」，带 fridayPlugin 标记）——停用、卸载时撤掉。
+
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::sync::{LazyLock, Mutex};
+
+    use base64::Engine;
+    use regex::Regex;
+    use serde_json::{Map, Value, json};
+    use sha2::Digest;
+
+    pub fn root() -> PathBuf {
+        crate::serve_dir().join("plugins")
+    }
+
+    fn registry_path() -> PathBuf {
+        root().join("plugins.json")
+    }
+
+    fn staging_root() -> PathBuf {
+        root().join(".staging")
+    }
+
+    fn registry() -> Vec<Value> {
+        let mut list: Vec<Value> = crate::read_json_file(&registry_path())["plugins"].as_array().cloned().unwrap_or_default();
+        list.retain(|plugin| plugin["name"].as_str().is_some_and(|name| !name.is_empty()));
+        list.sort_by_key(|plugin| plugin["name"].as_str().unwrap_or("").to_lowercase());
+        list
+    }
+
+    fn write_registry(list: &[Value]) -> Result<(), String> {
+        let _ = std::fs::create_dir_all(root());
+        crate::write_json_file(&registry_path(), &json!({ "plugins": list })).map_err(|(_, message)| message)
+    }
+
+    fn directory_of(name: &str) -> PathBuf {
+        root().join(name)
+    }
+
+    /// 启用的插件：(名字, 文件夹)
+    pub fn enabled() -> Vec<(String, PathBuf)> {
+        registry()
+            .into_iter()
+            .filter(|plugin| plugin["enabled"].as_bool().unwrap_or(true))
+            .map(|plugin| plugin["name"].as_str().unwrap_or("").to_string())
+            .map(|name| (name.clone(), directory_of(&name)))
+            .filter(|(_, directory)| directory.is_dir())
+            .collect()
+    }
+
+    fn first_existing(directory: &Path, candidates: &[&str]) -> Option<PathBuf> {
+        candidates.iter().map(|candidate| directory.join(candidate)).find(|path| path.exists())
+    }
+
+    pub fn hooks_file(directory: &Path) -> Option<PathBuf> {
+        first_existing(directory, &["hooks.json", "hooks/hooks.json"])
+    }
+
+    fn mcp_file(directory: &Path) -> Option<PathBuf> {
+        first_existing(directory, &["mcp.json", ".mcp.json"])
+    }
+
+    fn sub(directory: &Path, name: &str) -> Option<PathBuf> {
+        Some(directory.join(name)).filter(|path| path.is_dir())
+    }
+
+    /// 启用的插件的脚本工具文件夹：(插件名, tools/)
+    pub fn tools_dirs() -> Vec<(String, PathBuf)> {
+        enabled().into_iter().filter_map(|(name, directory)| sub(&directory, "tools").map(|tools| (name, tools))).collect()
+    }
+
+    /// plugin.json：Friday 的放在根上，Claude Code 的在 .claude-plugin/ 里
+    fn manifest_file(directory: &Path) -> Option<(Value, &'static str)> {
+        for (relative, format) in [("plugin.json", "friday"), (".claude-plugin/plugin.json", "claude")] {
+            if let Ok(data) = std::fs::read(directory.join(relative)) {
+                return Some((serde_json::from_slice(&data).unwrap_or(json!({})), format));
+            }
+        }
+        None
+    }
+
+    fn looks_like_plugin(path: &Path) -> bool {
+        manifest_file(path).is_some()
+            || ["skills", "tools", "commands", "agents"].iter().any(|name| path.join(name).is_dir())
+            || first_existing(path, &["mcp.json", ".mcp.json", "hooks.json", "hooks/hooks.json"]).is_some()
+    }
+
+    /// 插件的根：这里，或者只有一个子文件夹时它
+    fn find_root(directory: &Path) -> Option<PathBuf> {
+        if looks_like_plugin(directory) {
+            return Some(directory.to_path_buf());
+        }
+        let children: Vec<PathBuf> = std::fs::read_dir(directory)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir() && path.file_name().is_some_and(|name| name != "__MACOSX"))
+            .collect();
+        (children.len() == 1 && looks_like_plugin(&children[0])).then(|| children[0].clone())
+    }
+
+    fn files_under(directory: &Path) -> Vec<String> {
+        let mut result = Vec::new();
+        let mut stack = vec![directory.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                let relative =
+                    path.strip_prefix(directory).map(|relative| relative.to_string_lossy().replace('\\', "/")).unwrap_or_default();
+                if relative.starts_with(".git") || relative.contains("/.git/") || relative.starts_with("__MACOSX") {
+                    continue;
+                }
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    result.push(relative);
+                }
+            }
+        }
+        result.sort();
+        result
+    }
+
+    fn hash_directory(directory: &Path) -> String {
+        let mut hasher = sha2::Sha256::new();
+        for relative in files_under(directory) {
+            hasher.update(relative.as_bytes());
+            hasher.update([0u8]);
+            if let Ok(data) = std::fs::read(directory.join(&relative)) {
+                hasher.update(sha2::Sha256::digest(&data));
+            }
+        }
+        hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn name_problem(name: &str) -> Option<String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Some("没有名字（plugin.json 里写 name）".into());
+        }
+        if name.contains(' ') {
+            return Some("插件名不能有空格（MCP 服务、技能名里要用它）".into());
+        }
+        if name.starts_with('.') || name.chars().any(|c| "/\\:*?\"<>|".contains(c)) || name.len() > 64 {
+            return Some("插件名只能用字母、数字、-、_ 这类能当文件夹名的字".into());
+        }
+        None
+    }
+
+    fn markdown_names(directory: Option<PathBuf>) -> Vec<String> {
+        let Some(directory) = directory else { return Vec::new() };
+        files_under(&directory).into_iter().filter_map(|relative| relative.strip_suffix(".md").map(|name| name.replace('/', ":"))).collect()
+    }
+
+    /// 包里有什么（清单）
+    fn read(directory: &Path, hash: bool) -> Value {
+        let mut problems: Vec<String> = Vec::new();
+        let (manifest, format) = manifest_file(directory).unwrap_or_else(|| {
+            problems.push("没有 plugin.json：名字用文件夹名".into());
+            (json!({}), "friday")
+        });
+        let text = |key: &str| manifest[key].as_str().unwrap_or("").trim().to_string();
+        let name = Some(text("name"))
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| directory.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default());
+        let author = manifest["author"]["name"].as_str().map(str::to_string).unwrap_or_else(|| text("author"));
+        let skills: Vec<String> = sub(directory, "skills")
+            .map(|skills| {
+                crate::sorted_names(&skills)
+                    .into_iter()
+                    .filter(|skill| !skill.starts_with('.') && skills.join(skill).join("SKILL.md").is_file())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut tools = Vec::new();
+        if let Some(dir) = sub(directory, "tools") {
+            for folder in crate::sorted_names(&dir).into_iter().filter(|folder| !folder.starts_with('.')) {
+                match friday_core::script_tools::load(&dir.join(&folder)) {
+                    Some(tool) => tools.push(json!({ "name": tool["manifest"]["name"], "permission": tool["manifest"]["permission"] })),
+                    None => problems.push(format!("tools/{folder} 读不出来（要有 tool.json 和入口脚本）")),
+                }
+            }
+        }
+        let mut mcp = Vec::new();
+        if let Some(file) = mcp_file(directory) {
+            match std::fs::read(&file).ok().and_then(|data| serde_json::from_slice::<Value>(&data).ok()) {
+                Some(config) => {
+                    for (server, value) in config["mcpServers"].as_object().into_iter().flatten() {
+                        let summary = value["url"].as_str().map(str::to_string).unwrap_or_else(|| {
+                            let args: Vec<&str> = value["args"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+                            format!("{} {}", value["command"].as_str().unwrap_or(""), args.join(" ")).trim().to_string()
+                        });
+                        mcp.push(json!({ "name": format!("{name}-{server}"), "summary": summary.replace("${CLAUDE_PLUGIN_ROOT}", "〈插件文件夹〉").replace("${FRIDAY_PLUGIN_ROOT}", "〈插件文件夹〉") }));
+                    }
+                }
+                None => problems.push("MCP 配置读不懂".into()),
+            }
+        }
+        let mut hooks = Vec::new();
+        if let Some(file) = hooks_file(directory)
+            && let Ok(Value::Object(config)) =
+                std::fs::read(&file).map(|data| serde_json::from_slice::<Value>(&data).unwrap_or(json!(null)))
+        {
+            let events = config.get("hooks").cloned().unwrap_or(Value::Object(config.clone()));
+            for (event, groups) in events.as_object().into_iter().flatten() {
+                for group in groups.as_array().into_iter().flatten() {
+                    for hook in group["hooks"].as_array().into_iter().flatten() {
+                        if let Some(command) = hook["command"].as_str() {
+                            hooks.push(json!({ "event": event, "command": command.replace("${CLAUDE_PLUGIN_ROOT}", "〈插件文件夹〉").replace("${FRIDAY_PLUGIN_ROOT}", "〈插件文件夹〉") }));
+                        }
+                    }
+                }
+            }
+        }
+        let skipped: Vec<String> =
+            ["output-styles", "providers"].iter().filter(|name| directory.join(name).is_dir()).map(|name| format!("{name}/")).collect();
+        json!({
+            "name": name, "title": Some(text("title")).filter(|title| !title.is_empty()).unwrap_or_else(|| name.clone()), "version": text("version"),
+            "description": text("description"), "author": author, "format": format, "skills": skills, "tools": tools, "mcp": mcp, "hooks": hooks,
+            "commands": markdown_names(sub(directory, "commands")), "agents": markdown_names(sub(directory, "agents")), "skipped": skipped,
+            "problems": problems, "contentHash": if hash { hash_directory(directory) } else { String::new() },
+        })
+    }
+
+    struct Staged {
+        directory: PathBuf,
+        contents: Value,
+        source: Value,
+    }
+
+    static STAGED: LazyLock<Mutex<HashMap<String, Staged>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    fn source_label(source: &Value) -> String {
+        if source["type"] == "github" {
+            source["url"].as_str().unwrap_or("").to_string()
+        } else {
+            source["path"].as_str().unwrap_or("").to_string()
+        }
+    }
+
+    fn staged_json(token: &str, staged: &Staged) -> Value {
+        let name = staged.contents["name"].as_str().unwrap_or("");
+        let existing = registry().into_iter().find(|plugin| plugin["name"].as_str().is_some_and(|other| other.eq_ignore_ascii_case(name)));
+        let mut contents = staged.contents.clone();
+        if let Some(object) = contents.as_object_mut() {
+            object.remove("contentHash");
+        }
+        json!({
+            "token": token, "contents": contents, "replaces": existing.is_some(),
+            "unchanged": existing.is_some_and(|existing| existing["contentHash"] == staged.contents["contentHash"]),
+            "source": staged.source, "sourceLabel": source_label(&staged.source),
+        })
+    }
+
+    /// 解开 zip（macOS、Windows 的 tar 认 zip；Linux 用 unzip，没有就用 python 的 zipfile）
+    fn unzip(archive: &Path, into: &Path) -> Result<(), String> {
+        std::fs::create_dir_all(into).map_err(|error| error.to_string())?;
+        let tar = if cfg!(windows) {
+            PathBuf::from(std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into())).join("System32").join("tar.exe")
+        } else {
+            PathBuf::from("tar")
+        };
+        let attempts: Vec<Command> = if cfg!(target_os = "linux") {
+            let mut unzip = Command::new("unzip");
+            unzip.arg("-q").arg("-o").arg(archive).arg("-d").arg(into);
+            let mut python = Command::new("python3");
+            python.arg("-m").arg("zipfile").arg("-e").arg(archive).arg(into);
+            vec![unzip, python]
+        } else {
+            let mut command = Command::new(tar);
+            command.arg("-xf").arg(archive).arg("-C").arg(into);
+            vec![command]
+        };
+        let mut last = String::new();
+        for mut command in attempts {
+            match command.output() {
+                Ok(output) if output.status.success() => return Ok(()),
+                Ok(output) => last = String::from_utf8_lossy(&output.stderr).trim().to_string(),
+                Err(error) => last = error.to_string(),
+            }
+        }
+        Err(format!("解不开 zip：{last}"))
+    }
+
+    fn copy_tree(source: &Path, destination: &Path) -> Result<(), String> {
+        std::fs::create_dir_all(destination).map_err(|error| error.to_string())?;
+        for entry in std::fs::read_dir(source).map_err(|error| error.to_string())?.flatten() {
+            let name = entry.file_name();
+            if name == ".git" || name == "__MACOSX" || entry.file_type().is_ok_and(|kind| kind.is_symlink()) {
+                continue;
+            }
+            let target = destination.join(&name);
+            if entry.path().is_dir() {
+                copy_tree(&entry.path(), &target)?;
+            } else {
+                std::fs::copy(entry.path(), &target).map_err(|_| format!("拷不了 {}", entry.path().display()))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn stage(staging: &Path, base: &Path, token: &str, source: Value) -> Result<Value, String> {
+        let Some(plugin_root) = find_root(base) else {
+            let _ = std::fs::remove_dir_all(staging);
+            return Err("这不是插件：没找到 plugin.json（Friday 的放在最外层，Claude Code 的在 .claude-plugin/ 里），也没有 skills/、tools/、mcp.json、hooks.json".into());
+        };
+        let contents = read(&plugin_root, true);
+        if let Some(problem) = name_problem(contents["name"].as_str().unwrap_or("")) {
+            let _ = std::fs::remove_dir_all(staging);
+            return Err(format!("插件名不能用：{problem}"));
+        }
+        let staged = Staged { directory: plugin_root, contents, source };
+        let value = staged_json(token, &staged);
+        STAGED.lock().unwrap().insert(token.to_string(), staged);
+        Ok(value)
+    }
+
+    fn new_staging() -> (String, PathBuf) {
+        let token = uuid::Uuid::new_v4().to_string();
+        let staging = staging_root().join(&token);
+        let _ = std::fs::create_dir_all(&staging);
+        (token, staging)
+    }
+
+    /// 看一眼 GitHub 上的（https://github.com/主人/仓库[/tree/分支[/子文件夹]]，下 codeload 的 zip，不用装 git）
+    fn inspect_github(url: &str) -> Result<Value, String> {
+        static GITHUB: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"^(?:https?://)?(?:www\.)?github\.com/([^/\s]+)/([^/\s#?]+?)(?:\.git)?(?:/(?:tree|blob)/([^/\s]+)(?:/(.*?))?)?/?(?:[#?].*)?$").unwrap()
+        });
+        let captures = GITHUB
+            .captures(url.trim())
+            .ok_or_else(|| format!("认不出这个 GitHub 地址：{url}（要像 https://github.com/主人/仓库，或者 …/tree/分支/子文件夹）"))?;
+        let (owner, repo) = (&captures[1], &captures[2]);
+        let reference = captures.get(3).map_or("HEAD", |reference| reference.as_str());
+        let subdirectory = captures.get(4).map(|sub| sub.as_str().to_string()).unwrap_or_default();
+        let (token, staging) = new_staging();
+        let archive = staging.with_extension("zip");
+        let fetched = crate::powers::fetch(
+            &format!("https://codeload.github.com/{owner}/{repo}/zip/{reference}"),
+            &archive,
+            &std::sync::atomic::AtomicBool::new(false),
+            &mut |_| {},
+        )
+        .and_then(|_| unzip(&archive, &staging));
+        let _ = std::fs::remove_file(&archive);
+        if let Err(error) = fetched {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+        // zip 顶层是「仓库-分支/」；指了子文件夹的取它
+        let top: Vec<PathBuf> =
+            std::fs::read_dir(&staging).into_iter().flatten().flatten().map(|entry| entry.path()).filter(|path| path.is_dir()).collect();
+        let mut base = if top.len() == 1 { top[0].clone() } else { staging.clone() };
+        if !subdirectory.is_empty() {
+            let wanted = base.join(&subdirectory);
+            if subdirectory.split('/').any(|part| part == "..") || !wanted.is_dir() {
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(format!("仓库里没有子文件夹 {subdirectory}"));
+            }
+            base = wanted;
+        }
+        stage(&staging, &base, &token, json!({ "type": "github", "url": url.trim() }))
+    }
+
+    /// 看一眼客户端传来的 zip（.fridayplugin / .zip，文件夹由客户端打成 zip）
+    fn inspect_data(name: &str, data: &str) -> Result<Value, String> {
+        let bytes = base64::engine::general_purpose::STANDARD.decode(data.trim()).map_err(|_| "data 不是 base64".to_string())?;
+        let (token, staging) = new_staging();
+        let archive = staging.with_extension("zip");
+        std::fs::write(&archive, bytes).map_err(|error| error.to_string())?;
+        let unpacked = unzip(&archive, &staging);
+        let _ = std::fs::remove_file(&archive);
+        if let Err(error) = unpacked {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+        stage(&staging, &staging.clone(), &token, json!({ "type": "file", "path": name }))
+    }
+
+    fn trash(path: &Path) -> Result<(), String> {
+        let bin = root().join(".trash");
+        std::fs::create_dir_all(&bin).map_err(|error| error.to_string())?;
+        let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+        std::fs::rename(path, bin.join(format!("{name}-{}", chrono::Local::now().format("%Y%m%d-%H%M%S"))))
+            .map_err(|error| format!("{} 移不走：{error}", path.display()))
+    }
+
+    fn install(token: &str) -> Result<(), String> {
+        let staged = STAGED.lock().unwrap().remove(token).ok_or("这次的安装已经过期了，重新选一次")?;
+        let name = staged.contents["name"].as_str().unwrap_or("").to_string();
+        let target = directory_of(&name);
+        if target.exists() {
+            trash(&target)?;
+        }
+        copy_tree(&staged.directory, &target)?;
+        let _ = std::fs::remove_dir_all(staging_root().join(token));
+        let mut list = registry();
+        list.retain(|plugin| !plugin["name"].as_str().is_some_and(|other| other.eq_ignore_ascii_case(&name)));
+        list.push(json!({
+            "name": name, "version": staged.contents["version"], "enabled": true, "source": staged.source,
+            "installedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true), "contentHash": staged.contents["contentHash"],
+        }));
+        write_registry(&list)?;
+        changed();
+        Ok(())
+    }
+
+    fn find(name: &str) -> Option<Value> {
+        registry().into_iter().find(|plugin| plugin["name"].as_str().is_some_and(|other| other.eq_ignore_ascii_case(name)))
+    }
+
+    /// 设置 › 插件的列表
+    fn list() -> Value {
+        let plugins: Vec<Value> = registry()
+            .into_iter()
+            .map(|mut plugin| {
+                let name = plugin["name"].as_str().unwrap_or("").to_string();
+                let directory = directory_of(&name);
+                if let Some(object) = plugin.as_object_mut() {
+                    object.remove("contentHash");
+                    object.remove("projected");
+                }
+                plugin["sourceLabel"] = json!(source_label(&plugin["source"]));
+                plugin["directory"] = json!(directory.to_string_lossy());
+                plugin["missing"] = json!(!directory.is_dir());
+                let mut contents = read(&directory, false);
+                if let Some(object) = contents.as_object_mut() {
+                    object.remove("contentHash");
+                }
+                plugin["contents"] = contents;
+                plugin
+            })
+            .collect();
+        json!({ "plugins": plugins })
+    }
+
+    // MARK: 投到 EDITH 那边（技能、MCP）
+
+    fn skills_dir() -> PathBuf {
+        crate::edith_home().join("skills")
+    }
+
+    fn mcp_path() -> PathBuf {
+        crate::edith_home().join("mcp.json")
+    }
+
+    /// 启用的插件的技能、MCP 服务放到 EDITH 读的地方；停用、卸载了的撤掉
+    fn project() {
+        let wanted = enabled();
+        // 技能：~/.edith/skills/<插件>-<技能>（Unix 是符号链接，Windows 拷一份），记在 .friday-plugins.json 里好撤
+        let record_path = skills_dir().join(".friday-plugins.json");
+        let previous: Vec<String> = crate::read_json_file(&record_path)["links"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+        let mut links = Vec::new();
+        for (name, directory) in &wanted {
+            let Some(skills) = sub(directory, "skills") else { continue };
+            for skill in crate::sorted_names(&skills).into_iter().filter(|skill| skills.join(skill).join("SKILL.md").is_file()) {
+                let link = format!("{name}-{skill}");
+                let target = skills_dir().join(&link);
+                let _ = std::fs::create_dir_all(skills_dir());
+                if std::fs::symlink_metadata(&target).is_err() {
+                    #[cfg(unix)]
+                    let _ = std::os::unix::fs::symlink(skills.join(&skill), &target);
+                    #[cfg(windows)]
+                    let _ = copy_tree(&skills.join(&skill), &target);
+                }
+                links.push(link);
+            }
+        }
+        for stale in previous.iter().filter(|link| !links.contains(link)) {
+            let path = skills_dir().join(stale);
+            if std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+                let _ = std::fs::remove_file(&path);
+            } else {
+                let _ = std::fs::remove_dir_all(&path);
+            }
+        }
+        if !links.is_empty() || !previous.is_empty() {
+            let _ = crate::write_json_file(&record_path, &json!({ "links": links }));
+        }
+        // MCP：并进 ~/.edith/mcp.json，带 fridayPlugin 标记；${CLAUDE_PLUGIN_ROOT} 换成插件文件夹
+        let path = mcp_path();
+        let mut config = crate::read_json_file(&path);
+        if !config.is_object() {
+            config = json!({});
+        }
+        let mut servers: Map<String, Value> = config["mcpServers"].as_object().cloned().unwrap_or_default();
+        let before = servers.clone();
+        servers.retain(|_, server| server.get("fridayPlugin").is_none());
+        for (name, directory) in &wanted {
+            let Some(file) = mcp_file(directory) else { continue };
+            let Some(plugin_config) = std::fs::read(&file).ok().and_then(|data| serde_json::from_slice::<Value>(&data).ok()) else {
+                continue;
+            };
+            let root = directory.to_string_lossy().into_owned();
+            for (server, value) in plugin_config["mcpServers"].as_object().into_iter().flatten() {
+                let text = value
+                    .to_string()
+                    .replace("${CLAUDE_PLUGIN_ROOT}", &root.replace('\\', "\\\\"))
+                    .replace("${FRIDAY_PLUGIN_ROOT}", &root.replace('\\', "\\\\"));
+                let mut server_config: Value = serde_json::from_str(&text).unwrap_or_else(|_| value.clone());
+                server_config["fridayPlugin"] = json!(name);
+                servers.insert(format!("{name}-{server}"), server_config);
+            }
+        }
+        if servers != before {
+            config["mcpServers"] = Value::Object(servers);
+            let _ = crate::write_json_file(&path, &config);
+        }
+    }
+
+    /// 插件变了：投一遍、脚本工具和钩子跟着（动作换一份），网关重列设置页
+    fn changed() {
+        project();
+        crate::serve_update_actions();
+        crate::notify_all_clients("scripts", json!({}));
+    }
+
+    /// 起来时投一遍（插件是在别处装的、上次没投完的）
+    pub fn start() {
+        std::thread::spawn(project);
+    }
+
+    /// plugins.*（设置 › 插件看着这台时；下载、解压在工作线程里）
+    pub fn request(method: &str, params: &Value) -> crate::Reply {
+        let failed = |message: String| (crate::NOT_ALLOWED, message);
+        let name =
+            || params["name"].as_str().filter(|name| !name.is_empty()).map(str::to_string).ok_or((-32602, "缺少参数 name".to_string()));
+        match method {
+            "plugins.list" => Ok(list()),
+            "plugins.inspectGithub" => inspect_github(params["url"].as_str().unwrap_or("")).map_err(failed),
+            "plugins.inspectData" => {
+                inspect_data(params["name"].as_str().unwrap_or("plugin.zip"), params["data"].as_str().unwrap_or("")).map_err(failed)
+            }
+            "plugins.update" => {
+                let name = name()?;
+                let plugin = find(&name).ok_or_else(|| failed(format!("没有装插件「{name}」")))?;
+                match plugin["source"]["type"].as_str() {
+                    Some("github") => inspect_github(plugin["source"]["url"].as_str().unwrap_or("")).map_err(failed),
+                    _ => Err(failed("从文件装的插件：重新从文件装一次".into())),
+                }
+            }
+            "plugins.install" => {
+                install(params["token"].as_str().unwrap_or("")).map_err(failed)?;
+                Ok(list())
+            }
+            "plugins.discard" => {
+                let token = params["token"].as_str().unwrap_or("");
+                STAGED.lock().unwrap().remove(token);
+                let _ = std::fs::remove_dir_all(staging_root().join(token));
+                Ok(json!({}))
+            }
+            "plugins.setEnabled" => {
+                let name = name()?;
+                let mut list_all = registry();
+                let plugin = list_all
+                    .iter_mut()
+                    .find(|plugin| plugin["name"].as_str().is_some_and(|other| other.eq_ignore_ascii_case(&name)))
+                    .ok_or_else(|| failed(format!("没有装插件「{name}」")))?;
+                plugin["enabled"] = json!(params["enabled"].as_bool().unwrap_or(true));
+                write_registry(&list_all).map_err(failed)?;
+                changed();
+                Ok(list())
+            }
+            "plugins.uninstall" => {
+                let name = name()?;
+                find(&name).ok_or_else(|| failed(format!("没有装插件「{name}」")))?;
+                let directory = directory_of(&name);
+                if directory.exists() {
+                    trash(&directory).map_err(failed)?;
+                }
+                let mut list_all = registry();
+                list_all.retain(|plugin| !plugin["name"].as_str().is_some_and(|other| other.eq_ignore_ascii_case(&name)));
+                write_registry(&list_all).map_err(failed)?;
+                changed();
+                Ok(list())
             }
             other => Err((-32601, format!("没有这个方法：{other}"))),
         }

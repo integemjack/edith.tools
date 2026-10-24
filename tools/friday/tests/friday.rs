@@ -1141,7 +1141,11 @@ fn resident_part_joins_the_brain() {
     }
     let ((mut gateway, gateway_info), (mut resident, info)) = (gateway.unwrap(), resident.unwrap());
     assert_eq!((gateway_info["approves"].as_bool(), gateway_info.get("resident")), (Some(true), None), "{gateway_info}");
-    assert_eq!((info["resident"].as_bool(), info["hooks"].clone()), (Some(true), json!(["PreToolUse"])), "{info}");
+    assert_eq!(
+        (info["resident"].as_bool(), info["hooks"].clone(), info["models"].clone()),
+        (Some(true), json!(["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"]), json!(["power://"])),
+        "{info}"
+    );
     assert!(info["receives"].as_array().unwrap().contains(&json!("done")), "{info}");
     let actions: Vec<&str> = info["actions"].as_array().unwrap().iter().filter_map(|action| action["name"].as_str()).collect();
     assert!(actions.is_empty() || actions.contains(&"browser_navigate"), "{actions:?}");
