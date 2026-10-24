@@ -93,8 +93,13 @@ fn workspace_key(directory: &str) -> String {
     find_workspace(Path::new(directory)).to_string_lossy().into_owned()
 }
 
+/// 会话没给工作目录时用哪：EDITH_FRIDAY_DIRECTORY → 设置 › 智能体里选的（friday.json）→ 家目录
 fn default_directory() -> String {
-    std::env::var("EDITH_FRIDAY_DIRECTORY").ok().filter(|dir| !dir.is_empty()).unwrap_or_else(|| user_home().to_string_lossy().into_owned())
+    std::env::var("EDITH_FRIDAY_DIRECTORY")
+        .ok()
+        .filter(|dir| !dir.is_empty())
+        .or_else(|| META.value()["workingDirectory"].as_str().filter(|dir| Path::new(dir).is_dir()).map(str::to_string))
+        .unwrap_or_else(|| user_home().to_string_lossy().into_owned())
 }
 
 /// ISO 8601、UTC、不带毫秒（Swift 读带毫秒的会失败）
@@ -875,11 +880,6 @@ fn chain(history: &[Value], nodes: &[Node]) -> Vec<String> {
         .collect()
 }
 
-/// 存档里有几条消息（正在干的那一轮接在后面）
-fn stored_count(session: &str) -> usize {
-    stored_session(session).map_or(0, |stored| group(&stored.id, &stored.history, &Team::new()).len())
-}
-
 fn message_uuid(session: &str, node: usize) -> String {
     stable_uuid(&[session, "message", &node.to_string()])
 }
@@ -1138,14 +1138,24 @@ struct Live {
     context: Value,
     /// 这一轮用的模型（用量里显示）
     engine: String,
+    /// 会话的标题、工作目录（推动静时用，不每次读存档）
+    title: String,
+    cwd: String,
+    /// 给简报数的
+    tally: Tally,
 }
 
 impl Live {
     /// 这段会话开始的一轮（turn.started；连上之前就开始的，第一次收到它的事件或 sessions.list 报着时补一个）
     fn start(session: &str, turn: &str, text: &str) -> Live {
+        let stored = stored_session(session);
+        let title = stored.as_ref().map(|stored| stored.title.clone()).filter(|title| !title.is_empty());
         Live {
             turn: turn.to_string(),
-            node: stored_count(session),
+            node: stored.as_ref().map_or(0, |stored| group(&stored.id, &stored.history, &Team::new()).len()),
+            title: title.unwrap_or_else(|| text.replace('\n', " ").chars().take(40).collect()),
+            cwd: stored.map(|stored| stored.cwd).unwrap_or_default(),
+            tally: Tally::default(),
             segments: vec![Segment { text: text.to_string(), ..Default::default() }],
             started: SystemTime::now(),
             tokens: 0.0,
@@ -1579,6 +1589,15 @@ struct State {
     agents_loaded: HashSet<String>,
     /// 子智能体变了、该推一次的会话
     team_dirty: HashSet<String>,
+    /// 订了会话的动静（activity.subscribe）
+    activity: bool,
+    activity_seq: u64,
+    /// 每段会话最近一轮的简报
+    briefs: HashMap<String, Value>,
+    /// 开着设置页（config.subscribe）
+    config: bool,
+    /// 看过记住的事（memory.*）：之后推 memory 事件，按它要的最近几条截
+    memory: Option<usize>,
 }
 
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| Mutex::new(State::default()));
@@ -1791,9 +1810,20 @@ fn title(session: &Stored, state: &State) -> String {
     }
 }
 
+/// 这段会话的权限模式：选过的，没选过的按设置里新对话的默认（config.json 的 defaultPermissionMode），再没有是自动
 fn permission_mode(id: &str) -> String {
-    META.setting(id, "permissionMode").unwrap_or_else(|| "auto".into())
+    META.setting(id, "permissionMode").unwrap_or_else(default_permission_mode)
 }
+
+fn default_permission_mode() -> String {
+    read_json_file(&config_path())["defaultPermissionMode"]
+        .as_str()
+        .filter(|mode| PERMISSION_MODES.contains(mode))
+        .unwrap_or("auto")
+        .to_string()
+}
+
+const PERMISSION_MODES: [&str; 3] = ["auto", "plan", "full"];
 
 fn summary(session: &Stored, state: &State) -> Value {
     let live = state.live.contains_key(&session.id);
@@ -1970,9 +2000,15 @@ fn on_brain_event(params: &Value) {
                     && live.segments.len() == 1
                     && live.segments[0].pieces.is_empty()
                 {
-                    live.segments[0].from_agent = from_agent;
+                    live.segments[0].from_agent = from_agent.clone();
                 }
                 state.generating.insert(session.clone());
+                let by = if from_agent.is_some() { "agent" } else { "user" };
+                if let Some(live) = state.live.get_mut(&session) {
+                    live.tally.by = by.into();
+                }
+                let request = data["text"].as_str().unwrap_or("").chars().take(500).collect::<String>();
+                activity_event(&mut state, &session, "started", json!({ "by": by, "request": request }));
                 // 排着的那句开始了：从队列里拿掉（按 EDITH 排队时回的轮对，对不上再按原话）
                 let text = data["text"].as_str().unwrap_or("");
                 let by_turn: Option<String> = state.queued_turns.iter().find(|(_, queued)| **queued == turn).map(|(item, _)| item.clone());
@@ -1993,12 +2029,21 @@ fn on_brain_event(params: &Value) {
             "done" => {
                 if let Some(live) = state.live.remove(&session) {
                     META.set_stats(&session, live.stats_json(false));
+                    let brief = turn_brief(&session, &live, data);
+                    state.briefs.insert(session.clone(), brief.clone());
+                    activity_event(&mut state, &session, "finished", json!({ "brief": brief }));
                 }
                 ended = Some((data["error"].as_str().unwrap_or("").to_string(), data["stopped"] == true));
                 state.generating.remove(&session);
                 state.stopping.remove(&session);
                 state.dirty.remove(&session);
-                state.approvals.retain(|_, pending| pending.session != session);
+                let gone: Vec<String> =
+                    state.approvals.iter().filter(|(_, pending)| pending.session == session).map(|(id, _)| id.clone()).collect();
+                if !gone.is_empty() {
+                    state.approvals.retain(|_, pending| pending.session != session);
+                    let resolved = gone.iter().map(|id| json!({ "eventID": id, "outcome": "stopped" })).collect();
+                    approvals_changed(&mut state, &session, resolved);
+                }
                 true
             }
             _ => {
@@ -2006,6 +2051,7 @@ fn on_brain_event(params: &Value) {
                 let live = state.live.get_mut(&session).unwrap();
                 let text = data["text"].as_str().unwrap_or("");
                 let mut structure = false;
+                let mut announce = None;
                 match kind {
                     // 干活时补充的话塞进来了：另起一段
                     "input" => {
@@ -2016,11 +2062,19 @@ fn on_brain_event(params: &Value) {
                     "text" => live.push_text(false, text),
                     "thinking" => live.push_text(true, text),
                     "tool" => {
-                        live.push_tool(data["id"].as_str().unwrap_or(""), data["name"].as_str().unwrap_or(""), data["arguments"].clone())
+                        let (call, name) = (data["id"].as_str().unwrap_or(""), data["name"].as_str().unwrap_or(""));
+                        live.push_tool(call, name, data["arguments"].clone());
+                        if let Some(mut tool) = live.tally.note_tool(name, &data["arguments"]) {
+                            tool["eventID"] = json!(live.card_id(&session, call));
+                            announce = Some(tool);
+                        }
                     }
                     "result" => {
                         let status = if data["ok"].as_bool().unwrap_or(true) { "succeeded" } else { "failed" };
                         let call = data["id"].as_str().unwrap_or("");
+                        if data["name"] == "run_shell" && status == "failed" {
+                            live.tally.failed += 1;
+                        }
                         live.set_tool(call, status, Some(text));
                         if let Some(lines) = lines_of(data)
                             && let Some((segment, _)) = live.find_tool(call)
@@ -2034,6 +2088,9 @@ fn on_brain_event(params: &Value) {
                     _ => {}
                 }
                 state.dirty.insert(session.clone());
+                if let Some(tool) = announce {
+                    activity_event(&mut state, &session, "tool", json!({ "tool": tool }));
+                }
                 structure
             }
         }
@@ -2070,6 +2127,7 @@ fn on_brain_approve(brain: &Arc<Brain>, request: &Value) {
             let pending =
                 Pending { brain: brain.clone(), request: request.clone(), session: session.clone(), call, agent: Some(agent.to_string()) };
             state.approvals.insert(event_id, pending);
+            approvals_changed(&mut state, &session, Vec::new());
             state.team_dirty.insert(session.clone());
             if state.live.contains_key(&session) {
                 state.dirty.insert(session.clone());
@@ -2096,6 +2154,7 @@ fn on_brain_approve(brain: &Arc<Brain>, request: &Value) {
         state
             .approvals
             .insert(event_id, Pending { brain: brain.clone(), request: request.clone(), session: session.clone(), call, agent: None });
+        approvals_changed(&mut state, &session, Vec::new());
         state.dirty.insert(session.clone());
     }
     push_live_message(&session);
@@ -2110,10 +2169,19 @@ fn on_approve_cancel(params: &Value) {
     let agent = params["agent"].as_str().filter(|agent| !agent.is_empty()).map(str::to_string);
     let removed = {
         let mut state = STATE.lock().unwrap();
-        let before = state.approvals.len();
-        state.approvals.retain(|_, pending| !(pending.session == session && pending.call == call && pending.agent == agent));
-        let removed = state.approvals.len() != before;
+        let gone: Vec<String> = state
+            .approvals
+            .iter()
+            .filter(|(_, pending)| pending.session == session && pending.call == call && pending.agent == agent)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &gone {
+            state.approvals.remove(id);
+        }
+        let removed = !gone.is_empty();
         if removed {
+            let resolved = gone.iter().map(|id| json!({ "eventID": id, "outcome": "answered" })).collect();
+            approvals_changed(&mut state, &session, resolved);
             match &agent {
                 Some(agent) => {
                     if let Some(view) = state.agents.get_mut(agent) {
@@ -2134,6 +2202,716 @@ fn on_approve_cancel(params: &Value) {
     if removed {
         changed(&session, false);
     }
+}
+
+// MARK: - 会话的动静（activity.*：客户端的助手看这台的会话，同 Friday 的 ActivityTap / TurnBrief）
+
+/// 一轮里给简报数的：改了哪些文件、跑了几条命令（几条没成）、派了几个子智能体；谁开始的；上一条工具动静什么时候推的
+#[derive(Clone, Debug, Default)]
+struct Tally {
+    files: HashSet<String>,
+    commands: i64,
+    failed: i64,
+    agents: i64,
+    by: String,
+    last_tool: Option<Instant>,
+}
+
+impl Tally {
+    /// 记下一个工具；值得一提的（跑命令、写文件、派子智能体、上网）每段会话每 2 秒最多推一条
+    fn note_tool(&mut self, name: &str, arguments: &Value) -> Option<Value> {
+        let text = |key: &str| arguments[key].as_str().unwrap_or("").to_string();
+        let summary = match name {
+            "write_file" | "edit_file" => {
+                self.files.insert(text("path"));
+                text("path")
+            }
+            "run_shell" => {
+                self.commands += 1;
+                text("command")
+            }
+            "delegate_task" => {
+                self.agents += 1;
+                text("task")
+            }
+            "run_parallel_tasks" | "run_workflow" => {
+                let count = arguments["tasks"].as_array().or(arguments["steps"].as_array()).map_or(1, Vec::len);
+                self.agents += count as i64;
+                format!("{count} 个子智能体")
+            }
+            "fetch_url" => text("url"),
+            "web_search" => text("query"),
+            _ => return None,
+        };
+        if self.last_tool.is_some_and(|last| last.elapsed() < Duration::from_secs(2)) {
+            return None;
+        }
+        self.last_tool = Some(Instant::now());
+        let title = tool_look(name).map_or(name, |look| look.0);
+        Some(json!({ "tool": name, "title": title, "summary": summary.chars().take(200).collect::<String>() }))
+    }
+}
+
+/// 去掉 Markdown 的样子（简报的 answer、line）
+fn plain(text: &str) -> String {
+    text.lines()
+        .map(|line| line.trim().trim_start_matches(['#', '>', '-', '*', ' ']).replace(['*', '`'], ""))
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 一轮做完的简报（同 Friday 的 TurnBrief）：状态、挑出来的一句、改了几个文件、跑了几条命令……
+fn turn_brief(session: &str, live: &Live, done: &Value) -> Value {
+    let answer = plain(done["answer"].as_str().unwrap_or(""));
+    let error = done["error"].as_str().filter(|error| !error.is_empty());
+    let asks = answer.trim_end().ends_with(['？', '?']);
+    let status = if error.is_some() {
+        "error"
+    } else if done["stopped"] == true {
+        "stopped"
+    } else if asks {
+        "question"
+    } else {
+        "done"
+    };
+    // 挑一句：问句挑最后一句，别的挑第一句
+    let sentences: Vec<&str> =
+        answer.split_inclusive(['。', '！', '？', '!', '?', '\n']).map(str::trim).filter(|line| !line.is_empty()).collect();
+    let picked = if asks { sentences.last() } else { sentences.first() };
+    let line = error.map(str::to_string).unwrap_or_else(|| picked.map(|line| line.chars().take(80).collect()).unwrap_or_default());
+    let mut brief = json!({
+        "messageID": message_uuid(session, live.node + 2 * (live.segments.len() - 1) + 1),
+        "status": status,
+        "line": line,
+        "filesChanged": live.tally.files.len(),
+        "commands": live.tally.commands,
+        "commandsFailed": live.tally.failed,
+        "subAgents": live.tally.agents,
+        "seconds": live.started.elapsed().map_or(0, |elapsed| elapsed.as_secs()),
+        "stepsDone": 0,
+        "stepsTotal": 0,
+        "finishedAt": iso(SystemTime::now()),
+        "answer": answer.chars().take(1200).collect::<String>(),
+    });
+    if asks {
+        brief["question"] = json!(line);
+    }
+    brief
+}
+
+/// 推一条动静给订了的客户端（标题、工作目录按正在干的那一轮记的，没有就读存档）
+fn activity_event(state: &mut State, session: &str, kind: &str, extra: Value) {
+    if !state.activity {
+        return;
+    }
+    state.activity_seq += 1;
+    let (title, cwd) = match state.live.get(session) {
+        Some(live) => (live.title.clone(), live.cwd.clone()),
+        None => stored_session(session).map(|stored| (stored.title, stored.cwd)).unwrap_or_default(),
+    };
+    let mut params =
+        json!({ "conversationID": upper(session), "kind": kind, "seq": state.activity_seq, "at": iso(SystemTime::now()), "title": title });
+    if !cwd.is_empty() {
+        params["workingDirectory"] = json!(cwd);
+    }
+    if let (Some(params), Some(extra)) = (params.as_object_mut(), extra.as_object()) {
+        params.extend(extra.clone());
+    }
+    event("activity", params);
+}
+
+/// 这段会话在等的批准（PendingApproval）
+fn pending_approvals(state: &State, session: &str) -> Vec<Value> {
+    state
+        .approvals
+        .iter()
+        .filter(|(_, pending)| pending.session == session)
+        .map(|(id, pending)| {
+            let tool = pending.request["params"]["tool"].as_str().unwrap_or("");
+            json!({ "eventID": id, "tool": tool, "title": tool_look(tool).map_or(tool, |look| look.0), "summary": pending.request["params"]["summary"] })
+        })
+        .collect()
+}
+
+/// 待确认的变了：现在全部的，和少掉的那几个各是怎么结束的
+fn approvals_changed(state: &mut State, session: &str, resolved: Vec<Value>) {
+    let approvals = pending_approvals(state, session);
+    let mut extra = json!({ "approvals": approvals });
+    if !resolved.is_empty() {
+        extra["resolved"] = json!(resolved);
+    }
+    activity_event(state, session, "approval", extra);
+}
+
+/// activity.subscribe 的快照：有内容的会话现在的样子（新的在前）
+fn activity_snapshot(state: &State) -> Value {
+    let sessions: Vec<Value> = all_sessions()
+        .into_iter()
+        .filter(|session| !session.history.is_empty() || state.live.contains_key(&session.id))
+        .map(|session| {
+            let approvals = pending_approvals(state, &session.id);
+            let status = if !approvals.is_empty() {
+                "approval"
+            } else if state.generating.contains(&session.id) {
+                "running"
+            } else if failed_message(&session).is_some() {
+                "error"
+            } else if state.briefs.get(&session.id).is_some_and(|brief| brief["status"] == "question") {
+                "question"
+            } else {
+                "idle"
+            };
+            let mut item = json!({
+                "id": upper(&session.id), "title": title(&session, state), "status": status, "approvals": approvals,
+                "updatedAt": session.updated_at(),
+            });
+            if !session.cwd.is_empty() {
+                item["workingDirectory"] = json!(session.cwd);
+            }
+            if let Some(brief) = state.briefs.get(&session.id) {
+                item["lastBrief"] = brief.clone();
+            }
+            if let Some(live) = state.live.get(&session.id).filter(|live| !live.tally.by.is_empty()) {
+                item["startedBy"] = json!(live.tally.by);
+            }
+            item
+        })
+        .collect();
+    json!({ "sessions": sessions, "assistant": false })
+}
+
+// MARK: - 设置页（config.*、settings.*、tools.*、mcp.*：改的是 EDITH 的 config.json、mcp.json、技能目录）
+
+/// SettingsState（设置 › 智能体）
+fn settings_state() -> Value {
+    let config = read_json_file(&config_path());
+    let all = engines();
+    json!({
+        "systemPrompt": config["systemPrompt"].as_str().unwrap_or(""),
+        "defaultSystemPrompt": "",
+        "enableThinking": config["enableThinking"].as_bool().unwrap_or(false),
+        "requireApproval": config["permissions"]["mode"].as_str() != Some("auto"),
+        "confirmPaidCalls": false,
+        "defaultPermissionMode": default_permission_mode(),
+        "defaultEngineID": default_engine_id(&all),
+        "workingDirectory": default_directory(),
+        "teamMode": META.value()["teamMode"].as_str().unwrap_or("delegatesHeavy"),
+        "userStops": [],
+        "lightEngineID": "follow",
+        "quotaFallback": "wait",
+        "subAgentEngineID": "",
+    })
+}
+
+/// EDITH 的工具清单（tools.list，问默认工作目录的大脑：它才知道接了哪些能力、MCP 服务有哪些工具）
+fn tools_listing() -> Value {
+    brain_for(&default_directory())
+        .ok()
+        .and_then(|brain| brain.request("tools.list", json!({}), Duration::from_secs(15)).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}))
+}
+
+/// ToolsState（设置 › 工具）
+fn tools_state(listing: &Value) -> Value {
+    let disabled: Vec<&str> = listing["disabled"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+    let descriptors: Vec<Value> = listing["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|tool| {
+            let name = tool["name"].as_str().unwrap_or("");
+            let permission = if tool["readOnly"] == true {
+                "readOnly"
+            } else {
+                match name {
+                    "write_file" | "edit_file" | "save_memory" => "writeFiles",
+                    "fetch_url" | "web_search" => "network",
+                    _ => "execute",
+                }
+            };
+            let (title, symbol) = tool_look(name).unwrap_or((name, "wrench.and.screwdriver"));
+            let group = tool["group"].as_str().unwrap_or("builtin");
+            let mut descriptor = json!({
+                "name": name, "title": title, "description": tool["description"], "symbol": symbol, "permission": permission,
+                "origin": if group == "capability" { "capability" } else { group }, "enabled": !disabled.contains(&name),
+                "alwaysConfirm": false, "consumesQuota": false, "problem": null,
+            });
+            if tool["parameters"].is_object() {
+                descriptor["parametersText"] = json!(pretty(&tool["parameters"]));
+            }
+            descriptor
+        })
+        .collect();
+    let skills: Vec<Value> = listing["skills"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|skill| {
+            let file = skill["file"].as_str().unwrap_or("");
+            let directory = Path::new(file).parent().map(|dir| dir.to_string_lossy().into_owned()).unwrap_or_default();
+            json!({ "name": skill["name"], "declaredName": skill["name"], "description": skill["description"], "directory": directory, "file": file })
+        })
+        .collect();
+    json!({
+        "descriptors": descriptors, "scriptTools": [], "toolsDirectory": "", "skills": skills,
+        "skillsDirectory": listing["skillsDirectory"].as_str().unwrap_or(""),
+    })
+}
+
+fn mcp_path() -> PathBuf {
+    edith_home().join("mcp.json")
+}
+
+/// EDITH 全局那层的 mcp.json 里的服务（{名字: 配置}）
+fn mcp_servers() -> Map<String, Value> {
+    read_json_file(&mcp_path())["mcpServers"].as_object().cloned().unwrap_or_default()
+}
+
+fn write_mcp_servers(servers: Map<String, Value>) -> Result<(), (i64, String)> {
+    let mut file = read_json_file(&mcp_path());
+    file["mcpServers"] = Value::Object(servers);
+    write_json_file(&mcp_path(), &file)
+}
+
+/// McpState（设置 › 工具 › MCP 服务）：服务是 EDITH 合起来的三层（全局、项目、本地）；EDITH 用到时才连，连过的报工具
+fn mcp_state(listing: &Value) -> Value {
+    let unknown: Vec<&str> = listing["mcp"]["unknown"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+    let tools: Vec<&Value> = listing["tools"].as_array().into_iter().flatten().collect();
+    let mut servers: Map<String, Value> = listing["mcp"]["servers"].as_object().cloned().unwrap_or_default();
+    // 大脑没起来时只看全局那层
+    if servers.is_empty() {
+        servers = mcp_servers();
+    }
+    let list: Vec<Value> = servers
+        .iter()
+        .map(|(name, config)| {
+            let prefix = format!("{name}__");
+            let names: Vec<String> = tools
+                .iter()
+                .filter_map(|tool| tool["name"].as_str())
+                .filter_map(|tool| tool.strip_prefix(&prefix).map(str::to_string))
+                .collect();
+            let disabled = config["disabled"] == true;
+            let status = if disabled {
+                "disabled"
+            } else if unknown.contains(&name.as_str()) {
+                "connecting"
+            } else {
+                "connected"
+            };
+            let remote = config["url"].is_string();
+            let summary = if remote {
+                config["url"].as_str().unwrap_or("").to_string()
+            } else {
+                let args: Vec<&str> = config["args"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+                format!("{} {}", config["command"].as_str().unwrap_or(""), args.join(" ")).trim().to_string()
+            };
+            json!({
+                "name": name, "config": config, "summary": summary, "status": status,
+                "error": if status == "connecting" { "用到时再连" } else { "" },
+                "tools": names, "toolCount": names.len(), "log": "", "autoApprove": config["autoApprove"] == true, "disabled": disabled, "isRemote": remote,
+            })
+        })
+        .collect();
+    let text = std::fs::read_to_string(mcp_path()).unwrap_or_else(|_| "{\n  \"mcpServers\": {}\n}\n".into());
+    json!({
+        "servers": list, "configPath": mcp_path().to_string_lossy(), "homeDirectory": user_home().to_string_lossy(),
+        "configText": text, "missingSecrets": {},
+    })
+}
+
+fn capabilities_state() -> Value {
+    json!({ "entries": [], "packages": [], "problems": [], "jobs": [], "availability": {}, "optionSpecs": {}, "packageFor": {}, "providersDirectory": "" })
+}
+
+/// 设置页开着的客户端：推变了的那几份
+fn config_changed(parts: &[&str]) {
+    if !STATE.lock().unwrap().config {
+        return;
+    }
+    let listing = if parts.iter().any(|part| *part == "tools" || *part == "mcp") { tools_listing() } else { json!({}) };
+    let mut params = json!({});
+    for part in parts {
+        params[*part] = match *part {
+            "settings" => settings_state(),
+            "tools" => tools_state(&listing),
+            "mcp" => mcp_state(&listing),
+            _ => capabilities_state(),
+        };
+    }
+    event("config", params);
+}
+
+/// 贴来的 MCP 配置：Claude Desktop / Cursor 的 {"mcpServers": {…}}、VS Code 的 {"servers": {…}}、或者直接 {名字: 配置}
+fn parse_mcp_text(text: &str) -> Result<Map<String, Value>, String> {
+    let value: Value = serde_json::from_str(text.trim()).map_err(|error| format!("不是 JSON：{error}"))?;
+    let servers = value.get("mcpServers").or_else(|| value.get("servers")).cloned().unwrap_or(value);
+    let servers = servers.as_object().cloned().ok_or("没找到服务的配置")?;
+    if servers.values().any(|config| !config.is_object()) {
+        return Err("每个服务的配置都要是对象".into());
+    }
+    Ok(servers)
+}
+
+fn settings_request(method: &str, params: &Value) -> Reply {
+    let name = || text_param(params, "name");
+    match method {
+        "config.subscribe" => {
+            STATE.lock().unwrap().config = true;
+            let listing = tools_listing();
+            Ok(
+                json!({ "settings": settings_state(), "tools": tools_state(&listing), "mcp": mcp_state(&listing), "capabilities": capabilities_state() }),
+            )
+        }
+        "config.unsubscribe" => {
+            STATE.lock().unwrap().config = false;
+            Ok(json!({}))
+        }
+        "settings.get" => Ok(settings_state()),
+        "settings.update" => {
+            if let Some(mode) = params["defaultPermissionMode"].as_str().filter(|mode| !PERMISSION_MODES.contains(mode)) {
+                return Err((-32602, format!("不认识的权限模式：{mode}")));
+            }
+            let path = config_path();
+            let mut config = read_json_file(&path);
+            for (from, to) in
+                [("systemPrompt", "systemPrompt"), ("enableThinking", "enableThinking"), ("defaultPermissionMode", "defaultPermissionMode")]
+            {
+                if !params[from].is_null() {
+                    config[to] = params[from].clone();
+                }
+            }
+            if let Some(required) = params["requireApproval"].as_bool() {
+                if !config["permissions"].is_object() {
+                    config["permissions"] = json!({});
+                }
+                match required {
+                    true => {
+                        config["permissions"].as_object_mut().unwrap().remove("mode");
+                    }
+                    false => config["permissions"]["mode"] = json!("auto"),
+                }
+            }
+            let engines_changed = params["defaultEngineID"].is_string();
+            if let Some(engine) = params["defaultEngineID"].as_str() {
+                match engine {
+                    "" => {
+                        config.as_object_mut().unwrap().remove("defaultEngine");
+                    }
+                    engine => config["defaultEngine"] = json!(engine),
+                }
+            }
+            write_json_file(&path, &config)?;
+            if let Some(directory) = params["workingDirectory"].as_str() {
+                if !directory.is_empty() && !Path::new(directory).is_dir() {
+                    return Err((-32602, format!("工作目录不存在：{directory}")));
+                }
+                META.update(|value| value["workingDirectory"] = json!(directory));
+            }
+            if let Some(mode) = params["teamMode"].as_str() {
+                META.update(|value| value["teamMode"] = json!(mode));
+            }
+            if engines_changed {
+                event("engines", engines_state());
+            }
+            config_changed(&["settings"]);
+            Ok(settings_state())
+        }
+        "tools.setEnabled" => {
+            let tool = name()?;
+            let path = config_path();
+            let mut config = read_json_file(&path);
+            let mut disabled: Vec<Value> = config["disabledTools"].as_array().cloned().unwrap_or_default();
+            disabled.retain(|item| *item != json!(tool));
+            if params["enabled"].as_bool() == Some(false) {
+                disabled.push(json!(tool));
+            }
+            config["disabledTools"] = json!(disabled);
+            write_json_file(&path, &config)?;
+            config_changed(&["tools"]);
+            Ok(json!({}))
+        }
+        "tools.refreshSkills" => {
+            config_changed(&["tools"]);
+            Ok(json!({}))
+        }
+        "tools.skill" | "tools.deleteSkill" => {
+            let wanted = name()?;
+            let listing = tools_listing();
+            let skill = listing["skills"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|skill| skill["name"] == json!(wanted))
+                .cloned()
+                .ok_or((NOT_FOUND, format!("没有技能 {wanted}")))?;
+            let file = PathBuf::from(skill["file"].as_str().unwrap_or(""));
+            let directory = file.parent().map(Path::to_path_buf).unwrap_or_default();
+            if method == "tools.deleteSkill" {
+                // 只删 EDITH 自己技能目录里的（别的是项目、Claude Code、Friday 的）：挪进 ~/.edith/trash
+                let own = canonical(&edith_home().join("skills"));
+                if !canonical(&directory).starts_with(&own) {
+                    return Err((NOT_ALLOWED, format!("{} 不在 EDITH 的技能目录里，到它自己那边删", directory.display())));
+                }
+                let trash = edith_home().join("trash");
+                let _ = std::fs::create_dir_all(&trash);
+                let target = trash.join(format!("{wanted}-{}", chrono::Utc::now().format("%Y%m%d%H%M%S")));
+                std::fs::rename(&directory, &target).map_err(|error| (NOT_ALLOWED, format!("挪不动：{error}")))?;
+                config_changed(&["tools"]);
+                return Ok(json!({}));
+            }
+            let content = std::fs::read_to_string(&file).map_err(|error| (NOT_FOUND, format!("读不了 {}：{error}", file.display())))?;
+            let mut files = Vec::new();
+            let mut pending = vec![directory.clone()];
+            while let Some(dir) = pending.pop() {
+                for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        pending.push(path);
+                    } else if path != file && files.len() < 500 {
+                        files.push(path.strip_prefix(&directory).unwrap_or(&path).to_string_lossy().replace('\\', "/"));
+                    }
+                }
+            }
+            files.sort();
+            Ok(json!({
+                "name": skill["name"], "declaredName": skill["name"], "description": skill["description"],
+                "directory": directory.to_string_lossy(), "file": file.to_string_lossy(), "content": content, "files": files,
+            }))
+        }
+        "mcp.list" => Ok(json!({ "servers": mcp_servers() })),
+        "mcp.update" | "mcp.saveServer" | "mcp.saveConfigText" | "mcp.importText" => {
+            let mut servers = mcp_servers();
+            let mut names = Vec::new();
+            let outcome: Result<(), String> = (|| {
+                match method {
+                    "mcp.update" => {
+                        let given = params["servers"].as_object().cloned().ok_or("要给 servers")?;
+                        names.extend(given.keys().cloned());
+                        servers.extend(given);
+                    }
+                    "mcp.saveServer" => {
+                        let server = params["name"].as_str().map(str::trim).filter(|name| !name.is_empty()).ok_or("服务要有名字")?;
+                        let config = params["config"].clone();
+                        if !config.is_object() {
+                            return Err("配置要是对象".into());
+                        }
+                        if let Some(old) = params["oldName"].as_str().filter(|old| *old != server) {
+                            servers.remove(old);
+                        }
+                        servers.insert(server.to_string(), config);
+                        names.push(server.to_string());
+                    }
+                    "mcp.saveConfigText" => {
+                        let text = params["text"].as_str().unwrap_or("");
+                        let value: Value = serde_json::from_str(text).map_err(|error| format!("不是 JSON：{error}"))?;
+                        servers = value["mcpServers"].as_object().cloned().ok_or("要有 mcpServers 对象")?;
+                    }
+                    _ => {
+                        let pasted = parse_mcp_text(params["text"].as_str().unwrap_or(""))?;
+                        names.extend(pasted.keys().cloned());
+                        servers.extend(pasted);
+                    }
+                }
+                write_mcp_servers(servers.clone()).map_err(|(_, message)| message)
+            })();
+            if method == "mcp.update" {
+                outcome.map_err(|message| (-32602, message))?;
+                config_changed(&["mcp", "tools"]);
+                return Ok(json!({}));
+            }
+            let listing = tools_listing();
+            let mcp = mcp_state(&listing);
+            if outcome.is_ok() {
+                config_changed(&["mcp", "tools"]);
+            }
+            let error = outcome.err().unwrap_or_default();
+            if method == "mcp.importText" {
+                return Ok(json!({ "ok": error.is_empty(), "names": names, "error": error, "mcp": mcp }));
+            }
+            Ok(json!({ "error": error, "mcp": mcp }))
+        }
+        "mcp.remove" | "mcp.setDisabled" | "mcp.setAutoApprove" => {
+            let server = name()?;
+            let mut servers = mcp_servers();
+            match method {
+                "mcp.remove" => {
+                    servers.remove(&server);
+                }
+                _ => {
+                    // 只在项目那层配置的：全局这层写一条只改开关的（EDITH 后面盖前面）
+                    let entry = servers.entry(server.clone()).or_insert_with(|| json!({}));
+                    if method == "mcp.setDisabled" {
+                        entry["disabled"] = json!(params["disabled"].as_bool().unwrap_or(false));
+                    } else {
+                        entry["autoApprove"] = json!(params["value"].as_bool().unwrap_or(false));
+                    }
+                }
+            }
+            write_mcp_servers(servers)?;
+            config_changed(&["mcp", "tools"]);
+            Ok(json!({}))
+        }
+        // EDITH 用到时才连 MCP 服务、配置变了下次用时重连
+        "mcp.reconnect" | "mcp.reloadAll" | "capabilities.refreshAvailability" => {
+            config_changed(&["mcp"]);
+            Ok(json!({}))
+        }
+        other if other.starts_with("capabilities.") => {
+            Err(not_allowed("在这里管能力提供方（EDITH 的能力写在 ~/.edith/capabilities.json）"))
+        }
+        other => Err(not_allowed(&format!("脚本工具（{other}）"))),
+    }
+}
+
+// MARK: - 记住的事（memory.*：EDITH 的 ~/.edith/memory.json，同 EDITH 的 memory.rs）
+
+fn memory_path() -> PathBuf {
+    edith_home().join("memory.json")
+}
+
+fn memory_items() -> Vec<Value> {
+    read_json_file(&memory_path())["items"].as_array().cloned().unwrap_or_default()
+}
+
+fn memory_label(kind: &str) -> &'static str {
+    match kind {
+        "fact" => "事实",
+        "decision" => "决定",
+        "correction" => "纠正",
+        "experience" => "经验",
+        "habit" => "习惯",
+        "routine" => "惯例",
+        _ => "偏好",
+    }
+}
+
+/// 那台的本地时间文字（yyyy-MM-dd HH:mm）
+fn local_time(text: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(text)
+        .map(|time| time.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_default()
+}
+
+/// MemoryState 的一行
+fn memory_row(item: &Value) -> Value {
+    let field = |key: &str| item[key].as_str().unwrap_or("").to_string();
+    let uses = item["uses"].as_u64().unwrap_or(0);
+    let mut row = json!({
+        "id": field("id"), "shortId": field("id"), "kind": field("kind"), "kindLabel": memory_label(&field("kind")), "text": field("text"),
+        "project": field("project"), "pinned": item["pinned"] == true, "auto": field("source").starts_with("auto:"), "uses": uses,
+        "judged": 0, "wins": 0, "losses": 0, "rate": if uses > 0 { format!("用了 {uses} 次") } else { String::new() },
+        "lastUsed": local_time(&field("last_used_at")), "updatedAt": local_time(&field("updated_at")),
+    });
+    if field("state") == "archived" {
+        row["archivedAt"] = json!(local_time(&field("archived_at")));
+        row["archiveReason"] = json!(field("archive_reason"));
+    }
+    row
+}
+
+fn memory_state(recent: Option<usize>) -> Value {
+    let items = memory_items();
+    let (mut active, mut archived): (Vec<&Value>, Vec<&Value>) = items.iter().partition(|item| item["state"] != "archived");
+    let (count, archived_count) = (active.len(), archived.len());
+    if let Some(recent) = recent.filter(|recent| *recent > 0) {
+        let newest = |list: &mut Vec<&Value>, key: &str| {
+            list.sort_by(|a, b| b[key].as_str().cmp(&a[key].as_str()));
+            list.truncate(recent);
+        };
+        newest(&mut active, "updated_at");
+        newest(&mut archived, "archived_at");
+    }
+    let metrics =
+        json!({ "episodes": 0, "tasks": 0, "firstPass": 0, "deliveries": 0, "followups": 0, "firstPassText": "", "followupText": "" });
+    json!({
+        "items": active.into_iter().map(memory_row).collect::<Vec<_>>(),
+        "archived": archived.into_iter().map(memory_row).collect::<Vec<_>>(),
+        "metrics": { "week": metrics, "month": metrics }, "byVersion": [], "pending": [],
+        "count": count, "archivedCount": archived_count, "recent": recent.unwrap_or(0),
+    })
+}
+
+/// memory.search：同 EDITH 的 search_memory（每个关键词对上算一分，分高的、新的在前，最多 20 条；不分项目）
+fn memory_search(query: &str) -> Vec<Value> {
+    let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    let mut scored: Vec<(usize, Value)> = memory_items()
+        .into_iter()
+        .filter(|item| item["state"] != "archived")
+        .filter_map(|item| {
+            let text = item["text"].as_str().unwrap_or("").to_lowercase();
+            let score = words.iter().filter(|word| text.contains(word.as_str())).count();
+            (score > 0).then_some((score, item))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1["updated_at"].as_str().cmp(&a.1["updated_at"].as_str())));
+    scored.into_iter().take(20).map(|(_, item)| memory_row(&item)).collect()
+}
+
+fn memory_request(method: &str, params: &Value) -> Reply {
+    if method == "memory.search" {
+        let query = params["query"].as_str().unwrap_or("");
+        return Ok(json!({ "query": query, "items": memory_search(query), "pending": [] }));
+    }
+    let recent = {
+        let mut state = STATE.lock().unwrap();
+        if method == "memory.get" {
+            state.memory = Some(params["recent"].as_u64().unwrap_or(0) as usize);
+        }
+        state.memory.get_or_insert(0).to_owned()
+    };
+    if method == "memory.get" {
+        return Ok(memory_state(Some(recent)));
+    }
+    let now = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+    let mut items = memory_items();
+    if method == "memory.add" {
+        let text = text_param(params, "text")?;
+        let kind = params["kind"].as_str().filter(|kind| !kind.is_empty()).unwrap_or("preference");
+        let id = loop {
+            let id = format!("m{}", &uuid::Uuid::new_v4().simple().to_string()[..4]);
+            if !items.iter().any(|item| item["id"] == json!(id)) {
+                break id;
+            }
+        };
+        items.push(json!({
+            "id": id, "kind": kind, "text": text, "project": "", "pinned": false, "source": "user", "state": "active", "uses": 0,
+            "created_at": now, "updated_at": now,
+        }));
+    } else {
+        let id = text_param(params, "id")?;
+        let index = items.iter().position(|item| item["id"] == json!(id)).ok_or((NOT_FOUND, format!("没有记忆 {id}")))?;
+        let item = &mut items[index];
+        match method {
+            "memory.setText" => {
+                item["text"] = json!(text_param(params, "text")?);
+                // 用户改过的不再算自动学的，计数清零
+                item["source"] = json!("user");
+                item["uses"] = json!(0);
+                item["updated_at"] = json!(now);
+            }
+            "memory.setPinned" => item["pinned"] = json!(params["pinned"].as_bool().unwrap_or(false)),
+            "memory.archive" => {
+                item["state"] = json!("archived");
+                item["archived_at"] = json!(now);
+                item["archive_reason"] = json!("手动归档");
+            }
+            "memory.restore" => {
+                item["state"] = json!("active");
+                item["updated_at"] = json!(now);
+            }
+            "memory.remove" => {
+                items.remove(index);
+            }
+            other => return Err((-32601, format!("这一版的 EDITH 网关没有 {other}"))),
+        }
+    }
+    write_json_file(&memory_path(), &json!({ "items": items }))?;
+    let state = memory_state(Some(recent));
+    event("memory", state.clone());
+    Ok(state)
 }
 
 // MARK: - 大脑
@@ -2640,8 +3418,8 @@ fn server_info() -> Value {
         "startedAt": *STARTED,
         "host": "server",
         "clientDevices": { "power": false },
-        // 选目录时新建文件夹；runner.submit 认 whenBusy
-        "features": ["mkdir", "submitFrom"],
+        // 选目录时新建文件夹；runner.submit 认 whenBusy；会话的动静（客户端的助手看这台）、助手开没开
+        "features": ["mkdir", "submitFrom", "activity", "assistant", "config", "memory", "memorySearch"],
     })
 }
 
@@ -3050,6 +3828,8 @@ fn handle(method: &str, params: &Value) -> Reply {
             pending.brain.write(&json!({ "jsonrpc": "2.0", "id": pending.request["id"], "result": decision }));
             {
                 let mut state = STATE.lock().unwrap();
+                let outcome = if approved { "approved" } else { "denied" };
+                approvals_changed(&mut state, &pending.session, vec![json!({ "eventID": event_id, "outcome": outcome })]);
                 let status = if approved { "running" } else { "denied" };
                 match &pending.agent {
                     Some(agent) => {
@@ -3179,6 +3959,27 @@ fn handle(method: &str, params: &Value) -> Reply {
             Ok(json!({}))
         }
         "conversation.fork" => fork(params),
+        // 客户端的助手看这台的会话：快照 + 之后的 activity 事件；这台自己没有助手
+        "activity.subscribe" => {
+            let mut state = STATE.lock().unwrap();
+            state.activity = true;
+            Ok(activity_snapshot(&state))
+        }
+        "activity.unsubscribe" => {
+            STATE.lock().unwrap().activity = false;
+            Ok(json!({}))
+        }
+        "assistant.status" => Ok(json!({ "enabled": false, "reacting": false })),
+        method
+            if method.starts_with("config.")
+                || method.starts_with("settings.")
+                || method.starts_with("tools.")
+                || method.starts_with("mcp.")
+                || method.starts_with("capabilities.") =>
+        {
+            settings_request(method, params)
+        }
+        method if method.starts_with("memory.") => memory_request(method, params),
         "runner.retry" => retry(&session_param(params, "conversationID")?),
         "runner.selectBranch" => select_branch(&session_param(params, "conversationID")?, &upper(&text_param(params, "child")?)),
         // Friday 丢掉缓存的模型会话、下一轮按存档重建：EDITH 每轮本来就按存档来

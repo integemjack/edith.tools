@@ -927,3 +927,137 @@ fn models_secrets_and_turn_settings() {
     reply(&mut link, &sense, json!({ "disposition": "started", "turn": "t1" }));
     client.reply(submit);
 }
+
+#[test]
+fn activity_for_the_assistant() {
+    let home = scratch("friday-activity");
+    let work = home.join("work");
+    std::fs::create_dir_all(work.join(".git")).unwrap();
+    write_session(&home, &work);
+    let brain = FakeBrain::new();
+    register(&home, &brain, &work);
+    let mut client = Client::start(&home, &work);
+    let hello = client.send("hello", json!({ "protocol": 1 }));
+    let mut link = accept(&brain);
+    let list = link.wait_for(10, |message| message["method"] == "sessions.list").unwrap();
+    reply(&mut link, &list, json!([]));
+    let agents = link.wait_for(10, |message| message["method"] == "agents.list").unwrap();
+    reply(&mut link, &agents, json!([]));
+    let hello = client.reply(hello)["result"].clone();
+    assert!(hello["server"]["features"].as_array().unwrap().contains(&json!("activity")), "助手那一行不再说版本太旧");
+    assert_eq!(client.request("assistant.status", json!({}))["enabled"], false);
+
+    // 快照：有内容的会话现在的样子
+    let snapshot = client.request("activity.subscribe", json!({}));
+    let sessions = snapshot["sessions"].as_array().unwrap();
+    assert_eq!((sessions.len(), sessions[0]["status"].as_str(), sessions[0]["title"].as_str()), (1, Some("idle"), Some("写个文件")));
+    assert_eq!(snapshot["assistant"], false);
+
+    // 一轮：开始 → 跑命令（值得一提的工具）→ 要批准 → 批了 → 做完带简报
+    let activity = |client: &mut Client, kind: &str| {
+        let kind = kind.to_string();
+        client.event("activity", move |params| params["kind"] == json!(kind))["params"].clone()
+    };
+    push(&mut link, SESSION, "t1", "turn.started", json!({ "text": "跑一下测试", "origin": { "kind": "user" } }));
+    let started = activity(&mut client, "started");
+    assert_eq!((started["by"].as_str(), started["request"].as_str()), (Some("user"), Some("跑一下测试")));
+    assert_eq!(started["conversationID"], SESSION.to_uppercase());
+    push(&mut link, SESSION, "t1", "tool", json!({ "id": "c1", "name": "run_shell", "arguments": { "command": "cargo test" } }));
+    let tool = activity(&mut client, "tool");
+    assert_eq!((tool["tool"]["tool"].as_str(), tool["tool"]["summary"].as_str()), (Some("run_shell"), Some("cargo test")));
+    let approve = link
+        .start("approve", json!({ "session": SESSION, "turn": "t1", "call": "c1", "tool": "run_shell", "summary": "跑命令：cargo test" }));
+    let asked = activity(&mut client, "approval");
+    let pending = asked["approvals"][0].clone();
+    assert_eq!((pending["tool"].as_str(), pending["summary"].as_str()), (Some("run_shell"), Some("跑命令：cargo test")));
+    assert_eq!(pending["eventID"], tool["tool"]["eventID"], "待确认的就是那张卡片");
+    client.request("runner.resolveApproval", json!({ "eventID": pending["eventID"], "approved": true }));
+    let answered = activity(&mut client, "approval");
+    assert_eq!((answered["approvals"].clone(), answered["resolved"][0]["outcome"].clone()), (json!([]), json!("approved")));
+    assert_eq!(link.reply_to(approve, 10)["result"]["decision"], "allow");
+    push(&mut link, SESSION, "t1", "result", json!({ "id": "c1", "name": "run_shell", "ok": false, "text": "1 个没过" }));
+    append(
+        &home,
+        SESSION,
+        &[
+            json!({ "role": "user", "content": "跑一下测试" }),
+            json!({ "role": "assistant", "content": "**跑了**测试。有一个没过，要我修吗？" }),
+        ],
+    );
+    push(&mut link, SESSION, "t1", "done", json!({ "answer": "**跑了**测试。有一个没过，要我修吗？", "stopped": false, "error": null }));
+    let finished = activity(&mut client, "finished");
+    let brief = &finished["brief"];
+    assert_eq!(
+        (brief["status"].as_str(), brief["commands"].as_i64(), brief["commandsFailed"].as_i64()),
+        (Some("question"), Some(1), Some(1))
+    );
+    assert_eq!(
+        (brief["question"].as_str(), brief["answer"].as_str()),
+        (Some("有一个没过，要我修吗？"), Some("跑了测试。有一个没过，要我修吗？"))
+    );
+    let snapshot = client.request("activity.subscribe", json!({}));
+    assert_eq!(snapshot["sessions"][0]["status"], "question");
+    assert_eq!(snapshot["sessions"][0]["lastBrief"]["status"], "question");
+}
+
+#[test]
+fn settings_mcp_and_memory() {
+    let home = scratch("friday-settings");
+    let work = home.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let mut client = Client::start(&home, &work);
+    let hello = client.request("hello", json!({ "protocol": 1 }));
+    let features = hello["server"]["features"].as_array().unwrap().clone();
+    assert!(["config", "memory", "memorySearch"].iter().all(|feature| features.contains(&json!(feature))), "{features:?}");
+
+    // 设置 › 智能体：改 EDITH 的 config.json（别的键留着）
+    std::fs::write(home.join("config.json"), json!({ "model": "m1", "apiKey": "k" }).to_string()).unwrap();
+    let opened = client.request("config.subscribe", json!({}));
+    assert_eq!(
+        (opened["settings"]["requireApproval"].as_bool(), opened["settings"]["defaultPermissionMode"].as_str()),
+        (Some(true), Some("auto"))
+    );
+    let updated =
+        client.request("settings.update", json!({ "systemPrompt": "多用表格", "requireApproval": false, "defaultPermissionMode": "full" }));
+    assert_eq!(updated["requireApproval"], false);
+    let config: Value = serde_json::from_slice(&std::fs::read(home.join("config.json")).unwrap()).unwrap();
+    assert_eq!(
+        (config["systemPrompt"].as_str(), config["permissions"]["mode"].as_str(), config["apiKey"].as_str()),
+        (Some("多用表格"), Some("auto"), Some("k"))
+    );
+    client.event("config", |params| params["settings"]["systemPrompt"] == "多用表格");
+    client.request("tools.setEnabled", json!({ "name": "web_search", "enabled": false }));
+    let config: Value = serde_json::from_slice(&std::fs::read(home.join("config.json")).unwrap()).unwrap();
+    assert_eq!(config["disabledTools"], json!(["web_search"]));
+
+    // MCP：存、改名、贴、删，都在 EDITH 全局那层的 mcp.json
+    let saved = client.request("mcp.saveServer", json!({ "name": "a", "config": { "command": "echo" } }));
+    assert_eq!(saved["error"], "");
+    client.request("mcp.saveServer", json!({ "name": "b", "oldName": "a", "config": { "command": "echo" } }));
+    let pasted = client.request("mcp.importText", json!({ "text": "{\"mcpServers\": {\"c\": {\"url\": \"https://x.example/mcp\"}}}" }));
+    assert_eq!((pasted["ok"].as_bool(), pasted["names"].clone()), (Some(true), json!(["c"])));
+    let servers: Vec<String> =
+        pasted["mcp"]["servers"].as_array().unwrap().iter().map(|server| server["name"].as_str().unwrap().to_string()).collect();
+    assert_eq!(servers, ["b", "c"]);
+    let bad = client.request("mcp.importText", json!({ "text": "不是 JSON" }));
+    assert_eq!(bad["ok"], false);
+
+    // 记住的事：加、改、常驻、查、归档、恢复、删（EDITH 的 memory.json）
+    let state = client.request("memory.get", json!({ "recent": 20 }));
+    assert_eq!(state["count"], 0);
+    let state = client.request("memory.add", json!({ "text": "回复用中文" }));
+    let id = state["items"][0]["id"].as_str().unwrap().to_string();
+    assert_eq!((state["items"][0]["kind"].as_str(), state["items"][0]["kindLabel"].as_str()), (Some("preference"), Some("偏好")));
+    client.event("memory", |params| params["count"] == 1);
+    client.request("memory.setText", json!({ "id": id, "text": "回复一律用中文" }));
+    client.request("memory.setPinned", json!({ "id": id, "pinned": true }));
+    let found = client.request("memory.search", json!({ "query": "中文" }));
+    assert_eq!((found["items"][0]["text"].as_str(), found["items"][0]["pinned"].as_bool()), (Some("回复一律用中文"), Some(true)));
+    let state = client.request("memory.archive", json!({ "id": id }));
+    assert_eq!((state["count"].as_u64(), state["archivedCount"].as_u64()), (Some(0), Some(1)));
+    client.request("memory.restore", json!({ "id": id }));
+    let state = client.request("memory.remove", json!({ "id": id }));
+    assert_eq!(state["count"], 0);
+    let missing = client.send("memory.remove", json!({ "id": id }));
+    assert_eq!(client.reply(missing)["error"]["code"], 3);
+}
