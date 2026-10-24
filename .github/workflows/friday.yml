@@ -1,0 +1,32 @@
+# edith-friday：Friday 客户端的网关（tools/friday）。只在它自己（或共用的测试、工具链、流水线）改了时跑，别的工具改了不动它
+name: edith-friday
+
+on:
+  push:
+    paths:
+      - tools/friday/**
+      - support/**
+      - rust-toolchain.toml
+      - scripts/**
+      - .github/workflows/tool.yml
+      - .github/workflows/friday.yml
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 没改也发一版（只在 main 上）
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: edith-friday-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  tool:
+    uses: ./.github/workflows/tool.yml
+    with:
+      dir: friday
+      release: ${{ inputs.release == true }}

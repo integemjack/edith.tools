@@ -11,16 +11,29 @@
 
 它们只讲能力协议、不用大脑的代码（`edith-friday` 另外读大脑的会话存档）。MCP 服务不用这里的工具：大脑直接读 `.mcp.json` 连（能力协议 §9）。
 
+**每个工具相互隔离**：各是一个独立的 Rust 工程（`tools/<目录>/`：自己的 `Cargo.toml`、`Cargo.lock`、依赖、版本），各有各的工作流，
+只在自己改了时编、测、发版，一个工具编不过不耽误别的。共用的只有测试扮大脑用的 `support/`（只是开发依赖，不进程序）。
+
+| 目录 | 程序 | 发版标签 |
+|---|---|---|
+| `tools/websocket/` | `edith-websocket` | `edith-websocket-vX.Y.N` |
+| `tools/connect/` | `edith-connect` | `edith-connect-vX.Y.N` |
+| `tools/friday/` | `edith-friday` | `edith-friday-vX.Y.N` |
+
 ## 下载
 
 大脑要用时自己下：`edith tools install edith-connect`，或者能力配置里写了 `edith-connect` 而本机没有时自动下（装在 `~/.edith/tools/`）。
-它读 Release 里的 [`index.json`](https://github.com/integemjack/edith.tools/releases/latest/download/index.json)：
+每个工具各自的 Release（`<工具>-vX.Y.N`，只留最新一个）上是它每个平台一个包和这一版的清单 `<工具>.json`；
+固定的 `index` Release 上的 [`index.json`](https://github.com/integemjack/edith.tools/releases/download/index/index.json)
+把各个工具最新的清单合在一起（哪个工具发了版就重新合一次，`releases/latest/download/index.json` 也指向它），大脑读它：
 
 ```json
-{"version": "v0.1.3", "repository": "integemjack/edith.tools", "tools": {
-  "edith-connect": {"description": "…", "assets": {
-    "macos-arm64": {"file": "edith-connect-v0.1.3-macos-arm64.tar.gz", "url": "https://…", "sha256": "…", "size": 1234567}, "…": {}}}}}
+{"version": "2026-10-24T15:00:00Z", "repository": "integemjack/edith.tools", "tools": {
+  "edith-connect": {"description": "…", "version": "v0.2.0", "assets": {
+    "macos-arm64": {"file": "edith-connect-v0.2.0-macos-arm64.tar.gz", "url": "https://…", "sha256": "…", "size": 1234567}, "…": {}}}}}
 ```
+
+顶上的 `version` 是这份索引生成的时间，每个工具的版本在它自己的 `version` 里。
 
 平台：macOS（arm64、x64）、Windows（x64、x86、arm64）、Linux（x64、x86、arm64、armv7、armv6、riscv64、loong64、ppc64le、s390x；
 musl 静态程序，不挑发行版）。每个包里只有那一个程序。
@@ -42,11 +55,17 @@ musl 静态程序，不挑发行版）。每个包里只有那一个程序。
 
 ```bash
 git clone https://github.com/integemjack/edith.tools.git
-cargo test            # 要 python3；测试自己扮大脑（tests/common）
+cd edith.tools/tools/friday       # 每个工具单独编、单独测
+cargo test                        # 要 python3；测试自己扮大脑（support/）
 cargo build --release
 ```
 
-每次推送 GitHub Actions 编全平台全架构、跑测试；推到 `main` 的发一个 Release（`v<版本前两位>.<序号>`，只留最新一个）。
+加一个工具：`tools/<目录>/` 放一个独立工程（`Cargo.toml` 里写 `[workspace]`，开发依赖 `edith-tools-support = { path = "../../support" }`），
+再照 `.github/workflows/friday.yml` 加一个调 `tool.yml` 的工作流。
+
+每次推送，改了的工具（`tools/<目录>/`、共用的 `support/`、`rust-toolchain.toml`、`scripts/`、流水线）在 GitHub Actions 上编全平台全架构、跑测试；
+推到 `main`、而且这个工具自上一版以来改过（只改了 `support/` 的只测不发），发它的一版：版本 `v<它 Cargo.toml 版本的前两位>.<这个工具发过几次>`，
+然后重新合 `index.json`（`scripts/index.sh`，手动重合：工作流 `index`）。手动发：在 Actions 里跑那个工具的工作流、勾「没改也发一版」。
 
 ## 许可证
 

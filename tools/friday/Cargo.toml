@@ -1,0 +1,32 @@
+[package]
+name = "edith-friday"
+description = "Friday 客户端的网关：讲 Friday 的远程协议，客户端经 SSH 连上来就用这台的 EDITH（按工作目录起大脑）"
+# 每个工具各自的版本：发布标签是 edith-friday-v<前两位>.<这个工具发过几次>（.github/workflows/tool.yml）
+version = "0.2.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/integemjack/edith.tools"
+
+# 自己一个工作区：各个工具相互隔离（各自的依赖、Cargo.lock、版本、发布），改了一个不动别的
+[workspace]
+
+[dependencies]
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+base64 = "0.23"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+# 测试扮大脑用的（只在测试里）
+edith-tools-support = { path = "../../support" }
+base64 = "0.23"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "debuginfo"

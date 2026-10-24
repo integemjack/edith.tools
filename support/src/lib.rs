@@ -1,5 +1,5 @@
-//! 测试自己扮演 EDITH 大脑：开一个假的套接字（大脑唯一的接口：127.0.0.1 + 令牌），起工具、等它连进来、讲能力协议
-#![allow(dead_code)]
+//! 各个工具的测试共用（开发依赖）：测试自己扮演 EDITH 大脑——开一个假的套接字（大脑唯一的接口：127.0.0.1 + 令牌），
+//! 起工具、等它连进来、讲能力协议
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -12,10 +12,6 @@ use serde_json::{Value, json};
 
 pub fn python() -> &'static str {
     if cfg!(windows) { "python" } else { "python3" }
-}
-
-pub fn fake(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fake").join(name)
 }
 
 /// 一次测试的目录（当 EDITH_HOME）
@@ -42,6 +38,12 @@ pub struct FakeBrain {
     pub address: String,
     pub token: String,
     links: Receiver<Link>,
+}
+
+impl Default for FakeBrain {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FakeBrain {

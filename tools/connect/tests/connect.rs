@@ -1,11 +1,14 @@
 //! edith-connect：两个大脑共用一个设备（tests/fake/device.py）——启动器让设备服务连进各个大脑的套接字；
 //! 只起一个设备程序、设备忙、动作带上是哪个大脑、主动推的交给当前大脑（claim）、没人连着自己退出
 
-mod common;
-
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use common::{FakeBrain, fake, python, scratch, wait_until};
+use edith_tools_support::{FakeBrain, python, scratch, wait_until};
+
+fn fake(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fake").join(name)
+}
 use serde_json::{Value, json};
 
 #[test]

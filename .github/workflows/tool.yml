@@ -1,0 +1,192 @@
+# 一个工具的流水线：各个工具的工作流（websocket.yml、connect.yml、friday.yml）都调它，相互隔离——各编各的、各测各的、各发各的，
+# 一个工具编不过不耽误别的发版。
+# - 每次推送：这个工具编全平台、全架构；能在运行器上原生跑的同时跑测试（测试自己扮大脑，support/）。
+# - 推到 main、而且这个工具（tools/<目录>/、rust-toolchain.toml）自上一版以来改过（或手动要发）：发这个工具的一版——
+#   标签 <工具>-v<它 Cargo.toml 版本的前两位>.<这个工具发过几次>，Release 上是每个平台一个包 + 清单片段 <工具>.json，
+#   这个工具只留最新的一个 Release（标签留着）；然后重新生成 index.json（scripts/index.sh，挂在固定的 index Release 上）。
+# Linux 一律用 zig（cargo-zigbuild）编成 musl 静态程序：不挑发行版、不挑 glibc 版本（s390x 没有 musl 的标准库，用 glibc 2.17）。
+name: tool
+
+on:
+  workflow_call:
+    inputs:
+      dir:
+        description: tools/ 下的目录
+        type: string
+        required: true
+      release:
+        description: 没改也发一版
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  plan:
+    name: 版本
+    runs-on: ubuntu-latest
+    outputs:
+      name: ${{ steps.plan.outputs.name }}
+      version: ${{ steps.plan.outputs.version }}
+      release: ${{ steps.plan.outputs.release }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Plan
+        id: plan
+        shell: bash
+        run: |
+          dir="tools/${{ inputs.dir }}"
+          name=$(sed -n 's/^name = "\(.*\)"/\1/p' "$dir/Cargo.toml" | head -1)
+          base=$(sed -n 's/^version = "\([0-9]*\)\.\([0-9]*\)\..*"/\1.\2/p' "$dir/Cargo.toml" | head -1)
+          count=$(git tag -l "$name-v$base.*" | wc -l | tr -d ' ')
+          last=$(git tag -l "$name-v*" --sort=-v:refname | head -1)
+          changed=true
+          if [ -n "$last" ] && git diff --quiet "$last" HEAD -- "$dir" rust-toolchain.toml; then changed=false; fi
+          release=false
+          if [ "$GITHUB_REF" = "refs/heads/main" ] && { [ "$changed" = true ] || [ "${{ inputs.release }}" = true ]; }; then release=true; fi
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "version=v$base.$count" >> "$GITHUB_OUTPUT"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          echo "$name v$base.$count（上一版 ${last:-没有}，改过：$changed，发版：$release）"
+
+  build:
+    name: ${{ matrix.key }}
+    needs: plan
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { key: macos-arm64, os: macos-15, target: aarch64-apple-darwin, test: true }
+          - { key: macos-x64, os: macos-15, target: x86_64-apple-darwin, test: true }
+          - { key: windows-x64, os: windows-2022, target: x86_64-pc-windows-msvc, test: true }
+          - { key: windows-x86, os: windows-2022, target: i686-pc-windows-msvc, test: true }
+          - { key: windows-arm64, os: windows-11-arm, target: aarch64-pc-windows-msvc, test: true }
+          - { key: linux-x64, os: ubuntu-22.04, target: x86_64-unknown-linux-musl, zig: true, test: true }
+          - { key: linux-x86, os: ubuntu-22.04, target: i686-unknown-linux-musl, zig: true }
+          - { key: linux-arm64, os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, zig: true, test: true }
+          - { key: linux-armv7, os: ubuntu-22.04, target: armv7-unknown-linux-musleabihf, zig: true }
+          - { key: linux-armv6, os: ubuntu-22.04, target: arm-unknown-linux-musleabihf, zig: true }
+          - { key: linux-riscv64, os: ubuntu-22.04, target: riscv64gc-unknown-linux-musl, zig: true }
+          - { key: linux-loong64, os: ubuntu-22.04, target: loongarch64-unknown-linux-musl, zig: true }
+          - { key: linux-ppc64le, os: ubuntu-22.04, target: powerpc64le-unknown-linux-musl, zig: true }
+          - { key: linux-s390x, os: ubuntu-22.04, target: s390x-unknown-linux-gnu, zig_target: s390x-unknown-linux-gnu.2.17, zig: true }
+    env:
+      TARGET: ${{ matrix.target }}
+      BUILD_TARGET: ${{ matrix.zig_target || matrix.target }}
+      BUILD: ${{ matrix.zig && 'cargo zigbuild' || 'cargo build' }}
+      NAME: ${{ needs.plan.outputs.name }}
+      VERSION: ${{ needs.plan.outputs.version }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: tools/${{ inputs.dir }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # rust-toolchain.toml（仓库根上）定版本，rustup 第一次用时自动装；目标平台的标准库另加
+      - name: Rust target
+        run: rustup target add "$TARGET"
+
+      - name: Zig
+        if: matrix.zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+
+      - name: cargo-zigbuild
+        if: matrix.zig
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            tools/${{ inputs.dir }}/target
+          key: cargo-${{ inputs.dir }}-${{ matrix.key }}-${{ hashFiles(format('tools/{0}/Cargo.lock', inputs.dir), 'rust-toolchain.toml') }}
+          restore-keys: cargo-${{ inputs.dir }}-${{ matrix.key }}-
+
+      # zig 编的（musl 静态）测试在这台机器原生的 glibc 目标上跑，打出来的程序再跑一下 --version
+      - name: Test
+        if: matrix.test
+        run: |
+          if [ -n "${{ matrix.zig }}" ]; then cargo test --locked --release; else cargo test --locked --release --target "$TARGET"; fi
+
+      - name: Build
+        run: $BUILD --locked --release --target "$BUILD_TARGET"
+
+      # 包里只有这个程序（Windows .zip、其余 .tar.gz），名字 <工具>-<版本>-<平台>
+      - name: Package (macOS / Linux)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          tar -C "target/$TARGET/release" -czf "dist/$NAME-$VERSION-${{ matrix.key }}.tar.gz" "$NAME"
+          file "target/$TARGET/release/$NAME" || true
+          if [ "${{ matrix.test }}" = "true" ]; then "target/$TARGET/release/$NAME" --version; fi
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path "target/$env:TARGET/release/$env:NAME.exe" -DestinationPath "dist/$env:NAME-$env:VERSION-${{ matrix.key }}.zip"
+          & "target/$env:TARGET/release/$env:NAME.exe" --version
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ needs.plan.outputs.name }}-${{ matrix.key }}
+          path: tools/${{ inputs.dir }}/dist/*
+          if-no-files-found: error
+
+  release:
+    name: 发版
+    needs: [plan, build]
+    if: needs.plan.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    env:
+      NAME: ${{ needs.plan.outputs.name }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ needs.plan.outputs.name }}-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        shell: bash
+        run: |
+          tag="$NAME-$VERSION"
+          python3 scripts/index.py fragment "$NAME" "$VERSION" "$REPO" dist "tools/${{ inputs.dir }}/Cargo.toml" > "dist/$NAME.json"
+          (cd dist && sha256sum * > SHA256SUMS)
+          notes="$NAME $VERSION（$(git log -1 --format=%s)）
+
+          每个平台一个包；$NAME.json 是这一版的清单，合进 index Release 的 index.json（大脑的 edith tools 读它下载）。说明见 README.md。"
+          gh release create "$tag" dist/* --repo "$REPO" --target "${{ github.sha }}" --title "$NAME $VERSION" --notes "$notes" --latest=false
+          # 这个工具只留最新的一个 Release（标签留着；别的工具的不动）
+          gh release list --repo "$REPO" --limit 200 --json tagName -q '.[].tagName' \
+            | { grep -E "^$NAME-v[0-9]+\.[0-9]+\.[0-9]+$" || true; } | { grep -vx "$tag" || true; } \
+            | while read -r old; do gh release delete "$old" --repo "$REPO" -y; done
+
+      - name: Index
+        shell: bash
+        run: bash scripts/index.sh "$REPO"

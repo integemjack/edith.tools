@@ -1,0 +1,19 @@
+# 手动重新生成 index.json（各个工具最新 Release 上的清单片段合起来）：平时每个工具发版时自己会做
+name: index
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  index:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Index
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/index.sh "${{ github.repository }}"

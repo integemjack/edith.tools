@@ -1,8 +1,6 @@
 //! edith-websocket：远程客户端经它连进大脑的套接字，每个客户端一条连接、原样转（补 name）
 
-mod common;
-
-use common::{FakeBrain, scratch};
+use edith_tools_support::{FakeBrain, scratch};
 use serde_json::{Value, json};
 
 fn read(socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>) -> Value {
@@ -67,7 +65,7 @@ fn relays_remote_capabilities_into_the_brain() {
     assert!(link.closed(10));
     // 大脑叫它退出
     control.send(json!({ "jsonrpc": "2.0", "method": "shutdown", "params": {} }));
-    assert!(common::wait_until(10, || matches!(child.try_wait(), Ok(Some(_)))));
+    assert!(edith_tools_support::wait_until(10, || matches!(child.try_wait(), Ok(Some(_)))));
 }
 
 #[test]
@@ -79,5 +77,5 @@ fn exits_when_the_brain_goes_away() {
     let mut control = brain.accept(20).expect("edith-websocket 没连进来");
     control.handshake(json!({ "id": "b", "workspace": "/w" }));
     drop(control);
-    assert!(common::wait_until(10, || matches!(child.try_wait(), Ok(Some(_)))), "大脑没了它还开着");
+    assert!(edith_tools_support::wait_until(10, || matches!(child.try_wait(), Ok(Some(_)))), "大脑没了它还开着");
 }

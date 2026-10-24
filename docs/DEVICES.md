@@ -51,7 +51,7 @@ edith capabilities add --global mic edith-connect mic
 | `"holds": true` | 成功后调它的那个大脑**一直占着设备**，直到它调带 `releases` 的动作、或者它断开（比如「开始录音」） |
 | `"releases": true` | 放开 `holds` 占着的（比如「停止录音」） |
 
-例子见 [`tests/fake/device.py`](../tests/fake/device.py)。
+例子见 [`tools/connect/tests/fake/device.py`](../tools/connect/tests/fake/device.py)。
 
 ## 设备服务做什么（约定）
 

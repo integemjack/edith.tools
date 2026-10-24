@@ -1,0 +1,32 @@
+# edith-connect：共享设备（tools/connect）。只在它自己（或共用的测试、工具链、流水线）改了时跑，别的工具改了不动它
+name: edith-connect
+
+on:
+  push:
+    paths:
+      - tools/connect/**
+      - support/**
+      - rust-toolchain.toml
+      - scripts/**
+      - .github/workflows/tool.yml
+      - .github/workflows/connect.yml
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 没改也发一版（只在 main 上）
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: edith-connect-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  tool:
+    uses: ./.github/workflows/tool.yml
+    with:
+      dir: connect
+      release: ${{ inputs.release == true }}

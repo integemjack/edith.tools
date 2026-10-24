@@ -1,0 +1,12 @@
+[package]
+name = "edith-tools-support"
+description = "edith.tools 各个工具的测试共用：扮 EDITH 大脑（假套接字、令牌、能力协议）"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[workspace]
+
+[dependencies]
+serde_json = "1"
