@@ -12251,6 +12251,7 @@ mod pty {
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, LazyLock, Mutex};
+    use std::time::{Duration, Instant};
 
     use serde_json::{Value, json};
 
@@ -12271,6 +12272,8 @@ mod pty {
         command: Option<String>,
         size: Mutex<(u16, u16)>,
         output: Mutex<VecDeque<u8>>,
+        /// 最后一次有输出的时候（Windows 上等 shell 起好再写开时带的命令）
+        last_output: Mutex<Option<Instant>>,
         running: AtomicBool,
         exit_code: Mutex<Option<i32>>,
         /// 接着它的连接（能力名）
@@ -12302,6 +12305,7 @@ mod pty {
                 let extra = kept.len().saturating_sub(KEEP);
                 kept.drain(..extra);
             }
+            *self.last_output.lock().unwrap() = Some(Instant::now());
             let watchers: Vec<String> = self.watchers.lock().unwrap().iter().cloned().collect();
             if !watchers.is_empty() {
                 crate::notify_clients(&watchers, "terminal.output", json!({ "id": self.id, "data": base64(data) }));
@@ -12361,6 +12365,7 @@ mod pty {
             command: command.map(str::to_string),
             size: Mutex::new((cols, rows)),
             output: Mutex::new(VecDeque::new()),
+            last_output: Mutex::new(None),
             running: AtomicBool::new(true),
             exit_code: Mutex::new(None),
             watchers: Mutex::new(HashSet::from([watcher.to_string()])),
@@ -12385,8 +12390,24 @@ mod pty {
             std::thread::spawn(move || terminal.exited(waiter()));
         }
         if let Some(command) = command.filter(|command| !command.trim().is_empty()) {
-            let line = if cfg!(windows) { format!("{command}\r") } else { format!("{command}\n") };
-            let _ = terminal.pty.write(line.as_bytes());
+            if cfg!(windows) {
+                // PowerShell 起得慢（windows-arm64 上好几秒），起好之前写进去的会被吞掉：等它出过提示符、安静 0.5 秒再写
+                let terminal = terminal.clone();
+                let line = format!("{command}\r");
+                std::thread::spawn(move || {
+                    let deadline = Instant::now() + Duration::from_secs(20);
+                    while Instant::now() < deadline && terminal.running.load(Ordering::Relaxed) {
+                        let quiet = terminal.last_output.lock().unwrap().is_some_and(|at| at.elapsed() >= Duration::from_millis(500));
+                        if quiet {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    let _ = terminal.pty.write(line.as_bytes());
+                });
+            } else {
+                let _ = terminal.pty.write(format!("{command}\n").as_bytes());
+            }
         }
         changed();
         Ok(terminal.info())
