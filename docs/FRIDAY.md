@@ -27,11 +27,29 @@ Friday 客户端 ──SSH──▶ edith-friday --attach（一条连接一个�
   id 是它的卡片 id，上级是派它的那张卡片、主智能体派的是会话）。做完的从 EDITH 存的运行记录（`agents/<会话>/<id>.json`）读回来。
   子智能体交回给主智能体的那段话标 `fromAgent`（Friday 里不显示），用户干活时补充的标 `interjected`（「工作中补充」）。
 - **会话改动**：文件卡片的「本次会话改动」、改动视图、撤销转给 EDITH 的 `changes.*`（基线同 Friday 的 SessionChanges：写之前记原文，
-  命令改的到 git 里找原文）。删会话交给 EDITH 的 `sessions.remove`，基线、子智能体的运行记录一起删。
+  命令改的到 git 里找原文）。删会话交给 EDITH 的 `sessions.remove`，基线、子智能体的运行记录、分出去的各支一起删。卡片上的「+N −M」按 `result` 事件的 `lines`。
+- **重试、分支、分叉**：一轮出错（`done` 带 `error`）记在 `friday.json`（存档里不记），最后那条回复标错误、能重试——截到这一轮那句之前再发一遍，
+  消息 id 不变。改一条重发：这段整个存成 EDITH 里藏起来的一支（`sessions.fork` 带 `hidden`，记在 `#branch` 名下），主干截到那条之前；
+  分出去的各支按每条消息连同前面历史的指纹接进消息树（共同的开头不重复，同一处几支按分出来的先后排），切分支就是两支对换（`sessions.copy`）。
+  从某条消息分叉成新会话用 `sessions.fork`（标题加「（fork）」）。
+- **会话上选的**：权限模式、思考档位、模型随每句话交给大脑（`sense` 的 `mode` / `thinking` / `engine`），附件里的图片单独列出（`images`，模型能看图时给它）。
+  模型列表读 EDITH 的 `config.json`（顶层那个是 `edith`，`engines` 里的照原样），设置里加改删模型、存删密钥写回 `config.json` / `secrets.json`。
+- **设置页、记忆**：设置 › 智能体（系统提示、要不要批准、新对话的权限模式和模型、默认工作目录）、设置 › 工具（工具开关、技能、MCP 服务）改的是
+  EDITH 的 `config.json`、`mcp.json`；工具清单问默认工作目录的大脑（`tools.list`）。设置 › 记忆直接读写 EDITH 的 `memory.json`（模型用 save_memory / search_memory）。
+- **终端、浏览器**：在会话所在目录的大脑里开（`terminals.*`、`browser.*`），客户端断了照常在；输出、画面原样转给接着看的客户端。
+- **助手**：这台没有助手（EDITH 是大脑，助手开在客户端那台上）。客户端的助手看这台的会话走 `activity.*`（开始、跑命令、待确认、做完的简报）；
+  助手页看这台时说没开，不说版本太旧。
 
 ## 装上
 
-在要被连的那台机器上（没装 Friday 桌面版的；装了的客户端会先用桌面版自带的服务端）：
+在要被连的那台机器上（没装 Friday 桌面版的；装了的客户端会先用桌面版自带的服务端）装好 EDITH，配好模型，一条命令：
+
+```bash
+edith friday install        # 下载 edith-friday、装成 ~/.friday-server/bin/friday-server，edith 自己拷一份到旁边
+edith friday status         # 看装了没有；edith friday uninstall 去掉（原来是 Friday 服务端的换回去）
+```
+
+已经装着 Friday 自己的服务端时要加 `--force`（原来的改名成 `friday-server.friday` 留着）。手动装也行：
 
 ```bash
 mkdir -p ~/.friday-server/bin
@@ -61,25 +79,29 @@ cp edith ~/.friday-server/bin/                            # 或者 edith 在 PAT
 | 能做 | 方法 |
 |---|---|
 | 连上、看会话列表、打开会话 | `hello`、`conversation.subscribe` / `unsubscribe`、`message.get`、`conversation.search` |
-| 新建（空白会话）、删、改名、置顶、草稿 | `conversation.create`、`remove`、`rename`、`setPinned`、`setDraft` |
+| 新建（空白会话）、删、改名、置顶、草稿、分叉 | `conversation.create`、`remove`、`rename`、`setPinned`、`setDraft`、`fork` |
 | 选工作目录（没发过话的）、列目录、新建文件夹、最近的目录 | `runner.setWorkingDirectory`、`fs.list`、`fs.mkdir`（特性 `mkdir`）、`directories.*` |
-| 发话：闲着开始一轮，忙时补充进这一轮，或排到下一轮（显示在队列里） | `runner.submit`（`whenBusy: "queue"` 排队，特性 `submitFrom`） |
+| 发话：闲着开始一轮，忙时补充进这一轮，或排到下一轮；拿掉排着的 | `runner.submit`（`whenBusy: "queue"` 排队，特性 `submitFrom`）、`runner.removeQueued` |
+| 改一条重发、切分支、出错了重试 | `runner.submit` 带 `replacing`、`runner.selectBranch`、`runner.retry`（`runtime` 的 `failedMessageID` / `canRetry`） |
+| 权限模式、思考档位、模型 | `runner.setPermissionMode` / `setThinking` / `setEngine`；`engines.update` / `remove`、`secrets.set` / `remove` |
 | 附件、文件卡片预览 | `file.upload`（一块块传，回这台上的路径）、`fs.read` |
 | 流式看回复、速度和用量、上下文进度环 | `message` / `conversation` / `runtime` / `runner` 事件 |
-| 批准（主智能体的、子智能体的） | `runner.resolveApproval` |
+| 批准（主智能体的、子智能体的；几个客户端都问，先答的算） | `runner.resolveApproval` |
 | 停下 | `runner.stop`（排着的也不干了）、`runner.stopAll` |
-| 子智能体：卡片里看它的运行记录、Agent 树、停掉、追加指示 | `team` 事件、`runner.backgroundAgents`、`agent.stop`、`agent.send` |
+| 子智能体：卡片里看它的运行记录、Agent 树、停掉、追加指示、拿掉没看的指示 | `team` 事件、`runner.backgroundAgents`、`agent.stop`、`agent.send`、`agent.removeQueued` |
 | 文件卡片的「本次会话改动」、改动视图、撤销 | `fs.changes`、`fs.diff`、`fs.revert`（交给 EDITH 的 `changes.*`） |
+| 设置页（特性 `config`） | `config.subscribe`、`settings.get` / `update`、`tools.setEnabled` / `skill` / `deleteSkill` / `refreshSkills`、`mcp.*` |
+| 记住的事（特性 `memory`、`memorySearch`） | `memory.get` / `search` / `add` / `setText` / `setPinned` / `archive` / `restore` / `remove`、`memory` 事件 |
+| 终端 | `term.open` / `attach` / `detach` / `write` / `resize` / `close`、`terminals`、`term.output` 事件 |
+| 浏览器 | `browser.open` / `select` / `close` / `navigate` / `watch` / `container` / `fit` / `input` / `dialog`、`browser`、`browser.frame` 事件 |
+| 客户端的助手看这台（特性 `activity`、`assistant`） | `activity.subscribe` / `unsubscribe`、`activity` 事件、`assistant.status` |
 
-还不行的（回 `-32601` 没有，或错误 `4` 说明原因；`server.features` 只报上面那两个，客户端就不显示别的功能）：
+还不行的（回 `-32601` 没有，或错误 `4` 说明原因；`server.features` 不报，客户端就不显示）：
 
-- 分叉、重试、切分支；把排着的话拿掉（主智能体的、子智能体的）。
-- 终端、浏览器（`available: false`）、本地模型、设置页、助手（助手页那一行显示「版本太旧」）。
-- 在这里改模型和密钥：模型只有一个「EDITH · <模型>」，读 `~/.edith/config.json`；界面上选的权限模式、思考档位只记下来显示，
-  EDITH 按自己的审批规则（[EDITH.md](https://github.com/integemjack/edith/blob/main/docs/EDITH.md#信任与审批)）。
-- 图片附件模型看不到（只把路径告诉它）。
-- 要批准的事问最后连上的那个客户端；没有客户端连着时大脑等能批准的连上来（最多 10 分钟，过了就不做），
-  要无人值守就在 `~/.edith/config.json` 的 `permissions.allow` 里放开，或用 `edith --auto`。
+- 本地模型、定时任务、自我改进、提示词文件、钩子、插件、脚本工具、能力提供方、语音、文件存放位置。
+- 浏览器里智能体请用户接手（EDITH 的智能体还没有浏览器工具）；任务模式（工作方式）只记下，EDITH 一律需要时派子智能体。
+- 要批准的事：没有客户端连着时大脑等能批准的连上来（最多 10 分钟，过了就不做）；要无人值守就选「完全」权限模式，
+  或在 `~/.edith/config.json` 的 `permissions.allow` 里放开、用 `edith --auto`。
 
 ## 测试
 
@@ -89,4 +111,5 @@ cd tools/friday && cargo test
 
 一头扮 Friday 客户端，一头扮大脑（登记一个假的大脑）：存档翻译、连上来接着看在干的那一轮、发话、流式、批准、干活时补充另起一段、
 排队、停下、改名、空白会话第一次发话才在 EDITH 里建、选目录、列目录、新建文件夹、附件上传、删；子智能体的卡片和运行记录、Agent 树、
-子智能体要批准的、停掉 / 追加指示、交回的汇报不显示；会话改动、改动视图、撤销。
+子智能体要批准的、停掉 / 追加指示、交回的汇报不显示；会话改动、改动视图、撤销；出错重试、改一条重发、切分支、分叉；模型、密钥、
+会话上选的档位交给大脑；设置页、MCP、记忆；终端、浏览器转给大脑；会话的动静。

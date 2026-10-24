@@ -9,7 +9,7 @@
 | `edith-connect` | 共享设备：麦克风、摄像头、串口这类独占设备整台机器一个设备服务，几个大脑共用 | [docs/DEVICES.md](docs/DEVICES.md) |
 | `edith-friday` | Friday 客户端的网关：讲 Friday 的远程协议，客户端经 SSH 连上来就用这台的 EDITH（按工作目录起大脑） | [docs/FRIDAY.md](docs/FRIDAY.md) |
 
-它们只讲能力协议、不用大脑的代码（`edith-friday` 另外读大脑的会话存档）。MCP 服务不用这里的工具：大脑直接读 `.mcp.json` 连（能力协议 §9）。
+它们只讲能力协议、不用大脑的代码（`edith-friday` 另外读大脑的会话存档，读写 `~/.edith` 里设置页、记忆库对应的那几个文件）。MCP 服务不用这里的工具：大脑直接读 `.mcp.json` 连（能力协议 §9）。
 
 **每个工具相互隔离**：各是一个独立的 Rust 工程（`tools/<目录>/`：自己的 `Cargo.toml`、`Cargo.lock`、依赖、版本），各有各的工作流，
 只在自己改了时编、测、发版，一个工具编不过不耽误别的。共用的只有测试扮大脑用的 `support/`（只是开发依赖，不进程序）。
