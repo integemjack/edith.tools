@@ -1148,7 +1148,8 @@ fn resident_part_joins_the_brain() {
     );
     assert!(info["receives"].as_array().unwrap().contains(&json!("done")), "{info}");
     let actions: Vec<&str> = info["actions"].as_array().unwrap().iter().filter_map(|action| action["name"].as_str()).collect();
-    assert!(actions.is_empty() || actions.contains(&"browser_navigate"), "{actions:?}");
+    // 定时任务、脚本工具一直在；浏览器工具只在这台有浏览器时给
+    assert!(["loop", "create_tool", "list_tools"].iter().all(|name| actions.contains(name)), "{actions:?}");
     let list = gateway.wait_for(10, |message| message["method"] == "sessions.list").unwrap();
     reply(&mut gateway, &list, json!([]));
     let agents = gateway.wait_for(10, |message| message["method"] == "agents.list").unwrap();
