@@ -867,3 +867,63 @@ fn errors_retry_branches_and_fork() {
     let forked = listed["params"]["summaries"].as_array().unwrap().iter().find(|item| item["id"] == new.to_uppercase()).unwrap().clone();
     assert_eq!(forked["title"], "写个文件（fork）");
 }
+
+#[test]
+fn models_secrets_and_turn_settings() {
+    let home = scratch("friday-models");
+    let work = home.join("work");
+    std::fs::create_dir_all(work.join(".git")).unwrap();
+    write_session(&home, &work);
+    let second = json!({ "id": "second", "baseURL": "https://second.example/v1", "model": "m2", "apiKeySecret": "SECOND_KEY", "thinking": "effort" });
+    std::fs::write(home.join("config.json"), json!({ "model": "m1", "baseURL": "http://127.0.0.1:1/v1", "engines": [second] }).to_string())
+        .unwrap();
+    let brain = FakeBrain::new();
+    register(&home, &brain, &work);
+    let mut client = Client::start(&home, &work);
+    let hello = client.send("hello", json!({ "protocol": 1 }));
+    let mut link = accept(&brain);
+    let list = link.wait_for(10, |message| message["method"] == "sessions.list").unwrap();
+    reply(&mut link, &list, json!([]));
+    let agents = link.wait_for(10, |message| message["method"] == "agents.list").unwrap();
+    reply(&mut link, &agents, json!([]));
+    let hello = client.reply(hello)["result"].clone();
+
+    // 模型：顶层那个（edith，本机的不分档）+ engines 里的；默认第一个
+    let engines = &hello["state"]["engines"];
+    let ids: Vec<&str> = engines["engines"].as_array().unwrap().iter().map(|engine| engine["id"].as_str().unwrap()).collect();
+    assert_eq!((ids, engines["defaultEngineID"].as_str()), (vec!["edith", "second"], Some("edith")));
+    assert_eq!(engines["engines"][0]["thinking"], "none");
+    // 密钥只记名字、值写进 secrets.json；加、删模型改 config.json（别的键不动）
+    client.request("secrets.set", json!({ "name": "SECOND_KEY", "value": "k" }));
+    assert_eq!(client.event("secrets", |_| true)["params"]["names"], json!(["SECOND_KEY"]));
+    let secrets: Value = serde_json::from_slice(&std::fs::read(home.join("secrets.json")).unwrap()).unwrap();
+    assert_eq!(secrets["SECOND_KEY"], "k");
+    client.request("engines.update", json!({ "engine": { "id": "third", "baseURL": "https://third.example/v1", "model": "m3" } }));
+    client.event("engines", |params| params["engines"].as_array().unwrap().len() == 3);
+    client.request("engines.remove", json!({ "id": "third" }));
+    client.event("engines", |params| params["engines"].as_array().unwrap().len() == 2);
+    let config: Value = serde_json::from_slice(&std::fs::read(home.join("config.json")).unwrap()).unwrap();
+    assert_eq!((config["model"].as_str(), config["engines"].as_array().unwrap().len()), (Some("m1"), 1));
+    let id = client.send("engines.remove", json!({ "id": "edith" }));
+    assert_eq!(client.reply(id)["error"]["code"], 4);
+
+    // 会话上选的权限模式、模型、思考档位随话交给大脑；附件里的图片单独列出（模型能看图时给它）
+    client.request("runner.setPermissionMode", json!({ "conversationID": SESSION, "mode": "full" }));
+    client.request("runner.setEngine", json!({ "conversationID": SESSION, "engineID": "second" }));
+    client.request("runner.setThinking", json!({ "conversationID": SESSION, "level": "high" }));
+    let opened = client.request("conversation.subscribe", json!({ "id": SESSION }));
+    assert_eq!(opened["runtime"]["engine"]["id"], "second");
+    assert_eq!(opened["runtime"]["thinkingLevels"], json!(["off", "low", "medium", "high"]));
+    let shot = work.join("图.png").to_string_lossy().into_owned();
+    let notes = work.join("说明.txt").to_string_lossy().into_owned();
+    let submit = client.send("runner.submit", json!({ "conversationID": SESSION, "text": "看看", "attachments": [shot, notes] }));
+    let sense = link.wait_for(10, |message| message["method"] == "sense").unwrap();
+    let params = &sense["params"];
+    assert_eq!(
+        (params["mode"].as_str(), params["engine"].as_str(), params["thinking"].as_str()),
+        (Some("full"), Some("second"), Some("high"))
+    );
+    assert_eq!(params["images"], json!([shot]));
+    reply(&mut link, &sense, json!({ "disposition": "started", "turn": "t1" }));
+    client.reply(submit);
+}

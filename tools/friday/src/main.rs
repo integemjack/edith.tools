@@ -1136,6 +1136,8 @@ struct Live {
     first_output: Option<Instant>,
     /// 最近一段请求的上下文（进度环）
     context: Value,
+    /// 这一轮用的模型（用量里显示）
+    engine: String,
 }
 
 impl Live {
@@ -1151,6 +1153,7 @@ impl Live {
             pending: 0.0,
             first_output: None,
             context: json!({}),
+            engine: engine_for(session)["title"].as_str().unwrap_or("EDITH").to_string(),
         }
     }
 
@@ -1223,7 +1226,7 @@ impl Live {
             "tokensPerSecond": (speed * 10.0).round() / 10.0,
             "tokenCount": tokens.round() as i64,
             "startedAt": iso(self.started),
-            "engineName": engine()["title"],
+            "engineName": self.engine,
         });
         if live {
             stats["live"] = json!(true);
@@ -1580,26 +1583,201 @@ struct State {
 
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| Mutex::new(State::default()));
 
-fn engine() -> Value {
-    let config: Value =
-        std::fs::read(edith_home().join("config.json")).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or(json!({}));
-    let model = std::env::var("EDITH_MODEL").ok().or_else(|| config["model"].as_str().map(str::to_string)).unwrap_or_default();
-    let base = std::env::var("EDITH_BASE_URL").ok().or_else(|| config["baseURL"].as_str().map(str::to_string)).unwrap_or_default();
-    json!({
-        "id": ENGINE_ID,
-        "title": if model.is_empty() { "EDITH".to_string() } else { format!("EDITH · {model}") },
-        "baseURL": base,
-        "apiKeySecret": "EDITH_API_KEY",
-        "model": model,
-        "supportsVision": false,
-        "supportsTools": true,
-        "sendsEnableThinking": false,
-        "extraBody": "",
-    })
+// MARK: - 模型、密钥（EDITH 的 ~/.edith/config.json、secrets.json）
+
+fn config_path() -> PathBuf {
+    edith_home().join("config.json")
+}
+
+fn read_json_file(path: &Path) -> Value {
+    std::fs::read(path).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).filter(Value::is_object).unwrap_or(json!({}))
+}
+
+/// 写 EDITH 的配置文件（里面有密钥：只有自己能读；先写临时文件再换名）
+fn write_json_file(path: &Path, value: &Value) -> Result<(), (i64, String)> {
+    let failed = |error: std::io::Error| (NOT_ALLOWED, format!("写不了 {}：{error}", path.display()));
+    std::fs::create_dir_all(edith_home()).map_err(failed)?;
+    let temporary = path.with_extension(format!("json.{}", std::process::id()));
+    std::fs::write(&temporary, serde_json::to_vec_pretty(value).unwrap_or_default()).map_err(failed)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600));
+    }
+    std::fs::rename(&temporary, path).map_err(failed)
+}
+
+/// 没手动设思考方式时（同 friday.core 的 inferred_thinking）：自己开关的 toggle，本机的不猜，在线的分档
+fn inferred_thinking(base_url: &str, sends_enable_thinking: bool) -> &'static str {
+    let host = base_url.to_lowercase();
+    let local = ["://localhost", "://127.0.0.1", "://[::1]", "://0.0.0.0"].iter().any(|prefix| host.contains(prefix))
+        || host.starts_with("power://");
+    if sends_enable_thinking {
+        "toggle"
+    } else if local {
+        "none"
+    } else {
+        "effort"
+    }
+}
+
+/// EDITH 用的模型 → Friday 的 EngineConfig：顶层那个（baseURL / model，环境变量盖掉）id 是 edith；config.json 的 engines 本来就是 Friday 的格式
+fn engines() -> Vec<Value> {
+    let config = read_json_file(&config_path());
+    let mut list = Vec::new();
+    let model =
+        std::env::var("EDITH_MODEL").ok().filter(|model| !model.is_empty()).or_else(|| config["model"].as_str().map(str::to_string));
+    let base =
+        std::env::var("EDITH_BASE_URL").ok().filter(|base| !base.is_empty()).or_else(|| config["baseURL"].as_str().map(str::to_string));
+    if let Some(model) = model.filter(|model| !model.is_empty()) {
+        let base = base.unwrap_or_default();
+        list.push(json!({
+            "id": ENGINE_ID,
+            "title": format!("EDITH · {model}"),
+            "baseURL": base,
+            "apiKeySecret": "EDITH_API_KEY",
+            "model": model,
+            "supportsVision": config["supportsVision"].as_bool().unwrap_or(false),
+            "supportsTools": true,
+            "sendsEnableThinking": false,
+            "extraBody": config["extraBody"].as_str().unwrap_or(""),
+            "thinking": config["thinking"].as_str().unwrap_or_else(|| inferred_thinking(&base, false)),
+        }));
+    }
+    for entry in config["engines"].as_array().into_iter().flatten().filter(|entry| entry["id"].is_string()) {
+        let mut engine = entry.clone();
+        let text = |key: &str| entry[key].as_str().unwrap_or("").to_string();
+        if text("title").is_empty() {
+            engine["title"] = json!(text("model"));
+        }
+        if engine["thinking"].as_str().is_none_or(str::is_empty) {
+            engine["thinking"] = json!(inferred_thinking(&text("baseURL"), entry["sendsEnableThinking"].as_bool().unwrap_or(false)));
+        }
+        for (key, default) in [("supportsVision", true), ("supportsTools", true), ("sendsEnableThinking", false)] {
+            if !engine[key].is_boolean() {
+                engine[key] = json!(default);
+            }
+        }
+        list.push(engine);
+    }
+    list
+}
+
+/// 新对话默认用的：config.json 的 defaultEngine（在列表里的），没有就第一个
+fn default_engine_id(engines: &[Value]) -> String {
+    let wanted = read_json_file(&config_path())["defaultEngine"].as_str().map(str::to_string);
+    wanted
+        .filter(|id| engines.iter().any(|engine| engine["id"] == json!(id)))
+        .or_else(|| engines.first().and_then(|engine| engine["id"].as_str()).map(str::to_string))
+        .unwrap_or_else(|| ENGINE_ID.into())
+}
+
+/// 这段会话用的模型：界面上选的（还在的），没选用默认的
+fn engine_for(session: &str) -> Value {
+    let all = engines();
+    let chosen = META.setting(session, "engineID").filter(|id| all.iter().any(|engine| engine["id"] == json!(id)));
+    let id = chosen.unwrap_or_else(|| default_engine_id(&all));
+    all.into_iter().find(|engine| engine["id"] == json!(id)).unwrap_or_else(|| json!({ "id": ENGINE_ID, "title": "EDITH", "model": "" }))
 }
 
 fn engines_state() -> Value {
-    json!({ "engines": [engine()], "defaultEngineID": ENGINE_ID, "disallowedSubAgentEngines": [], "disabledServices": [] })
+    let all = engines();
+    let config = read_json_file(&config_path());
+    json!({
+        "defaultEngineID": default_engine_id(&all),
+        "engines": all,
+        "disallowedSubAgentEngines": config["disallowedSubAgentEngines"].as_array().cloned().unwrap_or_default(),
+        "disabledServices": [],
+    })
+}
+
+/// 思考档位（同 Friday 的 EngineConfig::thinkingLevels）
+fn thinking_levels(engine: &Value) -> Vec<&'static str> {
+    match engine["thinking"].as_str().unwrap_or("none") {
+        "toggle" | "thinkingType" => vec!["off", "medium"],
+        "effort" => vec!["off", "low", "medium", "high"],
+        _ => Vec::new(),
+    }
+}
+
+/// 密钥库里有哪些名字（值不出这台）
+fn secret_names() -> Value {
+    let secrets = read_json_file(&edith_home().join("secrets.json"));
+    let mut names: Vec<&String> = secrets.as_object().map(|all| all.keys().collect()).unwrap_or_default();
+    names.sort();
+    json!({ "names": names })
+}
+
+/// engines.update / remove、secrets.set / remove、设默认模型、给不给子智能体用：改 EDITH 的 config.json、secrets.json（下一轮起生效）
+fn engines_request(method: &str, params: &Value) -> Reply {
+    if method.starts_with("secrets.") {
+        let name = text_param(params, "name")?;
+        let path = edith_home().join("secrets.json");
+        let mut secrets = read_json_file(&path);
+        if method == "secrets.set" {
+            secrets[&name] = json!(params["value"].as_str().unwrap_or(""));
+        } else if let Some(all) = secrets.as_object_mut() {
+            all.remove(&name);
+        }
+        write_json_file(&path, &secrets)?;
+        event("secrets", secret_names());
+        return Ok(json!({}));
+    }
+    let path = config_path();
+    let mut config = read_json_file(&path);
+    let mut list: Vec<Value> = config["engines"].as_array().cloned().unwrap_or_default();
+    match method {
+        "engines.update" => {
+            let engine = params["engine"].clone();
+            let id = engine["id"].as_str().filter(|id| !id.is_empty()).ok_or((-32602, "engine 要有 id".to_string()))?.to_string();
+            if id == ENGINE_ID {
+                // 顶层那个：改 config.json 顶层的几项
+                for (from, to) in [
+                    ("baseURL", "baseURL"),
+                    ("model", "model"),
+                    ("supportsVision", "supportsVision"),
+                    ("extraBody", "extraBody"),
+                    ("thinking", "thinking"),
+                ] {
+                    if !engine[from].is_null() {
+                        config[to] = engine[from].clone();
+                    }
+                }
+            } else {
+                match list.iter_mut().find(|entry| entry["id"] == json!(id)) {
+                    Some(entry) => *entry = engine,
+                    None => list.push(engine),
+                }
+            }
+        }
+        "engines.remove" => {
+            let id = text_param(params, "id")?;
+            if id == ENGINE_ID {
+                return Err((NOT_ALLOWED, "顶层的模型不能在这里删（改 ~/.edith/config.json）".into()));
+            }
+            list.retain(|entry| entry["id"] != json!(id));
+        }
+        _ => {
+            // engines.setSubAgentAllowed：EDITH 的子智能体用派它的那一轮的模型，这里只记下给设置页看
+            let id = text_param(params, "id")?;
+            let mut disallowed: Vec<Value> = config["disallowedSubAgentEngines"].as_array().cloned().unwrap_or_default();
+            disallowed.retain(|item| *item != json!(id));
+            if params["allowed"].as_bool() == Some(false) {
+                disallowed.push(json!(id));
+            }
+            config["disallowedSubAgentEngines"] = json!(disallowed);
+        }
+    }
+    if list.is_empty() {
+        if let Some(object) = config.as_object_mut() {
+            object.remove("engines");
+        }
+    } else {
+        config["engines"] = json!(list);
+    }
+    write_json_file(&path, &config)?;
+    event("engines", engines_state());
+    Ok(json!({}))
 }
 
 /// 标题：存档里的；还没有（第一轮做完才存）时先用正在干的这一轮的原话（同 EDITH 起的标题：前 40 个字）
@@ -1627,7 +1805,7 @@ fn summary(session: &Stored, state: &State) -> Value {
         "isEmpty": session.history.is_empty() && !live,
         "hasDraft": META.draft(&session.id).is_some(),
         "permissionMode": permission_mode(&session.id),
-        "engineID": ENGINE_ID,
+        "engineID": engine_for(&session.id)["id"],
     });
     if !session.cwd.is_empty() {
         value["workingDirectory"] = json!(session.cwd);
@@ -1672,9 +1850,9 @@ fn runtime(session: &Stored, state: &State) -> Value {
         "canRetry": false,
         "pendingTurnChanges": { "model": false, "thinking": false },
         "canSend": true,
-        "engine": engine(),
+        "engine": engine_for(&session.id),
         "thinkingLevel": META.setting(&session.id, "thinking").unwrap_or_else(|| "off".into()),
-        "thinkingLevels": [],
+        "thinkingLevels": thinking_levels(&engine_for(&session.id)),
         "permissionMode": permission_mode(&session.id),
         "mainLiveSpeed": 0,
     });
@@ -1701,7 +1879,7 @@ fn conversation(session: &Stored, state: &State) -> Value {
         "selectedChildren": selected,
         "permissionMode": permission_mode(&session.id),
         "pinned": META.pinned(&session.id),
-        "engineID": ENGINE_ID,
+        "engineID": engine_for(&session.id)["id"],
     });
     if !session.cwd.is_empty() {
         value["workingDirectory"] = json!(session.cwd);
@@ -2493,7 +2671,7 @@ fn hello(params: &Value) -> Reply {
             "runner": runner_state(&state),
             "team": team_state(&state),
             "engines": engines_state(),
-            "secrets": { "names": [] },
+            "secrets": secret_names(),
             "directories": directories_state(),
             "terminals": { "terminals": [], "available": false, "reason": "这一版的 EDITH 还没有内置终端" },
             "browser": { "tabs": [], "available": false, "reason": "这一版的 EDITH 还没有内置浏览器" },
@@ -2521,6 +2699,29 @@ fn materialize(session: &Stored) -> Result<(Arc<Brain>, Stored), (i64, String)> 
     Ok((brain, stored))
 }
 
+/// 交给大脑的这段话按什么来：界面上选的权限模式、思考档位、模型（EDITH 照着审批、发请求），附件里的图片（模型能看图时一起给它）
+fn with_prefs(request: &mut Value, session: &str, attachments: &[&str]) {
+    request["mode"] = json!(permission_mode(session));
+    if let Some(thinking) = META.setting(session, "thinking") {
+        request["thinking"] = json!(thinking);
+    }
+    let engine = engine_for(session);
+    if engine["id"] != ENGINE_ID {
+        request["engine"] = engine["id"].clone();
+    }
+    let images: Vec<&str> = attachments
+        .iter()
+        .copied()
+        .filter(|path| {
+            let lower = path.to_lowercase();
+            [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"].iter().any(|extension| lower.ends_with(extension))
+        })
+        .collect();
+    if !images.is_empty() {
+        request["images"] = json!(images);
+    }
+}
+
 fn submit(params: &Value) -> Reply {
     let session = session_param(params, "conversationID")?;
     let mut text = params["text"].as_str().unwrap_or("").trim().to_string();
@@ -2539,9 +2740,9 @@ fn submit(params: &Value) -> Reply {
     // 忙的时候：默认同输入框（补充进这一轮），whenBusy: queue 排到下一轮
     let queue = params["whenBusy"].as_str() == Some("queue");
     let urgency = if queue { "queue" } else { "interject" };
-    let reply = brain
-        .request("sense", json!({ "session": session.id, "text": text, "urgency": urgency, "kind": "user" }), Duration::from_secs(30))
-        .map_err(|error| (NOT_ALLOWED, error))?;
+    let mut request = json!({ "session": session.id, "text": text, "urgency": urgency, "kind": "user" });
+    with_prefs(&mut request, &session.id, &attachments);
+    let reply = brain.request("sense", request, Duration::from_secs(30)).map_err(|error| (NOT_ALLOWED, error))?;
     META.set_draft(&session.id, "");
     if reply["disposition"] == "queued" {
         let item_id = uuid::Uuid::new_v4().to_string().to_uppercase();
@@ -2634,7 +2835,16 @@ fn retry(session: &Stored) -> Reply {
     let brain = brain_for(&session.cwd).map_err(|error| (NOT_ALLOWED, error))?;
     request_on(&brain, "sessions.truncate", json!({ "id": session.id, "keep": index }))?;
     META.set_ended(&session.id, 0, "", false);
-    request_on(&brain, "sense", json!({ "session": session.id, "text": text, "urgency": "interject", "kind": "user" }))?;
+    // 那句附的图片（存档里记成 file://路径）照样带上
+    let images: Vec<String> = session.history[index]["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|part| part["image_url"]["url"].as_str()?.strip_prefix("file://").map(str::to_string))
+        .collect();
+    let mut request = json!({ "session": session.id, "text": text, "urgency": "interject", "kind": "user" });
+    with_prefs(&mut request, &session.id, &images.iter().map(String::as_str).collect::<Vec<_>>());
+    request_on(&brain, "sense", request)?;
     changed(&session.id, true);
     Ok(json!({}))
 }
@@ -2723,7 +2933,7 @@ fn handle(method: &str, params: &Value) -> Reply {
             }
             META.set_blank(&id, &directory, params["title"].as_str().unwrap_or(""));
             META.push_recent(&directory);
-            for key in ["permissionMode", "thinking"] {
+            for key in ["permissionMode", "thinking", "engineID", "teamMode"] {
                 if let Some(value) = params[key].as_str() {
                     META.set_setting(&id, key, value);
                 }
@@ -2929,7 +3139,7 @@ fn handle(method: &str, params: &Value) -> Reply {
             event("directories", directories_state());
             Ok(json!({}))
         }
-        // 只记下（界面上显示选了什么），这一版的 EDITH 不按它们干活
+        // 记在这段会话上，下一句交给大脑时带上（权限模式、思考档位、模型；任务模式只记下）
         "runner.setPermissionMode" | "runner.setThinking" | "runner.setEngine" | "runner.setTeamMode" => {
             let id = lower(&text_param(params, "conversationID")?);
             let (key, value) = match method {
@@ -3016,7 +3226,7 @@ fn handle(method: &str, params: &Value) -> Reply {
         }
         "runner.cancelQuotaWait" => Err(not_allowed("这个操作")),
         "secrets.set" | "secrets.remove" | "engines.update" | "engines.remove" | "engines.setSubAgentAllowed" => {
-            Err(not_allowed("在这里改密钥和模型（改 ~/.edith/config.json）"))
+            engines_request(method, params)
         }
         other => Err((-32601, format!("这一版的 EDITH 网关没有 {other}"))),
     }
