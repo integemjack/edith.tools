@@ -52,6 +52,30 @@ Friday 客户端 ──SSH──▶ edith-friday --attach（一条连接一个�
   照 Friday 的 BrowserTools），操作的就是这段会话在卡片里的那些标签。批准用 PreToolUse 钩子告诉大脑（`need`）：打开新网站按网站问、本机 / 内网另说、
   点输入跑脚本问一声、自动模式下点付款登录和往密码框卡号输入也问；截图随动作的 `media` 交给能看图的模型；智能体开的标签一轮结束（`done`）关掉，
   `keep` 的留给用户；`hand_over` 推 `browser.handOver`，用户点「好了」时网关照这段会话选的档位替用户说一句。
+- **本地能力**（Friday.Powers，`powers.*`）：常驻的那份取 Friday.Powers 的 index-v2.json（`FRIDAY_POWERS_INDEX` 可以换），这台能用的平台包
+  （Metal / Vulkan / CUDA，共用运行库 cuda13）在这里装、更新、开关、选项、启停：断点续传、比大小和 SHA-256、系统的 tar 解开，
+  进程 `serve …` 报 `listening` 才算起来，关标准输入就退，闲 15 分钟停掉。目录 `~/.edith/friday/powers`（`FRIDAY_POWERS_DIR`）。
+  本地语音的用户音色导入、删（`powers.importVoice` / `deleteVoice`，先 `file.upload`）。
+- **本地模型**（`models.*`）：模型库是魔搭 / Hugging Face 的缓存布局（和这台的 Friday 桌面端共用），量化档、分片、视觉投影的规则同 llama.cpp；
+  从魔搭 / HF 下、强制删。`models.use` 在 EDITH 的 `config.json` 里建本地引擎（`power://llm`、「组织/仓库:量化档」）给会话换上，
+  大脑每段请求前问常驻的那份 `model.endpoint`（能力协议 §6.6）：拉起 friday-llm，回地址、令牌、`x_friday`（模型文件、会话、优先级）。
+  本地大模型关掉时本地引擎跟着标 `disabled`。生图 / 生视频的模型「使用」后记在 `~/.edith/friday/settings.json`。
+- **定时任务**（`/loop`，`loops.*`）：会话里打 `/loop …` 不交给模型——常驻的那份建、列、停，问答记进会话（EDITH 的 `note`）；
+  到点把 loop.run 提示词交给那段会话的大脑（排在手上这一轮之后，照会话选的档位；大脑没在跑就起），这一轮的回答就是这次的结果，
+  自己定节奏的按 `/loop next`，智能体建的 `/loop done` 就结束，用户建的只有用户能停；错过的 12 小时内补一次。
+  主智能体的 `loop` 动作（最多 5 个、一天 24 次，子 Agent 不给）。存在 `~/.edith/friday/loops.json`；有没暂停的任务时常驻的那份不退。
+- **脚本工具**：`~/.edith/friday/tools/<名字>/`（格式同 Swift / Qt，存储用 friday-core 的 script_tools）；启用了的是常驻那份的动作，
+  按权限加沙盒（macOS sandbox-exec，Linux 有 bwrap 时用它），声明的密钥从 EDITH 的密钥库按同名环境变量给，60 秒超时。
+  智能体的 `create_tool` / `update_tool` / `delete_tool` / `list_tools` / `read_tool`（存了就自测，通过才启用）；设置 › 工具的建、存、自测、回滚、开关、删。
+  工具变了经 `capability.update`（能力协议 §4.7）告诉大脑。
+- **钩子**（`hooks.*`）：同 Claude Code 的格式：全局 `~/.edith/friday/hooks.json`、项目 `.friday/hooks.json`（要信任、内容变了再信任）、插件带的；
+  大脑在四个时机问常驻的那份（能力协议 §6.7），这里跑命令：标准输入是 Claude Code 那个 JSON，退出码 2 拦下 / 接着做，JSON 输出照 Claude Code 认。
+- **插件**（`plugins.*`）：Friday（plugin.json）和 Claude Code（.claude-plugin/）两种写法，从 GitHub 地址或客户端传来的 zip 装：先看一眼列清单，点了才装到
+  `~/.edith/friday/plugins/<名字>/`。启用的钩子、脚本工具直接用；技能链进 EDITH 的 `~/.edith/skills/<插件>-<技能>`，MCP 服务并进 `~/.edith/mcp.json`
+  （「插件名-服务名」，带 `fridayPlugin` 标记）——停用、卸载时撤掉。插件的脚本工具只读。
+- **能力提供方**（`capabilities.*`）：装好的本地语音是「听录音、说话」的提供方，friday-diffusion 是「生图、生视频」的；智能体的 `transcribe_audio` / `speak` /
+  `generate_image` / `generate_video` / `check_job` 是常驻那份的动作（有开着的提供方才给；生视频是异步任务，check_job 取回）。设置页能开关、关掉一项、改名、看任务。
+  结果存在 `~/.edith/friday/media/`。在线服务的提供方、提供方包（脚本提供方）还不支持。
 - **助手**：这台没有助手（EDITH 是大脑，助手开在客户端那台上）。客户端的助手看这台的会话走 `activity.*`（开始、跑命令、待确认、做完的简报）；
   助手页看这台时说没开，不说版本太旧。
 
@@ -109,11 +133,19 @@ cp edith ~/.friday-server/bin/                            # 或者 edith 在 PAT
 | 记住的事（特性 `memory`、`memorySearch`） | `memory.get` / `search` / `add` / `setText` / `setPinned` / `archive` / `restore` / `remove`、`memory` 事件 |
 | 终端 | `term.open` / `attach` / `detach` / `write` / `resize` / `close`、`terminals`、`term.output` 事件 |
 | 浏览器 | `browser.open` / `select` / `close` / `navigate` / `watch` / `container` / `fit` / `input` / `dialog` / `handOverDone`、`browser`、`browser.frame`、`browser.handOver` 事件 |
+| 本地能力（特性 `powers`、`userVoices`） | `powers.subscribe` / `unsubscribe` / `refresh` / `install` / `cancel` / `uninstall` / `setEnabled` / `setOption` / `start` / `stop` / `importVoice` / `deleteVoice`、`powers` 事件 |
+| 本地模型（特性 `models`） | `models.subscribe` / `unsubscribe` / `refresh` / `use` / `download` / `cancel` / `retry` / `dismiss` / `release` / `delete`、`models`、`modelsFailed` 事件 |
+| 定时任务（特性 `loops`） | 会话里的 `/loop …`、`loops.list` / `setPaused` / `runNow` / `remove`、`loops` 事件 |
+| 脚本工具 | `tools.scriptVersions` / `saveScript` / `testScript` / `rollback` / `createScript` / `deleteScript`、`tools.setEnabled` |
+| 钩子（特性 `hooks`） | `hooks.state` / `saveGlobal` / `trust` / `example` |
+| 插件（特性 `plugins`） | `plugins.list` / `inspectGithub` / `inspectData` / `update` / `install` / `discard` / `setEnabled` / `uninstall` |
+| 能力提供方 | `capabilities.setEnabled` / `setKindAllowed` / `setTitle` / `deleteJob` / `refreshAvailability` |
 | 客户端的助手看这台（特性 `activity`、`assistant`） | `activity.subscribe` / `unsubscribe`、`activity` 事件、`assistant.status` |
 
 还不行的（回 `-32601` 没有，或错误 `4` 说明原因；`server.features` 不报，客户端就不显示）：
 
-- 本地模型、定时任务、自我改进、提示词文件、钩子、插件、脚本工具、能力提供方、语音、文件存放位置。
+- 自我改进、提示词文件、文件存放位置、内置钩子（`builtinHooks`）、命令（`commands`）；能力提供方里的在线服务和提供方包；
+  实时语音（`voice.*`：要这台开着助手，EDITH 是大脑，助手开在客户端那台上）。
 - 任务模式（工作方式）只记下，EDITH 一律需要时派子智能体。
 - 要批准的事：没有客户端连着时大脑等能批准的连上来（最多 10 分钟，过了就不做）；要无人值守就选「完全」权限模式，
   或在 `~/.edith/config.json` 的 `permissions.allow` 里放开、用 `edith --auto`。
@@ -129,3 +161,9 @@ cd tools/friday && cargo test
 子智能体要批准的、停掉 / 追加指示、交回的汇报不显示；会话改动、改动视图、撤销；出错重试、改一条重发、切分支、分叉；模型、密钥、
 会话上选的档位交给大脑；设置页、MCP、记忆；会话的动静。常驻的那份：网关拉起它、只一份、闲了自己退；终端真跑 shell（开、输出、重放、关）；
 浏览器真开标签（这台装着 Chrome 时）；连上大脑报的浏览器工具、钩子、`resident`，PreToolUse 替自己的动作说怎么批准，做动作。
+单元测试另有定时任务的写法（`/loop 每天9:00 …` 这些）、钩子的退出码 / JSON 认法。
+
+和真的 EDITH 一起跑的端到端（假模型；本地能力用本地索引里的假包，不在测试机上加载真的大模型——16 GB 的机器按显存开满上下文会把系统卡死）：
+本地能力装 / 停 / 关 / 卸载和 `model.endpoint`（`x_friday`、令牌）、真索引和魔搭的文件列表；定时任务的问答、到点、结果、`/loop done`；
+脚本工具的建 / 自测 / 回滚 / 开关 / 沙盒；钩子的四个时机和项目信任、插件的装 / 投到 EDITH / 停用 / 卸载；能力提供方的听写 / 合成 / 生图 / 生视频；
+智能体的浏览器工具（真 Chrome）。

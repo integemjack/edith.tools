@@ -14,7 +14,8 @@
 //!   （工具卡片 awaitingApproval、runner.pendingApproval、attention 事件），客户端 runner.resolveApproval 回过去。
 //!   客户端关了也不要紧：一直开着的大脑等能批准的连上来再问。
 //!
-//! - **常驻的那份**（`edith-friday serve`，整台机器一个，像 edith-connect）：Friday 专有、要一直在的——终端、浏览器、智能体的浏览器工具……
+//! - **常驻的那份**（`edith-friday serve`，整台机器一个，像 edith-connect）：Friday 专有、要一直在的——终端、浏览器、智能体的浏览器工具、
+//!   本地能力（Friday.Powers）和本地模型、定时任务、脚本工具、钩子、插件、能力提供方……
 //!   它连着这台每个大脑（在那里是能力「friday」，网关是「friday-client」），大脑只给它开模型地址和钩子两个口子；网关第一次要用时拉起它，
 //!   终端、浏览器的请求转给它。见「常驻的那份」一节。
 //!
