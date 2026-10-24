@@ -16,6 +16,10 @@ path = "tools/websocket/main.rs"
 name = "edith-connect"
 path = "tools/connect/main.rs"
 
+[[bin]]
+name = "edith-friday"
+path = "tools/friday/main.rs"
+
 # 自己是一个工作区
 [workspace]
 
@@ -23,6 +27,7 @@ path = "tools/connect/main.rs"
 ureq = "3"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 serde_json = "1"
+sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 

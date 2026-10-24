@@ -8,6 +8,7 @@ import sys
 DESCRIPTIONS = {
     "edith-websocket": "远程能力的中转：设备、网页、手机连它的 WebSocket，每个客户端经大脑的套接字成为一个能力",
     "edith-connect": "共享设备：麦克风、摄像头、串口这类独占设备整台机器一个设备服务，几个大脑共用",
+    "edith-friday": "Friday 客户端的网关：讲 Friday 的远程协议，客户端经 SSH 连上来就用这台的 EDITH（按工作目录起大脑）",
 }
 
 tag, repository, folder = sys.argv[1], sys.argv[2], sys.argv[3]

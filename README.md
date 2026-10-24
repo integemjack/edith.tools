@@ -7,8 +7,9 @@
 |---|---|---|
 | `edith-websocket` | 远程能力的中转：设备、网页、手机连它的 WebSocket，每个客户端经大脑的套接字成为一个能力 | [docs/WEBSOCKET.md](docs/WEBSOCKET.md) |
 | `edith-connect` | 共享设备：麦克风、摄像头、串口这类独占设备整台机器一个设备服务，几个大脑共用 | [docs/DEVICES.md](docs/DEVICES.md) |
+| `edith-friday` | Friday 客户端的网关：讲 Friday 的远程协议，客户端经 SSH 连上来就用这台的 EDITH（按工作目录起大脑） | [docs/FRIDAY.md](docs/FRIDAY.md) |
 
-它们只讲能力协议、不用大脑的代码。MCP 服务不用这里的工具：大脑直接读 `.mcp.json` 连（能力协议 §9）。
+它们只讲能力协议、不用大脑的代码（`edith-friday` 另外读大脑的会话存档）。MCP 服务不用这里的工具：大脑直接读 `.mcp.json` 连（能力协议 §9）。
 
 ## 下载
 
