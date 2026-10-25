@@ -124,6 +124,13 @@ Friday 客户端 ──SSH──▶ edith-friday --attach（一条连接一个�
   - **回执和分诊**：一轮做完按代码模板写（`完成｜机器｜标题 #短号`、挑出来的一句、改了几个文件 · 跑了几条命令 · 用时），不过模型；出错、在问你、等确认、
     卡住（在跑 5 分钟没动静，有工具在跑时 15 分钟）立即，助手派的、关注的、30 分钟内提到过的「用户在等」及时——这两级叫醒助手（每小时最多 30 次，
     客户端前台正看着那段会话时不叫），带上交给它的和它最后的回答让它核对；别的只上状态板、记日志。推送（`assistant.push`）按推送规则（默认要紧的）。
+  - **聊天工具渠道**（`assistant.channels.*`，同 Friday 的 ChannelHub）：SChat 机器人（`/bot/v1` 长轮询；服务器是 HTTPS 自签证书时按 SPKI 指纹认，
+    第一次连上记下 `options.pin`，之后对不上不连）、Telegram（Bot API 长轮询）、脚本渠道（`options.script`，stdin / stdout 一行一个 JSON：出
+    `{type: "send", chatKey, text, replyTo, buttons}`，入 `{type: "message", chatKey, senderID, senderName, text, group, replyTo}`）。配置在
+    `assistant/channels.json`，token 存 EDITH 的密钥库（`SCHAT_BOT_TOKEN`、`TELEGRAM_BOT_TOKEN`，第二个起带序号）。绑定码（`bindCode`，6 位、30 分钟）：
+    在聊天工具里给机器人发「/bind 绑定码」成为主人，在群里发就是推送的去处；只听主人的私聊。主人的话交给助手（来源是渠道 id），回复回到最近
+    说话的那个聊天、在想时「正在输入」；/help /status /sessions /stop /new 直接答；图片、视频、文件下载好当附件，语音先听写；回执和助手主动说的
+    推到开了「通知」的渠道的主人和群（回执带「接着做…」按钮、记着 #短号：引用回复它 = 直接发给那段会话）。都按纯文本渲染、超长切条。助手关着时渠道都停。
   - 日志在 `~/.edith/friday/assistant/journal/<日期>.jsonl`（只追加，同一个 id 后写的算），设置在 `settings.json`；`assistant.history` 按页取，`assistant.clear`
     清空并换一段新的助手会话。开着助手时常驻那份不闲退；`activity.subscribe` 的快照报 `assistant: true`（客户端的助手对这台的会话只上状态板）。
 
@@ -196,10 +203,12 @@ cp edith ~/.friday-server/bin/                            # 或者 edith 在 PAT
 | 自我改进（特性 `improve`） | `improve.get` / `run` / `runSelf` / `setEnabled` / `setEngine` / `setRepository` / `accept` / `dismiss` / `push` / `discard`、`improve` 事件 |
 | 客户端的助手看这台的会话（特性 `activity`） | `activity.subscribe` / `unsubscribe`、`activity` / `activity.assistant` 事件 |
 | 助手（特性 `assistant`） | `assistant.status` / `subscribe` / `unsubscribe` / `history` / `say` / `stop` / `settings.update` / `presence` / `resolveApproval` / `clear` / `memory.list`、`assistant.entry` / `board` / `state` / `push` / `reset` 事件 |
+| 助手的聊天工具 | `assistant.channels.list` / `add` / `update` / `remove` / `removeOwner` / `removeGroup` / `bindCode`、`assistant.channels` 事件 |
 
 还不行的（回 `-32601` 没有，或错误 `4` 说明原因；`server.features` 不报，客户端就不显示）：
 
-- 助手的渠道（SChat、Telegram、脚本渠道）和通话：还没搬（`assistant.channels.*` 回错误 `4`）；助手回答会话的 `ask_user` 问题、附件读取还没有。
+- 助手的通话还没搬；渠道里批准工具调用（`approveFromChannels`）、流式回复（SChat streams、Telegram 草稿）、发文件和语音回复、问题卡片还没有；
+  助手回答会话的 `ask_user` 问题、附件读取还没有。
 - 任务模式「不派子智能体」：EDITH 上没有这一档，按原来的（需要时派）做。
 - 要批准的事：没有客户端连着时大脑等能批准的连上来（最多 10 分钟，过了就不做）；要无人值守就选「完全」权限模式，
   或在 `~/.edith/config.json` 的 `permissions.allow` 里放开、用 `edith --auto`。
@@ -223,4 +232,5 @@ cd tools/friday && cargo test
 智能体的浏览器工具（真 Chrome）；命令的展开 / allowed-tools / use_command；提示词文件的历史 / 回滚 / 恢复；文件存放位置的搬；在线服务商的接入、
 模型列表、余额（假的服务）；实时语音（假的本地语音：听写把 PCM 当字、合成把字当 PCM）的说一句、按住说话、插话、叫停、接过去；
 复盘的第一条消息附目录、一轮结束整理、判定、评测、改进建议（评测比过才交、采用写进提示词、改代码开工作树交给会话、丢掉）；
-助手的开关、说话（藏起来的助手会话、人设、附状态板）、回执、派活（create_session）、做完叫醒助手、直达会话、不说、历史、等确认和在助手页拒绝。
+助手的开关、说话（藏起来的助手会话、人设、附状态板）、回执、派活（create_session）、做完叫醒助手、直达会话、不说、历史、等确认和在助手页拒绝；
+渠道（假的 SChat、Telegram 服务器、脚本渠道）的绑定、只听主人、说话回到那个聊天、命令、回执推送和引用回复直达、图片附件、自签证书的指纹、关助手渠道停。
