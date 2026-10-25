@@ -1825,7 +1825,7 @@ fn engines_state() -> Value {
         "defaultEngineID": default_engine_id(&all),
         "engines": all,
         "disallowedSubAgentEngines": config["disallowedSubAgentEngines"].as_array().cloned().unwrap_or_default(),
-        "disabledServices": [],
+        "disabledServices": services::disabled_services(),
     })
 }
 
@@ -1858,6 +1858,15 @@ fn engines_request(method: &str, params: &Value) -> Reply {
             all.remove(&name);
         }
         write_json_file(&path, &secrets)?;
+        // 新存的是已知服务的密钥：自动接入（默认模型、能力提供方），同 Friday 的密钥库回调
+        if method == "secrets.set"
+            && serve_mode() != "off"
+            && let Ok(hub) = hub()
+            && hub.request("services.installIfKnown", json!({ "name": name }), Duration::from_secs(10)).is_ok()
+        {
+            event("engines", engines_state());
+            config_changed(&["capabilities"]);
+        }
         event("secrets", secret_names());
         return Ok(json!({}));
     }
@@ -3042,7 +3051,9 @@ fn settings_request(method: &str, params: &Value) -> Reply {
         // 能力提供方：常驻那份的本机提供方
         other if other.starts_with("capabilities.") => {
             let hub = hub().map_err(|error| (NOT_ALLOWED, error))?;
-            let reply = hub.request(other, params.clone(), Duration::from_secs(60)).map_err(|error| hub_error(&error))?;
+            // 自测、导入要跑脚本（最长 10 分钟）
+            let wait = if matches!(other, "capabilities.retest" | "capabilities.import") { 660 } else { 60 };
+            let reply = hub.request(other, params.clone(), Duration::from_secs(wait)).map_err(|error| hub_error(&error))?;
             config_changed(&["capabilities"]);
             Ok(reply)
         }
@@ -3713,7 +3724,7 @@ fn server_info() -> Value {
 fn features() -> Vec<&'static str> {
     let mut list = vec!["mkdir", "submitFrom", "activity", "assistant", "config", "memory", "memorySearch", "commands", "storage"];
     if serve_mode() != "off" {
-        list.extend(["powers", "models", "userVoices", "loops", "hooks", "plugins", "prompts"]);
+        list.extend(["powers", "models", "userVoices", "loops", "hooks", "plugins", "prompts", "services", "serviceOps", "serviceUsage"]);
     }
     list
 }
@@ -4376,6 +4387,18 @@ fn handle(method: &str, params: &Value) -> Reply {
         "assistant.channels.list" => Ok(json!({ "channels": [] })),
         method if method.starts_with("assistant.") => Err((NOT_ALLOWED, "这台的 EDITH 没有助手：助手开在客户端那台上".into())),
         method if method.starts_with("term.") => terminal_request(method, params),
+        // 在线服务（设置 › 服务与密钥）：在常驻那份里接入（能力提供方在它那里），改完推模型、密钥、能力提供方
+        method if method.starts_with("services.") => {
+            let hub = hub().map_err(|error| (NOT_ALLOWED, error))?;
+            let wait = if matches!(method, "services.fetchModels" | "services.usage") { 60 } else { 30 };
+            let reply = hub.request(method, params.clone(), Duration::from_secs(wait)).map_err(|error| hub_error(&error))?;
+            if !matches!(method, "services.fetchModels" | "services.usage") {
+                event("engines", engines_state());
+                event("secrets", secret_names());
+                config_changed(&["capabilities"]);
+            }
+            Ok(reply)
+        }
         // 文件存放位置：重启（搬）在网关里；其余（看、量、登记、搬模型）在常驻那份（模型在它那里下、用），没有它时在这里
         "storage.restart" => storage::restart(!STATE.lock().unwrap().generating.is_empty()),
         method if method.starts_with("storage.") && serve_mode() == "off" => {
@@ -4703,7 +4726,8 @@ fn serve_initialize() -> Value {
 fn own_action(tool: &str) -> Option<&str> {
     let (owner, action) = tool.split_once("__")?;
     let own = owner.starts_with("friday") && !owner.starts_with("friday-client");
-    (own && (browser_tools::is_tool(action) || action == "loop" || commands::is_action(action))).then_some(action)
+    (own && (browser_tools::is_tool(action) || action == "loop" || commands::is_action(action) || caps::is_action(action)))
+        .then_some(action)
 }
 
 fn serve_hook(params: &Value) -> Value {
@@ -4720,6 +4744,9 @@ fn serve_hook(params: &Value) -> Value {
     let session = params["session_id"].as_str().unwrap_or("");
     if commands::is_action(action) {
         return json!({ "need": commands::need(action, &arguments, session) });
+    }
+    if caps::is_action(action) {
+        return json!({ "need": caps::need(action, &arguments) });
     }
     json!({ "need": browser_tools::need(tool, action, &arguments, session) })
 }
@@ -4748,7 +4775,7 @@ fn serve_act(params: &Value, brain: &Brain) -> Value {
     if caps::is_action(action) || scripts::is_meta(action) || scripts::is_script(action) {
         let caller = find_session(session).map(|stored| stored.cwd).filter(|cwd| !cwd.is_empty());
         let (ok, text, media) = if caps::is_action(action) {
-            caps::act(action, &arguments, caller.as_deref())
+            caps::act(action, &arguments, caller.as_deref(), session)
         } else {
             scripts::act(action, &arguments, caller.as_deref(), brain)
         };
@@ -4983,6 +5010,7 @@ fn serve_request(client: &str, method: &str, params: &Value) -> Reply {
         method if method.starts_with("plugins.") => plugins::request(method, params),
         method if method.starts_with("prompts.") => prompt_files::request(method, params),
         method if method.starts_with("storage.") => storage::handle(method, params),
+        method if method.starts_with("services.") => services::request(method, params),
         // 网关要搬文件存放位置：收好退出
         "serve.exit" => {
             SERVE_EXIT.store(true, Ordering::Relaxed);
@@ -5128,6 +5156,8 @@ fn serve() -> Result<(), String> {
     loops::start();
     plugins::start();
     prompt_files::start();
+    caps::IS_HUB.store(true, Ordering::Relaxed);
+    caps::start();
     {
         let token = token.clone();
         std::thread::spawn(move || {
@@ -9973,6 +10003,86 @@ mod scripts {
         names.iter().filter_map(|name| store[name].as_str().map(|value| (name.clone(), value.to_string()))).collect()
     }
 
+    /// 解释器（能力层的脚本提供方也用）
+    pub fn interpreter_of(language: &str) -> Option<PathBuf> {
+        interpreter(language)
+    }
+
+    /// 跑一个脚本（脚本提供方用）：按权限加沙盒、工作目录 work、标准输入 input、环境变量 environment。回 (退出码, 标准输出, 标准错误, 超时了没有)
+    pub fn execute(
+        language: &str,
+        entry: &Path,
+        work: &Path,
+        permission: &str,
+        input: &[u8],
+        environment: Vec<(String, String)>,
+        timeout: Duration,
+    ) -> Result<(i64, String, String, bool), String> {
+        let _ = std::fs::create_dir_all(work);
+        let interpreter = interpreter(language).ok_or_else(|| {
+            format!("找不到 {}，请先安装 {}", if language == "python" { "python3" } else { language }, title_of(language))
+        })?;
+        let wrapper = sandbox(permission, work);
+        let mut command = match wrapper.split_first() {
+            Some((program, rest)) => {
+                let mut command = Command::new(program);
+                command.args(rest).arg(&interpreter).arg(entry);
+                command
+            }
+            None => {
+                let mut command = Command::new(&interpreter);
+                command.arg(entry);
+                command
+            }
+        };
+        command.current_dir(work).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).envs(environment);
+        #[cfg(unix)]
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            command.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000);
+        }
+        let mut child = command.spawn().map_err(|error| format!("无法启动 {}：{error}", interpreter.display()))?;
+        let input = input.to_vec();
+        if let Some(mut stdin) = child.stdin.take() {
+            std::thread::spawn(move || {
+                let _ = stdin.write_all(&input);
+            });
+        }
+        let read = |pipe: Option<Box<dyn Read + Send>>| {
+            std::thread::spawn(move || {
+                let mut text = Vec::new();
+                if let Some(mut pipe) = pipe {
+                    let _ = pipe.read_to_end(&mut text);
+                }
+                String::from_utf8_lossy(&text).trim().to_string()
+            })
+        };
+        let stdout = read(child.stdout.take().map(|pipe| Box::new(pipe) as Box<dyn Read + Send>));
+        let stderr = read(child.stderr.take().map(|pipe| Box::new(pipe) as Box<dyn Read + Send>));
+        let started = Instant::now();
+        let (code, timed_out) = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break (status.code().map(i64::from).unwrap_or(-1), false),
+                Ok(None) if started.elapsed() >= timeout => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break (-1, true);
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(error) => return Err(error.to_string()),
+            }
+        };
+        Ok((code, stdout.join().unwrap_or_default(), stderr.join().unwrap_or_default(), timed_out))
+    }
+
     fn run(tool: &Value, arguments: &Value, caller: Option<&str>) -> Result<Run, String> {
         let manifest = &tool["manifest"];
         let language = manifest["language"].as_str().unwrap_or("python");
@@ -11562,7 +11672,7 @@ mod plugins {
     }
 
     /// 解开 zip（macOS、Windows 的 tar 认 zip；Linux 用 unzip，没有就用 python 的 zipfile）
-    fn unzip(archive: &Path, into: &Path) -> Result<(), String> {
+    pub fn unzip(archive: &Path, into: &Path) -> Result<(), String> {
         std::fs::create_dir_all(into).map_err(|error| error.to_string())?;
         let tar = if cfg!(windows) {
             PathBuf::from(std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into())).join("System32").join("tar.exe")
@@ -13694,12 +13804,14 @@ mod storage {
         let meta = std::fs::symlink_metadata(from).map_err(|_| format!("读不了 {}", native(from)))?;
         if meta.file_type().is_symlink() {
             if std::fs::symlink_metadata(to).is_err() {
-                let link = std::fs::read_link(from).map_err(|_| format!("读不了链接 {}", native(from)))?;
                 if let Some(parent) = to.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
                 #[cfg(unix)]
-                std::os::unix::fs::symlink(&link, to).map_err(|error| format!("建不了链接 {}：{error}", native(to)))?;
+                {
+                    let link = std::fs::read_link(from).map_err(|_| format!("读不了链接 {}", native(from)))?;
+                    std::os::unix::fs::symlink(&link, to).map_err(|error| format!("建不了链接 {}：{error}", native(to)))?;
+                }
                 #[cfg(windows)]
                 std::fs::copy(from, to).map(|_| ()).map_err(|error| format!("复制不了 {}：{error}", native(from)))?;
             }
@@ -13900,63 +14012,2698 @@ mod storage {
     }
 }
 
-mod caps {
-    //! 能力层（照 Friday 的 CapabilityRegistry + PowerBackend）：装好的本地能力是「本机」提供方（`power-<id>`）——本地语音能听录音、说话，
-    //! friday-diffusion 能生图、生视频。智能体看到的是固定的几个工具（transcribe_audio、speak、generate_image、generate_video、check_job），
-    //! 是常驻那份的动作；有提供方开着、这项没关的才给。生视频是异步任务（jobs.json），check_job 查进度、做完取回文件。
-    //! 设置 › 工具 › 能力提供方 看着这台时：列这些提供方、开关、关掉某一项、改名字（存在 ~/.edith/friday/capabilities.json）。
+mod services {
+    //! 在线服务（设置 › 服务与密钥，同 Friday 的 OnlineServices / ServiceInstaller / ModelListFetcher）：一个密钥对应一家服务，接入时
+    //! 它的对话模型进 EDITH 的 config.json（engines，Friday 的 EngineConfig 格式），看图 / 生图 / 听录音这些进常驻那份的能力提供方。
+    //! 服务目录同 Friday（客户端也有一份，这里只要认 id、密钥名、模型模板、提供方）；同一家接第二个账号是「目录 id#n」、密钥名 X_n；
+    //! 不在目录里的 OpenAI 兼容服务按密钥名（没有密钥按接口地址）认成「custom-…」。
+
+    use std::collections::HashSet;
+
+    use serde_json::{Map, Value, json};
+
+    #[derive(Clone, Debug)]
+    pub struct Service {
+        pub id: String,
+        pub title: String,
+        pub secret: Option<String>,
+        /// 对话模型的模板（Friday 的 EngineConfig；id 空）
+        pub engine: Option<Value>,
+        pub provider: Option<&'static str>,
+        pub options: Vec<(String, String)>,
+        pub custom: bool,
+        pub instance: u32,
+    }
+
+    impl Service {
+        fn base_id(&self) -> &str {
+            self.id.split('#').next().unwrap_or(&self.id)
+        }
+
+        /// 显示名能改：自定义服务，或重复添加、有对话模型的实例
+        fn renamable(&self) -> bool {
+            self.custom || (self.instance > 1 && self.engine.is_some())
+        }
+    }
+
+    /// 在线引擎模板：一律分档（effort）
+    fn engine(title: &str, base: &str, secret: &str, model: &str, vision: bool, tools: bool) -> Option<Value> {
+        Some(json!({ "id": "", "title": title, "baseURL": base, "apiKeySecret": secret, "model": model, "supportsVision": vision,
+            "supportsTools": tools, "sendsEnableThinking": false, "extraBody": "", "thinking": "effort" }))
+    }
+
+    /// 本机服务、自定义服务：不带 thinking（按地址推断）
+    fn plain_engine(title: &str, base: &str, secret: &str, model: &str, vision: bool) -> Value {
+        json!({ "id": "", "title": title, "baseURL": base, "apiKeySecret": secret, "model": model, "supportsVision": vision,
+            "supportsTools": true, "sendsEnableThinking": false, "extraBody": "" })
+    }
+
+    fn service(
+        id: &str,
+        title: &str,
+        secret: Option<&str>,
+        engine: Option<Value>,
+        provider: Option<&'static str>,
+        options: &[(&str, &str)],
+    ) -> Service {
+        Service {
+            id: id.into(),
+            title: title.into(),
+            secret: secret.map(str::to_string),
+            engine,
+            provider,
+            options: options.iter().map(|(key, value)| (key.to_string(), value.to_string())).collect(),
+            custom: false,
+            instance: 1,
+        }
+    }
+
+    /// 服务目录（顺序同 Friday：国内 → 国际 → 本机）
+    pub fn catalog() -> Vec<Service> {
+        let e = |title: &str, base: &str, secret: &str, model: &str, vision: bool, tools: bool| {
+            engine(title, base, secret, model, vision, tools)
+        };
+        vec![
+            service(
+                "dashscope",
+                "阿里云百炼",
+                Some("DASHSCOPE_API_KEY"),
+                e("通义千问", "https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1", "DASHSCOPE_API_KEY", "qwen-plus", false, true),
+                Some("dashscope"),
+                &[],
+            ),
+            service(
+                "ark",
+                "火山方舟",
+                Some("ARK_API_KEY"),
+                e("豆包", "https://ark.cn-beijing.volces.com/api/v3", "ARK_API_KEY", "doubao-seed-1-6-250615", true, true),
+                Some("volcengineArk"),
+                &[],
+            ),
+            service("volcspeech", "豆包语音", Some("VOLC_SPEECH_KEY"), None, Some("volcengineSpeech"), &[]),
+            service(
+                "deepseek",
+                "DeepSeek",
+                Some("DEEPSEEK_API_KEY"),
+                e("DeepSeek", "https://api.deepseek.com/v1", "DEEPSEEK_API_KEY", "deepseek-chat", false, true),
+                None,
+                &[],
+            ),
+            service(
+                "moonshot",
+                "Moonshot Kimi",
+                Some("MOONSHOT_API_KEY"),
+                e("Kimi", "https://api.moonshot.cn/v1", "MOONSHOT_API_KEY", "kimi-k2-0905-preview", false, true),
+                None,
+                &[],
+            ),
+            service(
+                "zhipu",
+                "智谱 AI",
+                Some("ZHIPU_API_KEY"),
+                e("智谱 GLM", "https://open.bigmodel.cn/api/paas/v4", "ZHIPU_API_KEY", "glm-4.5", false, true),
+                Some("openAICompatible"),
+                &[
+                    ("baseURL", "https://open.bigmodel.cn/api/paas/v4"),
+                    ("apiKeySecret", "ZHIPU_API_KEY"),
+                    ("visionModel", "glm-4.5v"),
+                    ("videoUnderstandingModel", "glm-4.5v"),
+                    ("imageModel", "cogview-4-250304"),
+                ],
+            ),
+            service(
+                "qianfan",
+                "百度千帆",
+                Some("QIANFAN_API_KEY"),
+                e("文心", "https://qianfan.baidubce.com/v2", "QIANFAN_API_KEY", "ernie-4.5-turbo-128k", false, true),
+                None,
+                &[],
+            ),
+            service(
+                "hunyuan",
+                "腾讯混元",
+                Some("HUNYUAN_API_KEY"),
+                e("混元", "https://api.hunyuan.cloud.tencent.com/v1", "HUNYUAN_API_KEY", "hunyuan-turbos-latest", false, true),
+                None,
+                &[],
+            ),
+            service(
+                "minimax",
+                "MiniMax",
+                Some("MINIMAX_API_KEY"),
+                e("MiniMax", "https://api.minimaxi.com/v1", "MINIMAX_API_KEY", "MiniMax-M1", false, true),
+                None,
+                &[],
+            ),
+            service(
+                "stepfun",
+                "阶跃星辰",
+                Some("STEPFUN_API_KEY"),
+                e("阶跃 Step", "https://api.stepfun.com/v1", "STEPFUN_API_KEY", "step-3", true, true),
+                None,
+                &[],
+            ),
+            service(
+                "yi",
+                "零一万物",
+                Some("YI_API_KEY"),
+                e("Yi", "https://api.lingyiwanwu.com/v1", "YI_API_KEY", "yi-lightning", false, true),
+                None,
+                &[],
+            ),
+            service(
+                "spark",
+                "讯飞星火",
+                Some("SPARK_API_KEY"),
+                e("星火", "https://spark-api-open.xf-yun.com/v1", "SPARK_API_KEY", "4.0Ultra", false, true),
+                None,
+                &[],
+            ),
+            service(
+                "baichuan",
+                "百川智能",
+                Some("BAICHUAN_API_KEY"),
+                e("百川", "https://api.baichuan-ai.com/v1", "BAICHUAN_API_KEY", "Baichuan4-Turbo", false, true),
+                None,
+                &[],
+            ),
+            service(
+                "siliconflow",
+                "硅基流动",
+                Some("SILICONFLOW_API_KEY"),
+                e("硅基流动", "https://api.siliconflow.cn/v1", "SILICONFLOW_API_KEY", "Qwen/Qwen3-235B-A22B-Instruct-2507", false, true),
+                Some("openAICompatible"),
+                &[
+                    ("baseURL", "https://api.siliconflow.cn/v1"),
+                    ("apiKeySecret", "SILICONFLOW_API_KEY"),
+                    ("visionModel", "Qwen/Qwen2.5-VL-72B-Instruct"),
+                    ("videoUnderstandingModel", "Qwen/Qwen2.5-VL-72B-Instruct"),
+                    ("imageModel", "Kwai-Kolors/Kolors"),
+                    ("transcriptionModel", "FunAudioLLM/SenseVoiceSmall"),
+                    ("speechModel", "FunAudioLLM/CosyVoice2-0.5B"),
+                    ("speechVoice", "FunAudioLLM/CosyVoice2-0.5B:anna"),
+                ],
+            ),
+            service(
+                "ppio",
+                "PPIO 派欧云",
+                Some("PPIO_API_KEY"),
+                e("PPIO", "https://api.ppinfra.com/v3/openai", "PPIO_API_KEY", "deepseek/deepseek-v3-0324", false, true),
+                None,
+                &[],
+            ),
+            service(
+                "openai",
+                "OpenAI",
+                Some("OPENAI_API_KEY"),
+                e("OpenAI", "https://api.openai.com/v1", "OPENAI_API_KEY", "gpt-4o-mini", true, true),
+                Some("openAICompatible"),
+                &[("baseURL", "https://api.openai.com/v1"), ("apiKeySecret", "OPENAI_API_KEY")],
+            ),
+            service(
+                "anthropic",
+                "Anthropic Claude",
+                Some("ANTHROPIC_API_KEY"),
+                e("Claude", "https://api.anthropic.com/v1", "ANTHROPIC_API_KEY", "claude-sonnet-5-5", true, true),
+                None,
+                &[],
+            ),
+            service(
+                "gemini",
+                "Google Gemini",
+                Some("GEMINI_API_KEY"),
+                e("Gemini", "https://generativelanguage.googleapis.com/v1beta/openai", "GEMINI_API_KEY", "gemini-2.5-flash", true, true),
+                Some("openAICompatible"),
+                &[
+                    ("baseURL", "https://generativelanguage.googleapis.com/v1beta/openai"),
+                    ("apiKeySecret", "GEMINI_API_KEY"),
+                    ("visionModel", "gemini-2.5-flash"),
+                    ("videoUnderstandingModel", "gemini-2.5-flash"),
+                    ("imageModel", "imagen-3.0-generate-002"),
+                ],
+            ),
+            service(
+                "xai",
+                "xAI Grok",
+                Some("XAI_API_KEY"),
+                e("Grok", "https://api.x.ai/v1", "XAI_API_KEY", "grok-4", true, true),
+                Some("openAICompatible"),
+                &[
+                    ("baseURL", "https://api.x.ai/v1"),
+                    ("apiKeySecret", "XAI_API_KEY"),
+                    ("visionModel", "grok-4"),
+                    ("videoUnderstandingModel", "grok-4"),
+                    ("imageModel", "grok-2-image"),
+                ],
+            ),
+            service(
+                "mistral",
+                "Mistral AI",
+                Some("MISTRAL_API_KEY"),
+                e("Mistral", "https://api.mistral.ai/v1", "MISTRAL_API_KEY", "mistral-large-latest", false, true),
+                Some("openAICompatible"),
+                &[
+                    ("baseURL", "https://api.mistral.ai/v1"),
+                    ("apiKeySecret", "MISTRAL_API_KEY"),
+                    ("visionModel", "pixtral-large-latest"),
+                    ("videoUnderstandingModel", "pixtral-large-latest"),
+                ],
+            ),
+            service(
+                "groq",
+                "Groq",
+                Some("GROQ_API_KEY"),
+                e("Groq", "https://api.groq.com/openai/v1", "GROQ_API_KEY", "llama-3.3-70b-versatile", false, true),
+                None,
+                &[],
+            ),
+            service(
+                "together",
+                "Together AI",
+                Some("TOGETHER_API_KEY"),
+                e("Together", "https://api.together.xyz/v1", "TOGETHER_API_KEY", "meta-llama/Llama-3.3-70B-Instruct-Turbo", false, true),
+                Some("openAICompatible"),
+                &[
+                    ("baseURL", "https://api.together.xyz/v1"),
+                    ("apiKeySecret", "TOGETHER_API_KEY"),
+                    ("visionModel", "meta-llama/Llama-3.2-90B-Vision-Instruct-Turbo"),
+                    ("videoUnderstandingModel", "meta-llama/Llama-3.2-90B-Vision-Instruct-Turbo"),
+                    ("imageModel", "black-forest-labs/FLUX.1-schnell"),
+                ],
+            ),
+            service(
+                "fireworks",
+                "Fireworks AI",
+                Some("FIREWORKS_API_KEY"),
+                e(
+                    "Fireworks",
+                    "https://api.fireworks.ai/inference/v1",
+                    "FIREWORKS_API_KEY",
+                    "accounts/fireworks/models/llama-v3p3-70b-instruct",
+                    false,
+                    true,
+                ),
+                None,
+                &[],
+            ),
+            service(
+                "perplexity",
+                "Perplexity",
+                Some("PERPLEXITY_API_KEY"),
+                e("Perplexity", "https://api.perplexity.ai", "PERPLEXITY_API_KEY", "sonar-pro", false, false),
+                None,
+                &[],
+            ),
+            service(
+                "cohere",
+                "Cohere",
+                Some("COHERE_API_KEY"),
+                e("Cohere", "https://api.cohere.ai/compatibility/v1", "COHERE_API_KEY", "command-a-03-2025", false, true),
+                None,
+                &[],
+            ),
+            service(
+                "openrouter",
+                "OpenRouter",
+                Some("OPENROUTER_API_KEY"),
+                e("OpenRouter", "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY", "openai/gpt-4o-mini", true, true),
+                None,
+                &[],
+            ),
+            service(
+                "huggingface",
+                "Hugging Face",
+                Some("HF_TOKEN"),
+                e("Hugging Face", "https://router.huggingface.co/v1", "HF_TOKEN", "meta-llama/Llama-3.3-70B-Instruct", false, true),
+                None,
+                &[],
+            ),
+            service(
+                "ollama",
+                "Ollama",
+                None,
+                Some(plain_engine("Ollama", "http://localhost:11434/v1", "none", "qwen3:8b", false)),
+                None,
+                &[],
+            ),
+            service(
+                "lmstudio",
+                "LM Studio",
+                None,
+                Some(plain_engine("LM Studio", "http://localhost:1234/v1", "none", "qwen/qwen3-8b", false)),
+                None,
+                &[],
+            ),
+        ]
+    }
+
+    /// 同一家的第 n 个（n ≥ 2）：密钥名 X_n、id「目录 id#n」，名称默认「名称 n」
+    fn instance(base: &Service, number: u32, title: &str) -> Option<Service> {
+        if base.custom || base.instance != 1 || number < 2 {
+            return None;
+        }
+        let secret = format!("{}_{number}", base.secret.as_ref()?);
+        let mut service = base.clone();
+        service.instance = number;
+        service.id = format!("{}#{number}", base.id);
+        service.secret = Some(secret.clone());
+        service.title = if title.trim().is_empty() { format!("{} {number}", base.title) } else { title.trim().to_string() };
+        if let Some(engine) = &mut service.engine {
+            engine["title"] = json!(service.title);
+            engine["apiKeySecret"] = json!(secret);
+        }
+        if service.provider.is_some() {
+            service.options.retain(|(key, _)| key != "apiKeySecret");
+            service.options.push(("apiKeySecret".into(), secret));
+        }
+        Some(service)
+    }
+
+    fn find_in_catalog(id: &str) -> Option<Service> {
+        let all = catalog();
+        if let Some(found) = all.iter().find(|service| service.id == id) {
+            return Some(found.clone());
+        }
+        let (base, number) = id.rsplit_once('#')?;
+        let number: u32 = number.parse().ok().filter(|number| *number >= 2)?;
+        let base = all.into_iter().find(|service| service.id == base)?;
+        instance(&base, number, "").filter(|found| found.id == id)
+    }
+
+    /// 按密钥名找：目录服务的，或它的实例 X_n
+    pub fn for_secret(name: &str) -> Option<Service> {
+        let all = catalog();
+        if let Some(found) = all.iter().find(|service| service.secret.as_deref() == Some(name)) {
+            return Some(found.clone());
+        }
+        let (base, number) = name.rsplit_once('_')?;
+        let number: u32 = number.parse().ok().filter(|number| *number >= 2)?;
+        let base = all.into_iter().find(|service| service.secret.as_deref() == Some(base))?;
+        instance(&base, number, "").filter(|found| found.secret.as_deref() == Some(name))
+    }
+
+    // MARK: 模型（EDITH 的 config.json engines）、密钥（secrets.json）
+
+    fn config() -> Value {
+        crate::read_json_file(&crate::config_path())
+    }
+
+    fn engine_list() -> Vec<Value> {
+        config()["engines"].as_array().cloned().unwrap_or_default().into_iter().filter(|engine| engine["id"].is_string()).collect()
+    }
+
+    fn save_engines(list: Vec<Value>) -> Result<(), String> {
+        let path = crate::config_path();
+        let mut config = crate::read_json_file(&path);
+        if !config.is_object() {
+            config = json!({});
+        }
+        if list.is_empty() {
+            config.as_object_mut().unwrap().remove("engines");
+        } else {
+            config["engines"] = json!(list);
+        }
+        crate::write_json_file(&path, &config).map_err(|(_, error)| error)
+    }
+
+    fn secret_of(engine: &Value) -> Option<String> {
+        engine["apiKeySecret"]
+            .as_str()
+            .map(str::trim)
+            .filter(|name| !name.is_empty() && !name.eq_ignore_ascii_case("none"))
+            .map(str::to_string)
+    }
+
+    fn secrets() -> Value {
+        crate::read_json_file(&crate::edith_home().join("secrets.json"))
+    }
+
+    fn secret_names() -> Vec<String> {
+        secrets().as_object().map(|all| all.keys().cloned().collect()).unwrap_or_default()
+    }
+
+    fn set_secret(name: &str, value: &str) -> Result<(), String> {
+        let path = crate::edith_home().join("secrets.json");
+        let mut all = crate::read_json_file(&path);
+        if !all.is_object() {
+            all = json!({});
+        }
+        all[name] = json!(value);
+        crate::write_json_file(&path, &all).map_err(|(_, error)| error)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
+    }
+
+    fn remove_secret(name: &str) -> Result<(), String> {
+        let path = crate::edith_home().join("secrets.json");
+        let mut all = crate::read_json_file(&path);
+        if let Some(object) = all.as_object_mut() {
+            object.remove(name);
+        }
+        crate::write_json_file(&path, &all).map_err(|(_, error)| error)
+    }
+
+    /// 密钥名：大写字母、数字、下划线，以字母开头
+    pub fn normalized_secret(name: &str) -> String {
+        name.trim().to_uppercase().replace(['-', ' ', '.'], "_")
+    }
+
+    fn valid_secret(name: &str) -> bool {
+        let mut chars = name.chars();
+        chars.next().is_some_and(|first| first.is_ascii_uppercase())
+            && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+    }
+
+    /// 由一个自定义引擎反推出它所属的「服务」：同密钥名（没有密钥按接口地址）的引擎都算这家的
+    fn custom(engine: &Value) -> Service {
+        let base = engine["baseURL"].as_str().unwrap_or("").to_string();
+        let key = secret_of(engine).unwrap_or_else(|| base.clone());
+        Service {
+            id: format!("custom-{key}"),
+            title: engine["title"].as_str().unwrap_or("").to_string(),
+            secret: secret_of(engine),
+            engine: Some(engine.clone()),
+            provider: Some("openAICompatible"),
+            options: vec![("baseURL".into(), base)],
+            custom: true,
+            instance: 1,
+        }
+    }
+
+    /// 这家服务已接入的全部模型（按密钥名；不需要密钥的按接口地址，目录里的再按显示名认）
+    pub fn engines_of(service: &Service, list: &[Value]) -> Vec<Value> {
+        let Some(template) = &service.engine else { return Vec::new() };
+        if let Some(secret) = &service.secret {
+            return list.iter().filter(|engine| secret_of(engine).as_deref() == Some(secret.as_str())).cloned().collect();
+        }
+        list.iter()
+            .filter(|engine| {
+                engine["baseURL"] == template["baseURL"]
+                    || (!service.custom && secret_of(engine).is_none() && engine["title"] == template["title"])
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// 实例：名称记在它的模型上
+    fn named(mut service: Service, list: &[Value]) -> Service {
+        if service.instance <= 1 || service.engine.is_none() {
+            return service;
+        }
+        if let Some(title) =
+            engines_of(&service, list).first().and_then(|engine| engine["title"].as_str()).filter(|title| !title.trim().is_empty())
+        {
+            service.title = title.to_string();
+            if let Some(engine) = &mut service.engine {
+                engine["title"] = json!(title);
+            }
+        }
+        service
+    }
+
+    fn instance_numbers(base: &Service, names: &[String]) -> Vec<u32> {
+        let Some(secret) = &base.secret else { return Vec::new() };
+        let prefix = format!("{secret}_");
+        let mut numbers: Vec<u32> = names
+            .iter()
+            .filter(|name| name.starts_with(&prefix))
+            .filter_map(|name| for_secret(name))
+            .filter(|found| found.instance > 1 && found.base_id() == base.id)
+            .map(|found| found.instance)
+            .collect();
+        numbers.sort();
+        numbers.dedup();
+        numbers
+    }
+
+    fn custom_services(list: &[Value]) -> Vec<Service> {
+        let catalog_ids: HashSet<String> = catalog()
+            .iter()
+            .flat_map(|service| engines_of(service, list))
+            .filter_map(|engine| engine["id"].as_str().map(str::to_string))
+            .collect();
+        let mut seen = HashSet::new();
+        let mut result = Vec::new();
+        for engine in list {
+            let id = engine["id"].as_str().unwrap_or("");
+            if catalog_ids.contains(id) || engine["baseURL"].as_str().is_some_and(|base| base.starts_with("power://")) {
+                continue;
+            }
+            if secret_of(engine).is_some_and(|name| for_secret(&name).is_some()) {
+                continue;
+            }
+            let service = custom(engine);
+            if seen.insert(service.id.clone()) {
+                result.push(service);
+            }
+        }
+        result
+    }
+
+    /// 按 id 找：目录服务、它的实例，或由已接入的自定义模型反推出的
+    pub fn resolve(id: &str) -> Option<Service> {
+        let list = engine_list();
+        if let Some(found) = find_in_catalog(id) {
+            return Some(named(found, &list));
+        }
+        custom_services(&list).into_iter().find(|service| service.id == id)
+    }
+
+    fn installed(service: &Service, names: &[String], list: &[Value]) -> bool {
+        match &service.secret {
+            Some(secret) => names.contains(secret),
+            None => !engines_of(service, list).is_empty(),
+        }
+    }
+
+    fn installed_services() -> Vec<Service> {
+        let (names, list) = (secret_names(), engine_list());
+        let mut result = Vec::new();
+        for service in catalog() {
+            if installed(&service, &names, &list) {
+                result.push(service.clone());
+            }
+            for number in instance_numbers(&service, &names) {
+                if let Some(found) = instance(&service, number, "") {
+                    result.push(named(found, &list));
+                }
+            }
+        }
+        result.extend(custom_services(&list));
+        result
+    }
+
+    // MARK: 能力提供方（常驻那份的）
+
+    /// 这家服务的提供方（类型 + 密钥名，自定义的再看接口地址）
+    fn provider_of(service: &Service) -> Option<Value> {
+        let kind = service.provider?;
+        let wanted: Vec<String> = service.secret.iter().cloned().collect();
+        crate::caps::all_entries().into_iter().find(|entry| {
+            entry["type"] == kind
+                && crate::caps::secret_names_of(entry) == wanted
+                && (!service.custom
+                    || service
+                        .options
+                        .iter()
+                        .any(|(key, value)| key == "baseURL" && entry["options"]["baseURL"].as_str().unwrap_or("") == value))
+        })
+    }
+
+    /// 这家服务开着：有模型看模型（有一个开着就算），只有提供方看提供方
+    fn enabled(service: &Service) -> bool {
+        let list = engines_of(service, &engine_list());
+        if !list.is_empty() {
+            return list.iter().any(|engine| engine["disabled"] != true);
+        }
+        provider_of(service).is_none_or(|entry| entry["enabled"].as_bool().unwrap_or(true))
+    }
+
+    /// 已接入、关着的服务（EnginesState.disabledServices）
+    pub fn disabled_services() -> Vec<String> {
+        installed_services().into_iter().filter(|service| !enabled(service)).map(|service| service.id).collect()
+    }
+
+    fn base_url(service: &Service) -> String {
+        engines_of(service, &engine_list())
+            .first()
+            .and_then(|engine| engine["baseURL"].as_str().map(str::to_string))
+            .or_else(|| service.engine.as_ref().and_then(|engine| engine["baseURL"].as_str().map(str::to_string)))
+            .unwrap_or_default()
+    }
+
+    fn new_engine(template: &Value, model: &str, base: &str, off: bool, title: Option<&str>) -> Value {
+        let mut engine = template.clone();
+        engine["id"] = json!(uuid::Uuid::new_v4().to_string().to_uppercase());
+        engine["model"] = json!(model);
+        engine["baseURL"] = json!(base);
+        if let Some(title) = title {
+            engine["title"] = json!(title);
+        }
+        if off {
+            engine["disabled"] = json!(true);
+        } else if let Some(object) = engine.as_object_mut() {
+            object.remove("disabled");
+        }
+        engine
+    }
+
+    /// 接入：勾的模型各建一个（没勾用模板的默认模型），再补齐能力提供方；已有的不重复建。这家关着时新建的也关着
+    fn install(service: &Service, models: &[String]) -> Result<(), String> {
+        if let Some(template) = &service.engine {
+            let mut list = engine_list();
+            let current = engines_of(service, &list);
+            let wanted: Vec<String> =
+                if models.is_empty() { vec![template["model"].as_str().unwrap_or("").to_string()] } else { models.to_vec() };
+            let existing: HashSet<String> = current.iter().filter_map(|engine| engine["model"].as_str().map(str::to_string)).collect();
+            let base = base_url(service);
+            let off = !current.is_empty() && current.iter().all(|engine| engine["disabled"] == true);
+            let title =
+                (service.instance > 1).then(|| current.first().and_then(|engine| engine["title"].as_str().map(str::to_string))).flatten();
+            for model in wanted.iter().filter(|model| !model.is_empty() && !existing.contains(*model)) {
+                list.push(new_engine(template, model, &base, off, title.as_deref()));
+            }
+            save_engines(list)?;
+        }
+        if let Some(kind) = service.provider
+            && provider_of(service).is_none()
+        {
+            let options: Map<String, Value> = service.options.iter().map(|(key, value)| (key.clone(), json!(value))).collect();
+            crate::caps::add_entry(kind, &service.title, options);
+        }
+        Ok(())
+    }
+
+    /// 改这家服务的模型集合：新勾的加，取消的删
+    fn set_models(service: &Service, models: &HashSet<String>) -> Result<(), String> {
+        let Some(template) = &service.engine else { return Ok(()) };
+        let list = engine_list();
+        let current = engines_of(service, &list);
+        let removed: HashSet<String> = current
+            .iter()
+            .filter(|engine| !engine["model"].as_str().is_some_and(|model| models.contains(model)))
+            .filter_map(|engine| engine["id"].as_str().map(str::to_string))
+            .collect();
+        let mut list: Vec<Value> =
+            list.into_iter().filter(|engine| !engine["id"].as_str().is_some_and(|id| removed.contains(id))).collect();
+        let existing: HashSet<String> = current.iter().filter_map(|engine| engine["model"].as_str().map(str::to_string)).collect();
+        let base = current
+            .first()
+            .and_then(|engine| engine["baseURL"].as_str().map(str::to_string))
+            .unwrap_or_else(|| template["baseURL"].as_str().unwrap_or("").to_string());
+        let off = !current.is_empty() && current.iter().all(|engine| engine["disabled"] == true);
+        let title =
+            (service.instance > 1).then(|| current.first().and_then(|engine| engine["title"].as_str().map(str::to_string))).flatten();
+        let mut sorted: Vec<&String> = models.iter().collect();
+        sorted.sort();
+        for model in sorted.into_iter().filter(|model| !existing.contains(*model)) {
+            list.push(new_engine(template, model, &base, off, title.as_deref()));
+        }
+        save_engines(list)
+    }
+
+    /// 服务级设置（显示名、接口地址、密钥名）：这家的模型一起改，跟着它的能力提供方也改
+    fn apply(service: &Service, title: &str, base: &str, secret: &str) -> Result<(), String> {
+        let found = provider_of(service);
+        let list = engine_list();
+        let current = engines_of(service, &list);
+        let old_urls: HashSet<String> = current.iter().filter_map(|engine| engine["baseURL"].as_str().map(str::to_string)).collect();
+        let title = if service.renamable() {
+            if title.trim().is_empty() { service.title.clone() } else { title.trim().to_string() }
+        } else {
+            service.engine.as_ref().and_then(|engine| engine["title"].as_str().map(str::to_string)).unwrap_or_else(|| title.to_string())
+        };
+        let secret = normalized_secret(secret);
+        let ids: HashSet<String> = current.iter().filter_map(|engine| engine["id"].as_str().map(str::to_string)).collect();
+        let list: Vec<Value> = list
+            .into_iter()
+            .map(|mut engine| {
+                if engine["id"].as_str().is_some_and(|id| ids.contains(id)) {
+                    engine["title"] = json!(title);
+                    if !base.trim().is_empty() {
+                        engine["baseURL"] = json!(base.trim());
+                    }
+                    if service.custom {
+                        engine["apiKeySecret"] = json!(if secret.is_empty() { "none".to_string() } else { secret.clone() });
+                    }
+                }
+                engine
+            })
+            .collect();
+        save_engines(list)?;
+        let Some(entry) = found else { return Ok(()) };
+        let id = entry["id"].as_str().unwrap_or("").to_string();
+        let (base, rename, custom, entry_title, service_title) = (
+            base.trim().to_string(),
+            service.renamable(),
+            service.custom,
+            entry["title"].as_str().unwrap_or("").to_string(),
+            service.title.clone(),
+        );
+        crate::caps::change_entry(&id, |entry| {
+            if let Some(url) = entry["options"]["baseURL"].as_str().map(str::to_string)
+                && old_urls.contains(&url)
+                && url != base
+                && !base.is_empty()
+            {
+                entry["options"]["baseURL"] = json!(base);
+            }
+            if rename && entry_title == service_title && entry_title != title {
+                entry["title"] = json!(title);
+            }
+            if custom {
+                entry["options"]["apiKeySecret"] = json!(if secret.is_empty() { "none".to_string() } else { secret.clone() });
+            }
+        });
+        Ok(())
+    }
+
+    /// 密钥库里新加了一个密钥：是已知服务（或它的实例）就自动接入（默认模型）；已经有模型的只补能力提供方
+    pub fn install_if_known(secret: &str) {
+        let Some(found) = for_secret(secret) else { return };
+        let mut service = named(found, &engine_list());
+        if !engines_of(&service, &engine_list()).is_empty() {
+            service.engine = None;
+        }
+        let _ = install(&service, &[]);
+    }
+
+    fn strings(value: &Value) -> Vec<String> {
+        value.as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect()
+    }
+
+    fn set_enabled(service: &Service, on: bool) -> Result<(), String> {
+        let ids: HashSet<String> =
+            engines_of(service, &engine_list()).iter().filter_map(|engine| engine["id"].as_str().map(str::to_string)).collect();
+        let list: Vec<Value> = engine_list()
+            .into_iter()
+            .map(|mut engine| {
+                if engine["id"].as_str().is_some_and(|id| ids.contains(id)) {
+                    if on {
+                        if let Some(object) = engine.as_object_mut() {
+                            object.remove("disabled");
+                        }
+                    } else {
+                        engine["disabled"] = json!(true);
+                    }
+                }
+                engine
+            })
+            .collect();
+        save_engines(list)?;
+        if let Some(entry) = provider_of(service) {
+            let id = entry["id"].as_str().unwrap_or("").to_string();
+            crate::caps::change_entry(&id, |entry| entry["enabled"] = json!(on));
+        }
+        Ok(())
+    }
+
+    /// 拉 OpenAI 兼容接口的模型列表（GET {baseURL}/models）：自然排序、去重
+    pub fn fetch_models(base: &str, key: Option<&str>) -> Result<Vec<String>, String> {
+        let url = crate::capnet::endpoint(base, "models").map_err(|error| error.message)?;
+        let mut headers = crate::capnet::bearer(key);
+        headers.push(("Accept".into(), "application/json".into()));
+        let response = crate::capnet::send("GET", &url, &headers, None, 30).map_err(|error| error.message)?;
+        if !response.ok() {
+            return Err(crate::capnet::Error::http(response.status, &response.text(600)).message);
+        }
+        let document = response.json();
+        if document.is_null() {
+            return Err("响应格式不符合预期：返回的不是 JSON".into());
+        }
+        let items: Vec<Value> = if document.is_array() {
+            document.as_array().cloned().unwrap_or_default()
+        } else {
+            document["data"].as_array().or_else(|| document["models"].as_array()).cloned().unwrap_or_default()
+        };
+        let mut ids: Vec<String> = items
+            .iter()
+            .filter_map(|item| ["id", "name", "model"].iter().find_map(|key| item[*key].as_str()).map(str::to_string))
+            .collect();
+        if ids.is_empty() {
+            return Err("响应格式不符合预期：返回里没有模型列表，这个接口可能不支持 /models，请手动填模型名".into());
+        }
+        ids.sort_by(|a, b| natural(a, b));
+        ids.dedup();
+        Ok(ids)
+    }
+
+    /// 不分大小写、数字按数值比（Finder 的排序）
+    fn natural(a: &str, b: &str) -> std::cmp::Ordering {
+        let split = |text: &str| -> Vec<(bool, String)> {
+            let mut parts: Vec<(bool, String)> = Vec::new();
+            for c in text.to_lowercase().chars() {
+                let digit = c.is_ascii_digit();
+                match parts.last_mut() {
+                    Some((kind, part)) if *kind == digit => part.push(c),
+                    _ => parts.push((digit, c.to_string())),
+                }
+            }
+            parts
+        };
+        let (left, right) = (split(a), split(b));
+        for (x, y) in left.iter().zip(right.iter()) {
+            let order = if x.0 && y.0 {
+                x.1.trim_start_matches('0').len().cmp(&y.1.trim_start_matches('0').len()).then(x.1.cmp(&y.1))
+            } else {
+                x.1.cmp(&y.1)
+            };
+            if order != std::cmp::Ordering::Equal {
+                return order;
+            }
+        }
+        left.len().cmp(&right.len()).then(a.cmp(b))
+    }
+
+    /// services.*（设置 › 服务与密钥看着这台时；在常驻那份里跑：能力提供方在它那里）
+    pub fn request(method: &str, params: &Value) -> crate::Reply {
+        let text = |key: &str| params[key].as_str().unwrap_or("").to_string();
+        let service = || {
+            let id = text("id");
+            resolve(&id).ok_or((crate::NOT_FOUND, format!("这台机器上没有这家服务：{id}")))
+        };
+        match method {
+            "services.install" => {
+                let service = service()?;
+                if let Some(secret) = &service.secret {
+                    let value = text("secret").trim().to_string();
+                    if value.is_empty() {
+                        return Ok(json!({}));
+                    }
+                    set_secret(secret, &value).map_err(|error| (crate::NOT_ALLOWED, error))?;
+                    install_if_known(secret);
+                }
+                let mut models = strings(&params["models"]);
+                models.sort();
+                install(&service, &models).map_err(|error| (crate::NOT_ALLOWED, error))?;
+                if !models.is_empty() {
+                    set_models(&service, &models.iter().cloned().collect()).map_err(|error| (crate::NOT_ALLOWED, error))?;
+                }
+                if let Some(template) = &service.engine {
+                    let url = text("baseURL");
+                    let base =
+                        if url.trim().is_empty() { template["baseURL"].as_str().unwrap_or("").to_string() } else { url.trim().to_string() };
+                    let current = engines_of(&service, &engine_list());
+                    let title = if service.renamable() && !text("title").trim().is_empty() {
+                        text("title")
+                    } else {
+                        current.first().and_then(|engine| engine["title"].as_str().map(str::to_string)).unwrap_or(service.title.clone())
+                    };
+                    let secret = if service.custom {
+                        current.first().and_then(secret_of).unwrap_or_default()
+                    } else {
+                        service.secret.clone().unwrap_or_default()
+                    };
+                    apply(&service, &title, &base, &secret).map_err(|error| (crate::NOT_ALLOWED, error))?;
+                }
+                Ok(json!({}))
+            }
+            "services.apply" => {
+                let service = service()?;
+                let secret = normalized_secret(&text("secretName"));
+                if !secret.is_empty() && !valid_secret(&secret) {
+                    return Ok(json!({ "error": "密钥名只能用大写字母、数字、下划线，且以字母开头" }));
+                }
+                let value = text("secretValue").trim().to_string();
+                let target = if service.custom { secret.clone() } else { service.secret.clone().unwrap_or_default() };
+                if !value.is_empty() && !target.is_empty() {
+                    set_secret(&target, &value).map_err(|error| (crate::NOT_ALLOWED, error))?;
+                    install_if_known(&target);
+                }
+                if service.engine.is_some() {
+                    set_models(&service, &strings(&params["models"]).into_iter().collect()).map_err(|error| (crate::NOT_ALLOWED, error))?;
+                }
+                apply(&service, &text("title"), &text("baseURL"), &secret).map_err(|error| (crate::NOT_ALLOWED, error))?;
+                Ok(json!({ "error": "" }))
+            }
+            "services.uninstall" => {
+                let service = service()?;
+                let list = engine_list();
+                if !installed(&service, &secret_names(), &list) && engines_of(&service, &list).is_empty() {
+                    return Err((crate::NOT_FOUND, format!("这台机器上没有接入这家服务：{}", service.id)));
+                }
+                let ids: HashSet<String> =
+                    engines_of(&service, &list).iter().filter_map(|engine| engine["id"].as_str().map(str::to_string)).collect();
+                save_engines(list.into_iter().filter(|engine| !engine["id"].as_str().is_some_and(|id| ids.contains(id))).collect())
+                    .map_err(|error| (crate::NOT_ALLOWED, error))?;
+                if let Some(entry) = provider_of(&service) {
+                    crate::caps::remove_entry(entry["id"].as_str().unwrap_or(""));
+                }
+                if let Some(secret) = &service.secret {
+                    remove_secret(secret).map_err(|error| (crate::NOT_ALLOWED, error))?;
+                }
+                Ok(json!({}))
+            }
+            "services.installCustom" => {
+                let secret = normalized_secret(&text("secretName"));
+                let key = text("key").trim().to_string();
+                if !secret.is_empty() && !valid_secret(&secret) {
+                    return Err((-32602, "密钥名只能用大写字母、数字、下划线，且以字母开头".into()));
+                }
+                let (title, base) = (text("title").trim().to_string(), text("baseURL").trim().to_string());
+                if title.is_empty() || base.is_empty() {
+                    return Err((-32602, "缺少参数 title / baseURL".into()));
+                }
+                let mut models = strings(&params["models"]);
+                models.sort();
+                if !secret.is_empty() && !key.is_empty() {
+                    set_secret(&secret, &key).map_err(|error| (crate::NOT_ALLOWED, error))?;
+                }
+                let vision = params["supportsVision"].as_bool().unwrap_or(false);
+                let mut list = engine_list();
+                for model in &models {
+                    let mut engine = plain_engine(&title, &base, if secret.is_empty() { "none" } else { &secret }, model, vision);
+                    engine["id"] = json!(uuid::Uuid::new_v4().to_string().to_uppercase());
+                    list.push(engine);
+                }
+                save_engines(list).map_err(|error| (crate::NOT_ALLOWED, error))?;
+                if vision && let Some(first) = models.first() {
+                    let options: Map<String, Value> = [
+                        ("baseURL", base.clone()),
+                        ("apiKeySecret", if secret.is_empty() { "none".to_string() } else { secret.clone() }),
+                        ("visionModel", first.clone()),
+                        ("videoUnderstandingModel", first.clone()),
+                    ]
+                    .into_iter()
+                    .map(|(key, value)| (key.to_string(), json!(value)))
+                    .collect();
+                    crate::caps::add_entry("openAICompatible", &title, options);
+                }
+                Ok(json!({}))
+            }
+            "services.setEnabled" => {
+                let service = service()?;
+                set_enabled(&service, params["enabled"].as_bool().unwrap_or(true)).map_err(|error| (crate::NOT_ALLOWED, error))?;
+                Ok(json!({}))
+            }
+            "services.installIfKnown" => {
+                install_if_known(&text("name"));
+                Ok(json!({}))
+            }
+            "services.fetchModels" => {
+                // 在这台上拉（用这台的密钥、这台能连到的地址，比如局域网里的 Ollama）
+                let base = text("baseURL");
+                let key = if !text("apiKey").is_empty() {
+                    Some(text("apiKey"))
+                } else {
+                    secrets()[text("secretName")].as_str().map(str::to_string)
+                };
+                let models = fetch_models(&base, key.as_deref()).map_err(|error| (-32603, error))?;
+                Ok(json!({ "models": models }))
+            }
+            "services.usage" => Ok(crate::usage::request(params)),
+            other => Err((-32601, format!("没有这个方法：{other}"))),
+        }
+    }
+}
+
+mod usage {
+    //! 在线服务的余额和套餐用量（设置 › 服务与密钥 每家服务下面那几行，同 Friday 的 ServiceUsage）：用密钥就能查的接口，按接口地址认——
+    //! DeepSeek /user/balance、Kimi /v1/users/me/balance、Kimi Code 套餐 /coding/v1/usages、硅基流动 /v1/user/info、OpenRouter /api/v1/key、
+    //! 智谱 / Z.ai Coding 套餐 /api/monitor/usage/quota/limit、MiniMax Token Plan、自定义服务（one-api / new-api 中转）的 billing 接口。
+    //! 对话请求里顺手记的限流余量（observed）在大脑那边，这里给空的。
+
+    use serde_json::{Value, json};
+
+    #[derive(PartialEq)]
+    enum Kind {
+        None,
+        DeepSeek,
+        Moonshot,
+        KimiCode,
+        SiliconFlow,
+        OpenRouter,
+        Zhipu,
+        MiniMax,
+        Relay,
+    }
+
+    fn parts(base: &str) -> (String, String, String) {
+        let trimmed = base.trim();
+        let (scheme, rest) = trimmed.split_once("://").unwrap_or(("", trimmed));
+        let (host, path) = rest.split_once('/').map(|(host, path)| (host, format!("/{path}"))).unwrap_or((rest, String::new()));
+        let host = host.rsplit('@').next().unwrap_or(host).split(':').next().unwrap_or("").to_lowercase();
+        (scheme.to_lowercase(), host, path.to_lowercase())
+    }
+
+    fn local_host(host: &str) -> bool {
+        host == "localhost"
+            || host.ends_with(".local")
+            || host.starts_with("127.")
+            || host.starts_with("10.")
+            || host.starts_with("192.168.")
+            || host == "::1"
+            || host
+                .split('.')
+                .nth(1)
+                .and_then(|second| second.parse::<u8>().ok())
+                .is_some_and(|second| host.starts_with("172.") && (16..=31).contains(&second))
+    }
+
+    fn kind_for(base: &str, custom: bool) -> Kind {
+        let (scheme, host, path) = parts(base);
+        match host.as_str() {
+            "api.deepseek.com" => Kind::DeepSeek,
+            "api.moonshot.cn" | "api.moonshot.ai" => Kind::Moonshot,
+            "api.kimi.com" if path.starts_with("/coding") => Kind::KimiCode,
+            "api.siliconflow.cn" | "api.siliconflow.com" => Kind::SiliconFlow,
+            "openrouter.ai" => Kind::OpenRouter,
+            "open.bigmodel.cn" | "api.z.ai" if path.contains("/coding") => Kind::Zhipu,
+            "api.minimaxi.com" | "api.minimax.io" | "api.minimax.chat" => Kind::MiniMax,
+            _ if custom && !host.is_empty() && (scheme == "https" || scheme == "http") && !local_host(&host) => Kind::Relay,
+            _ => Kind::None,
+        }
+    }
+
+    pub fn can_query(base: &str, custom: bool) -> bool {
+        kind_for(base, custom) != Kind::None
+    }
+
+    /// 数字或数字字符串
+    fn number(value: &Value) -> Option<f64> {
+        match value {
+            Value::Number(number) => number.as_f64(),
+            Value::String(text) => text.trim().parse().ok(),
+            _ => None,
+        }
+    }
+
+    /// ISO 8601 或 Unix 时间戳（秒 / 毫秒）→ ISO 8601（UTC，秒）
+    fn date(value: &Value) -> Option<String> {
+        if let Some(stamp) = number(value).filter(|stamp| *stamp > 1e9) {
+            let ms = if stamp > 1e12 { stamp as i64 } else { (stamp * 1000.0) as i64 };
+            return chrono::DateTime::from_timestamp_millis(ms).map(|time| time.format("%Y-%m-%dT%H:%M:%SZ").to_string());
+        }
+        let text = value.as_str()?.trim();
+        chrono::DateTime::parse_from_rfc3339(text)
+            .ok()
+            .map(|time| time.with_timezone(&chrono::Utc).format("%Y-%m-%dT%H:%M:%SZ").to_string())
+    }
+
+    fn get(url: &str, headers: Vec<(String, String)>) -> Result<Value, String> {
+        let mut headers = headers;
+        headers.push(("Accept".into(), "application/json".into()));
+        let response = crate::capnet::send("GET", url, &headers, None, 20).map_err(|error| error.message)?;
+        if !response.ok() {
+            return Err(crate::capnet::Error::http(response.status, &response.text(300)).message);
+        }
+        match response.json() {
+            value @ (Value::Object(_) | Value::Array(_)) => Ok(value),
+            _ => Err("响应格式不符合预期：返回的不是 JSON".into()),
+        }
+    }
+
+    fn bearer(key: &str) -> Vec<(String, String)> {
+        vec![("Authorization".into(), format!("Bearer {}", key.trim()))]
+    }
+
+    /// 业务上的失败（HTTP 200 但 status / success 是 false）
+    fn check_envelope(object: &Value) -> Result<(), String> {
+        if object["status"] == false || object["success"] == false {
+            let message = object["message"].as_str().or_else(|| object["msg"].as_str()).unwrap_or("服务没查到");
+            return Err(message.to_string());
+        }
+        Ok(())
+    }
+
+    /// 窗口长度 → 标题：「5 小时」「每周」「每月」「30 分钟」
+    fn span_title(seconds: f64) -> String {
+        let plural = |n: f64, one: &str, unit: &str| if n == 1.0 { one.to_string() } else { format!("{} {unit}", trim_number(n)) };
+        if seconds <= 0.0 {
+            String::new()
+        } else if seconds % (7.0 * 86400.0) == 0.0 {
+            plural(seconds / (7.0 * 86400.0), "每周", "周")
+        } else if seconds % 86400.0 == 0.0 {
+            plural(seconds / 86400.0, "每天", "天")
+        } else if seconds % 3600.0 == 0.0 {
+            plural(seconds / 3600.0, "每小时", "小时")
+        } else {
+            format!("{} 分钟", (seconds / 60.0).round())
+        }
+    }
+
+    fn trim_number(value: f64) -> String {
+        if value.fract() == 0.0 { format!("{}", value as i64) } else { value.to_string() }
+    }
+
+    /// 下一个 UTC 零点 / 周一零点 / 月初
+    fn next_utc(period: &str) -> String {
+        use chrono::Datelike;
+        let today = chrono::Utc::now().date_naive();
+        let next = match period {
+            "weekly" => today + chrono::Duration::days(8 - today.weekday().number_from_monday() as i64),
+            "monthly" => {
+                let (year, month) = if today.month() == 12 { (today.year() + 1, 1) } else { (today.year(), today.month() + 1) };
+                chrono::NaiveDate::from_ymd_opt(year, month, 1).unwrap_or(today)
+            }
+            _ => today + chrono::Duration::days(1),
+        };
+        format!("{}T00:00:00Z", next.format("%Y-%m-%d"))
+    }
+
+    fn window(title: &str) -> Value {
+        json!({ "title": title })
+    }
+
+    fn set(target: &mut Value, key: &str, value: Option<f64>) {
+        if let Some(value) = value {
+            target[key] = json!(value);
+        }
+    }
+
+    fn report() -> Value {
+        json!({ "balances": [], "windows": [], "freeTier": false })
+    }
+
+    fn deepseek(object: &Value) -> Value {
+        let mut out = report();
+        let balances: Vec<Value> = object["balance_infos"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|info| {
+                let mut balance =
+                    json!({ "amount": number(&info["total_balance"]).unwrap_or(0.0), "currency": info["currency"].as_str().unwrap_or("") });
+                set(&mut balance, "granted", number(&info["granted_balance"]));
+                balance
+            })
+            .collect();
+        out["balances"] = json!(balances);
+        if let Some(available) = object["is_available"].as_bool() {
+            out["available"] = json!(available);
+        }
+        out
+    }
+
+    fn moonshot(object: &Value, currency: &str) -> Value {
+        let mut out = report();
+        let data = &object["data"];
+        let Some(available) = number(&data["available_balance"]) else { return out };
+        let mut balance = json!({ "amount": available, "currency": currency });
+        set(&mut balance, "granted", number(&data["voucher_balance"]));
+        if let Some(cash) = number(&data["cash_balance"]).filter(|cash| *cash < 0.0) {
+            balance["owed"] = json!(-cash);
+        }
+        out["balances"] = json!([balance]);
+        out["available"] = json!(available > 0.0);
+        out
+    }
+
+    fn kimi_code(object: &Value) -> Value {
+        let mut out = report();
+        let make = |title: &str, detail: &Value| {
+            let mut value = window(title);
+            let (limit, used) = (number(&detail["limit"]), number(&detail["used"]));
+            set(&mut value, "limit", limit);
+            set(&mut value, "used", used);
+            let remaining = number(&detail["remaining"]).or_else(|| limit.zip(used).map(|(limit, used)| (limit - used).max(0.0)));
+            set(&mut value, "remaining", remaining);
+            if let Some(reset) = date(&detail["resetTime"]) {
+                value["resetAt"] = json!(reset);
+            }
+            value
+        };
+        let mut windows = Vec::new();
+        if object["usage"].as_object().is_some_and(|usage| !usage.is_empty()) {
+            windows.push(make("每周", &object["usage"]));
+        }
+        for entry in object["limits"].as_array().into_iter().flatten() {
+            let span = &entry["window"];
+            let unit = span["timeUnit"].as_str().unwrap_or("");
+            let factor = if unit.contains("DAY") {
+                86400.0
+            } else if unit.contains("HOUR") {
+                3600.0
+            } else {
+                60.0
+            };
+            let title = span_title(number(&span["duration"]).unwrap_or(0.0) * factor);
+            windows.push(make(if title.is_empty() { "窗口" } else { &title }, &entry["detail"]));
+        }
+        // 短的窗口在前
+        windows.sort_by_key(|window| window["title"] == "每周");
+        out["windows"] = json!(windows);
+        let mut level = object["user"]["membership"]["level"].as_str().unwrap_or("").to_string();
+        if let Some(rest) = level.strip_prefix("LEVEL_") {
+            level = rest.to_lowercase();
+        }
+        if !level.is_empty() {
+            out["plan"] = json!(level);
+        }
+        out
+    }
+
+    fn silicon_flow(object: &Value, currency: &str) -> Value {
+        let mut out = report();
+        let data = &object["data"];
+        if let Some(total) = number(&data["totalBalance"]) {
+            let mut balance = json!({ "amount": total, "currency": currency });
+            set(&mut balance, "granted", number(&data["balance"]));
+            out["balances"] = json!([balance]);
+        }
+        out
+    }
+
+    fn open_router(object: &Value) -> Value {
+        let mut out = report();
+        let data = &object["data"];
+        let mut windows = Vec::new();
+        if let Some(limit) = number(&data["limit"]) {
+            let mut value = window("密钥额度");
+            value["limit"] = json!(limit);
+            set(&mut value, "remaining", number(&data["limit_remaining"]));
+            value["unit"] = json!("$");
+            if let Some(reset) = data["limit_reset"].as_str().filter(|reset| ["daily", "weekly", "monthly"].contains(reset)) {
+                value["resetAt"] = json!(next_utc(reset));
+            }
+            windows.push(value);
+        }
+        set(&mut out, "spent", number(&data["usage"]));
+        set(&mut out, "spentThisMonth", number(&data["usage_monthly"]));
+        let free = data["is_free_tier"] == true;
+        out["freeTier"] = json!(free);
+        if free {
+            let daily = &data["free_model_daily_requests"];
+            if let Some(limit) = number(&daily["limit"]).filter(|limit| *limit > 0.0) {
+                let mut value = window("今天的免费模型");
+                value["limit"] = json!(limit);
+                set(&mut value, "used", number(&daily["used"]));
+                set(&mut value, "remaining", number(&daily["remaining"]));
+                value["unit"] = json!("次");
+                value["resetAt"] = json!(next_utc("daily"));
+                windows.push(value);
+            }
+        }
+        out["windows"] = json!(windows);
+        out
+    }
+
+    fn zhipu(document: &Value) -> Value {
+        let mut out = report();
+        let items: Vec<Value> = if let Some(items) = document.as_array() {
+            items.clone()
+        } else if let Some(items) = document["data"].as_array() {
+            items.clone()
+        } else {
+            if let Some(level) = document["data"]["level"].as_str().filter(|level| !level.is_empty()) {
+                out["plan"] = json!(level);
+            }
+            let limits = document["data"]["limits"].as_array().cloned().unwrap_or_default();
+            if limits.is_empty() { document["limits"].as_array().cloned().unwrap_or_default() } else { limits }
+        };
+        let span = |unit: i64, count: f64| match unit {
+            3 => span_title(count * 3600.0),
+            4 => span_title(count * 86400.0),
+            5 => {
+                if count == 1.0 {
+                    "每月".to_string()
+                } else {
+                    format!("{} 个月", trim_number(count))
+                }
+            }
+            6 => span_title(count * 7.0 * 86400.0),
+            _ => String::new(),
+        };
+        let (mut tokens, mut tools) = (Vec::new(), Vec::new());
+        for entry in items {
+            let period = span(entry["unit"].as_i64().unwrap_or(0), number(&entry["number"]).unwrap_or(1.0));
+            let mut value = json!({});
+            set(&mut value, "limit", number(&entry["usage"]));
+            set(&mut value, "used", number(&entry["currentValue"]));
+            set(&mut value, "remaining", number(&entry["remaining"]));
+            if let Some(percentage) = number(&entry["percentage"]) {
+                value["remainingPercent"] = json!((100.0 - percentage).clamp(0.0, 100.0));
+            }
+            if let Some(reset) = date(&entry["nextResetTime"]) {
+                value["resetAt"] = json!(reset);
+            }
+            if entry["type"] == "TIME_LIMIT" {
+                value["title"] = json!(if period.is_empty() { "工具调用".to_string() } else { format!("工具调用（{period}）") });
+                value["unit"] = json!("次");
+                tools.push(value);
+            } else {
+                value["title"] = json!(if period.is_empty() { "额度".to_string() } else { period });
+                tokens.push(value);
+            }
+        }
+        tokens.extend(tools);
+        out["windows"] = json!(tokens);
+        out
+    }
+
+    fn relay(subscription: &Value, used: &Value) -> Option<Value> {
+        let (limit, used) = (number(&subscription["hard_limit_usd"])?, number(&used["total_usage"])?);
+        let mut out = report();
+        out["balances"] = json!([{ "amount": limit - used / 100.0, "currency": "USD" }]);
+        Some(out)
+    }
+
+    fn minimax(object: &Value, plan_key: bool) -> Result<Option<Value>, String> {
+        let code = object["base_resp"]["status_code"].as_i64().unwrap_or(0);
+        if code != 0 {
+            let message = object["base_resp"]["status_msg"].as_str().unwrap_or("").to_string();
+            if !plan_key {
+                return Ok(None);
+            }
+            if code == 2062 {
+                let mut out = report();
+                out["subscription"] = json!(true);
+                out["warnings"] =
+                    json!([format!("没有生效中的套餐（MiniMax：{}）", if message.is_empty() { code.to_string() } else { message })]);
+                return Ok(Some(out));
+            }
+            return Err(if message.is_empty() { format!("MiniMax 错误 {code}") } else { message });
+        }
+        let label = |model: &str| {
+            let name = model.to_lowercase();
+            if name.is_empty() || name == "general" || name.starts_with("minimax") || name.starts_with("abab") {
+                String::new()
+            } else if name.contains("video") || name.contains("hailuo") {
+                "视频".into()
+            } else if name.contains("speech") || name.contains("tts") || name.contains("audio") {
+                "语音".into()
+            } else if name.contains("image") {
+                "生图".into()
+            } else if name.contains("music") {
+                "音乐".into()
+            } else {
+                model.to_string()
+            }
+        };
+        let titled = |prefix: &str, span: String| if prefix.is_empty() { span } else { format!("{prefix}（{span}）") };
+        let span = |start: &Value, end: &Value, fallback: &str| {
+            let title = match (number(start), number(end)) {
+                (Some(from), Some(to)) if to > from => span_title(((to - from) / 1000.0).round()),
+                _ => String::new(),
+            };
+            if title.is_empty() { fallback.to_string() } else { title }
+        };
+        let mut windows = Vec::new();
+        for entry in object["model_remains"].as_array().into_iter().flatten() {
+            let prefix = label(entry["model_name"].as_str().unwrap_or(""));
+            let mut interval = window(&titled(&prefix, span(&entry["start_time"], &entry["end_time"], "5 小时")));
+            if let Some(reset) = date(&entry["end_time"]) {
+                interval["resetAt"] = json!(reset);
+            }
+            if let Some(percent) = number(&entry["current_interval_remaining_percent"]) {
+                interval["remainingPercent"] = json!(percent.clamp(0.0, 100.0));
+                windows.push(interval);
+            } else if let Some(total) = number(&entry["current_interval_total_count"]).filter(|total| *total > 0.0) {
+                interval["limit"] = json!(total);
+                interval["remaining"] = json!(number(&entry["current_interval_usage_count"]).unwrap_or(0.0).clamp(0.0, total));
+                interval["unit"] = json!("次");
+                windows.push(interval);
+            }
+            if let Some(weekly) = number(&entry["current_weekly_remaining_percent"]) {
+                let mut value = window(&titled(&prefix, span(&entry["weekly_start_time"], &entry["weekly_end_time"], "每周")));
+                value["remainingPercent"] = json!(weekly.clamp(0.0, 100.0));
+                if let Some(reset) = date(&entry["weekly_end_time"]) {
+                    value["resetAt"] = json!(reset);
+                }
+                windows.push(value);
+            }
+        }
+        if windows.is_empty() && !plan_key {
+            return Ok(None);
+        }
+        let mut out = report();
+        out["subscription"] = json!(true);
+        out["windows"] = json!(windows);
+        Ok(Some(out))
+    }
+
+    /// 查：不支持的地址、中转不认 billing 接口时 None
+    fn query(base: &str, key: &str, custom: bool) -> Result<Option<Value>, String> {
+        let kind = kind_for(base, custom);
+        if kind == Kind::None || key.trim().is_empty() {
+            return Ok(None);
+        }
+        let (_, host, _) = parts(base);
+        let origin = format!("https://{host}");
+        let currency = if host.ends_with(".cn") { "CNY" } else { "USD" };
+        let mut found = match kind {
+            Kind::None => None,
+            Kind::DeepSeek => Some(deepseek(&get(&format!("{origin}/user/balance"), bearer(key))?)),
+            Kind::Moonshot => {
+                let object = get(&format!("{origin}/v1/users/me/balance"), bearer(key))?;
+                check_envelope(&object)?;
+                Some(moonshot(&object, currency))
+            }
+            Kind::KimiCode => {
+                let mut headers = bearer(key);
+                headers.push(("User-Agent".into(), "KimiCLI/1.6".into()));
+                Some(kimi_code(&get("https://api.kimi.com/coding/v1/usages", headers)?))
+            }
+            Kind::SiliconFlow => {
+                let object = get(&format!("{origin}/v1/user/info"), bearer(key))?;
+                check_envelope(&object)?;
+                Some(silicon_flow(&object, currency))
+            }
+            Kind::OpenRouter => Some(open_router(&get("https://openrouter.ai/api/v1/key", bearer(key))?)),
+            Kind::Zhipu => {
+                let headers = vec![("Authorization".into(), key.trim().to_string()), ("Accept-Language".into(), "en-US,en".into())];
+                let document = get(&format!("{origin}/api/monitor/usage/quota/limit"), headers)?;
+                if document.is_object() {
+                    check_envelope(&document)?;
+                }
+                Some(zhipu(&document))
+            }
+            Kind::MiniMax => {
+                let base = if host == "api.minimaxi.com" { "https://api.minimaxi.com" } else { "https://api.minimax.io" };
+                let object = get(&format!("{base}/v1/token_plan/remains"), bearer(key))
+                    .or_else(|_| get(&format!("{base}/v1/api/openplatform/coding_plan/remains"), bearer(key)))?;
+                minimax(&object, key.trim().starts_with("sk-cp-"))?
+            }
+            Kind::Relay => {
+                let attempt = (|| -> Result<Option<Value>, String> {
+                    let subscription =
+                        get(&crate::capnet::endpoint(base, "dashboard/billing/subscription").map_err(|error| error.message)?, bearer(key))?;
+                    let today = chrono::Utc::now().date_naive();
+                    let url = format!(
+                        "{}?start_date={}&end_date={}",
+                        crate::capnet::endpoint(base, "dashboard/billing/usage").map_err(|error| error.message)?,
+                        (today - chrono::Duration::days(99)).format("%Y-%m-%d"),
+                        (today + chrono::Duration::days(1)).format("%Y-%m-%d")
+                    );
+                    let used = get(&url, bearer(key))?;
+                    Ok(relay(&subscription, &used))
+                })();
+                attempt.unwrap_or(None)
+            }
+        };
+        if let Some(report) = &mut found {
+            report["fetchedAt"] = json!(chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string());
+        }
+        Ok(found)
+    }
+
+    /// services.usage：{supported, report?, error?, observed}
+    pub fn request(params: &Value) -> Value {
+        let base = params["baseURL"].as_str().unwrap_or("").to_string();
+        let custom = params["custom"].as_bool().unwrap_or(false);
+        let mut result = json!({ "supported": can_query(&base, custom), "observed": {} });
+        let secret = params["secretName"]
+            .as_str()
+            .and_then(|name| crate::read_json_file(&crate::edith_home().join("secrets.json"))[name].as_str().map(str::to_string));
+        let (Some(secret), true, false) = (secret, result["supported"] == true, params["observedOnly"] == true) else { return result };
+        match query(&base, &secret, custom) {
+            Ok(Some(report)) => result["report"] = report,
+            Ok(None) => result["supported"] = json!(false),
+            Err(error) => result["error"] = json!(error),
+        }
+        result
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn parses_like_friday() {
+            let report = deepseek(
+                &json!({ "is_available": true, "balance_infos": [{ "currency": "CNY", "total_balance": "12.50", "granted_balance": "2.00" }] }),
+            );
+            assert_eq!(report["balances"][0]["amount"], 12.5);
+            assert_eq!(report["available"], true);
+            let report = moonshot(&json!({ "data": { "available_balance": 3.0, "voucher_balance": 3.0, "cash_balance": -1.5 } }), "CNY");
+            assert_eq!(report["balances"][0]["owed"], 1.5);
+            let report = zhipu(
+                &json!({ "data": { "level": "pro", "limits": [{ "type": "TOKENS_LIMIT", "unit": 3, "number": 5, "percentage": 30 }, { "type": "TIME_LIMIT", "unit": 5, "number": 1, "usage": 100, "currentValue": 10 }] } }),
+            );
+            assert_eq!(report["plan"], "pro");
+            assert_eq!(report["windows"][0]["title"], "5 小时");
+            assert_eq!(report["windows"][0]["remainingPercent"], 70.0);
+            assert_eq!(report["windows"][1]["title"], "工具调用（每月）");
+            assert!(can_query("https://api.deepseek.com/v1", false) && !can_query("https://api.openai.com/v1", false));
+            assert!(can_query("https://relay.example.com/v1", true) && !can_query("http://localhost:3000/v1", true));
+            assert_eq!(span_title(5.0 * 3600.0), "5 小时");
+            assert_eq!(span_title(7.0 * 86400.0), "每周");
+        }
+    }
+}
+
+mod capnet {
+    //! 能力层的联网、媒体和录音（同 Friday 的 HTTPClient / MediaEncoding / AudioEncoding / SpeechSupport）：
+    //! 在线提供方的请求（带状态码的错误、按路径取 JSON 里的值、multipart）、本地图片 / 视频变成接口要的样子（data URL、抽帧——要 ffmpeg）、
+    //! 录音的读、解（WAV 自己解，别的格式找 ffmpeg）、换采样率、拼接、按安静处切段、编 m4a（ffmpeg），合成用的按句切文字。
 
     use std::io::Read;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    use base64::Engine;
+    use serde_json::Value;
+
+    /// 出错：status 是 HTTP 状态码（不是 HTTP 的错为 0），message 给模型和用户看
+    #[derive(Debug, Clone)]
+    pub struct Error {
+        pub status: u16,
+        pub message: String,
+    }
+
+    impl Error {
+        pub fn new(message: impl Into<String>) -> Error {
+            Error { status: 0, message: message.into() }
+        }
+
+        /// HTTP <状态码>：<正文前 600 字>
+        pub fn http(status: u16, body: &str) -> Error {
+            Error { status, message: format!("HTTP {status}：{}", body.chars().take(600).collect::<String>()) }
+        }
+
+        /// 响应格式不符合预期：<详情前 600 字>
+        pub fn malformed(detail: &str) -> Error {
+            Error::new(format!("响应格式不符合预期：{}", detail.chars().take(600).collect::<String>()))
+        }
+    }
+
+    impl From<String> for Error {
+        fn from(message: String) -> Error {
+            Error::new(message)
+        }
+    }
+
+    impl From<&str> for Error {
+        fn from(message: &str) -> Error {
+            Error::new(message)
+        }
+    }
+
+    pub type Result<T> = std::result::Result<T, Error>;
+
+    pub struct Response {
+        pub status: u16,
+        pub headers: Vec<(String, String)>,
+        pub body: Vec<u8>,
+    }
+
+    impl Response {
+        pub fn header(&self, name: &str) -> Option<&str> {
+            self.headers.iter().find(|(key, _)| key.eq_ignore_ascii_case(name)).map(|(_, value)| value.as_str())
+        }
+
+        pub fn mime(&self) -> String {
+            self.header("content-type").unwrap_or("").split(';').next().unwrap_or("").trim().to_lowercase()
+        }
+
+        pub fn text(&self, limit: usize) -> String {
+            String::from_utf8_lossy(&self.body).chars().take(limit).collect()
+        }
+
+        pub fn json(&self) -> Value {
+            serde_json::from_slice(&self.body).unwrap_or(Value::Null)
+        }
+
+        pub fn ok(&self) -> bool {
+            (200..300).contains(&self.status)
+        }
+    }
+
+    /// 发一个请求（不把 4xx / 5xx 当成错，调用方看状态码）。body：(Content-Type, 内容)
+    pub fn send(method: &str, url: &str, headers: &[(String, String)], body: Option<(&str, Vec<u8>)>, timeout: u64) -> Result<Response> {
+        let agent: ureq::Agent =
+            ureq::Agent::config_builder().http_status_as_error(false).timeout_global(Some(Duration::from_secs(timeout))).build().into();
+        let response = match method {
+            "GET" => {
+                let mut request = agent.get(url);
+                for (key, value) in headers {
+                    request = request.header(key, value);
+                }
+                request.call()
+            }
+            other => {
+                let mut request = if other == "PUT" { agent.put(url) } else { agent.post(url) };
+                for (key, value) in headers {
+                    request = request.header(key, value);
+                }
+                match body {
+                    Some((content_type, data)) => request.header("Content-Type", content_type).send(&data[..]),
+                    None => request.send_empty(),
+                }
+            }
+        };
+        let mut response = response.map_err(|error| Error::new(format!("连不上 {}：{error}", host_of(url))))?;
+        let status = response.status().as_u16();
+        let headers: Vec<(String, String)> =
+            response.headers().iter().map(|(key, value)| (key.as_str().to_string(), value.to_str().unwrap_or("").to_string())).collect();
+        let mut data = Vec::new();
+        response
+            .body_mut()
+            .as_reader()
+            .read_to_end(&mut data)
+            .map_err(|error| Error::new(format!("读 {} 的回复出错：{error}", host_of(url))))?;
+        Ok(Response { status, headers, body: data })
+    }
+
+    fn host_of(url: &str) -> String {
+        url.split("://").nth(1).unwrap_or(url).split('/').next().unwrap_or("").to_string()
+    }
+
+    /// 发 JSON（或不带正文）、收 JSON：不是 2xx 抛 HTTP 错，回的不是 JSON 对象抛格式错
+    pub fn json(method: &str, url: &str, headers: &[(String, String)], body: Option<&Value>, timeout: u64) -> Result<Value> {
+        let payload = body.map(|body| ("application/json", serde_json::to_vec(body).unwrap_or_default()));
+        let response = send(method, url, headers, payload, timeout)?;
+        if !response.ok() {
+            return Err(Error::http(response.status, &response.text(2000)));
+        }
+        match response.json() {
+            Value::Object(object) => Ok(Value::Object(object)),
+            _ => Err(Error::malformed(&response.text(600))),
+        }
+    }
+
+    /// 按「a.b.0.c」取值
+    pub fn at<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
+        let mut current = value;
+        for part in path.split('.') {
+            current = match part.parse::<usize>() {
+                Ok(index) if current.is_array() => current.get(index)?,
+                _ => current.get(part)?,
+            };
+        }
+        Some(current)
+    }
+
+    pub fn string_at(value: &Value, path: &str) -> Option<String> {
+        match at(value, path)? {
+            Value::String(text) => Some(text.clone()),
+            Value::Number(number) => Some(number.to_string()),
+            _ => None,
+        }
+    }
+
+    /// 给人看的 JSON（截到 600 字）
+    pub fn describe(value: &Value) -> String {
+        value.to_string().chars().take(600).collect()
+    }
+
+    pub fn bearer(key: Option<&str>) -> Vec<(String, String)> {
+        match key.filter(|key| !key.is_empty()) {
+            Some(key) => vec![("Authorization".into(), format!("Bearer {key}"))],
+            None => Vec::new(),
+        }
+    }
+
+    /// multipart/form-data：(Content-Type, 正文)；files 是 (字段名, 文件名, MIME, 内容)
+    pub fn multipart(fields: &[(&str, String)], files: &[(&str, &str, &str, &[u8])]) -> (String, Vec<u8>) {
+        let boundary = format!("Friday-{}", uuid::Uuid::new_v4().simple());
+        let mut body = Vec::new();
+        for (name, value) in fields {
+            body.extend_from_slice(
+                format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n").as_bytes(),
+            );
+        }
+        for (name, file, mime, data) in files {
+            body.extend_from_slice(
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"; filename=\"{file}\"\r\nContent-Type: {mime}\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            body.extend_from_slice(data);
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        (format!("multipart/form-data; boundary={boundary}"), body)
+    }
+
+    /// baseURL 去掉末尾的 / 再接 path
+    pub fn endpoint(base: &str, path: &str) -> Result<String> {
+        let base = base.trim().trim_end_matches('/');
+        if !(base.starts_with("http://") || base.starts_with("https://")) {
+            return Err(Error::new(format!("接口地址不合法：{base}")));
+        }
+        Ok(format!("{base}/{}", path.trim_start_matches('/')))
+    }
+
+    /// 「1024x1024 / 1024*1024 / 1024×1024 / 16:9」→ (宽, 高)；比例按 base 边长换算、取 16 的倍数
+    pub fn parse_size(raw: Option<&str>, base: u32) -> Option<(u32, u32)> {
+        let raw = raw?.to_lowercase().replace(' ', "");
+        if raw.is_empty() {
+            return None;
+        }
+        if let Some(separator) = ['x', '*', '×'].into_iter().find(|separator| raw.contains(*separator)) {
+            let parts: Vec<&str> = raw.split(separator).filter(|part| !part.is_empty()).collect();
+            if let [width, height] = parts.as_slice()
+                && let (Ok(width), Ok(height)) = (width.parse::<u32>(), height.parse::<u32>())
+            {
+                return Some((width, height));
+            }
+            return None;
+        }
+        let (a, b) = raw.split_once(':')?;
+        let (a, b) = (a.parse::<f64>().ok()?, b.parse::<f64>().ok()?);
+        if a <= 0.0 || b <= 0.0 {
+            return None;
+        }
+        let (width, height) = if a >= b { (base as f64, base as f64 * b / a) } else { (base as f64 * a / b, base as f64) };
+        Some(((width / 16.0) as u32 * 16, (height / 16.0) as u32 * 16))
+    }
+
+    // MARK: 媒体
+
+    fn is_remote(input: &str) -> bool {
+        input.starts_with("http://") || input.starts_with("https://")
+    }
+
+    fn local(input: &str) -> PathBuf {
+        PathBuf::from(input.strip_prefix("file://").unwrap_or(input))
+    }
+
+    /// 工具参数里的文件：http(s) 原样，绝对路径原样，相对的按会话的工作目录，~ 开头的按家目录；不存在的说清楚
+    pub fn resolve_input(raw: &str, cwd: Option<&str>) -> Result<String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(Error::new("缺少文件路径"));
+        }
+        if is_remote(trimmed) {
+            return Ok(trimmed.to_string());
+        }
+        let path = local(trimmed);
+        let path = if let Some(rest) = trimmed.strip_prefix("~/") {
+            crate::user_home().join(rest)
+        } else if path.is_absolute() {
+            path
+        } else {
+            cwd.map(PathBuf::from).unwrap_or_else(crate::user_home).join(path)
+        };
+        if !path.exists() {
+            return Err(Error::new(format!("文件不存在：{}。用户附件的完整路径写在消息末尾的「附件」里。", path.display())));
+        }
+        Ok(path.to_string_lossy().into_owned())
+    }
+
+    pub fn data_url(data: &[u8], mime: &str) -> String {
+        format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(data))
+    }
+
+    /// 这台的程序（PATH 里找）
+    pub fn which(name: &str) -> Option<PathBuf> {
+        let names: Vec<String> = if cfg!(windows) { vec![format!("{name}.exe"), name.to_string()] } else { vec![name.to_string()] };
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path).flat_map(|dir| names.iter().map(move |name| dir.join(name))).find(|path| path.is_file())
+    }
+
+    fn run(program: &Path, arguments: &[String], timeout: u64) -> Option<(bool, Vec<u8>, String)> {
+        let mut child = std::process::Command::new(program)
+            .args(arguments)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .ok()?;
+        let mut stdout = child.stdout.take()?;
+        let mut stderr = child.stderr.take()?;
+        let out = std::thread::spawn(move || {
+            let mut data = Vec::new();
+            let _ = stdout.read_to_end(&mut data);
+            data
+        });
+        let err = std::thread::spawn(move || {
+            let mut data = Vec::new();
+            let _ = stderr.read_to_end(&mut data);
+            String::from_utf8_lossy(&data).into_owned()
+        });
+        let started = std::time::Instant::now();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status.success(),
+                Ok(None) if started.elapsed() > Duration::from_secs(timeout) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break false;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(30)),
+                Err(_) => break false,
+            }
+        };
+        Some((status, out.join().unwrap_or_default(), err.join().unwrap_or_default()))
+    }
+
+    fn image_mime(path: &Path, data: &[u8]) -> &'static str {
+        if data.starts_with(b"\x89PNG") {
+            return "image/png";
+        }
+        if data.starts_with(&[0xFF, 0xD8]) {
+            return "image/jpeg";
+        }
+        if data.len() > 12 && &data[0..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+            return "image/webp";
+        }
+        if data.starts_with(b"GIF8") {
+            return "image/gif";
+        }
+        match path.extension().map(|ext| ext.to_string_lossy().to_lowercase()).as_deref() {
+            Some("jpg" | "jpeg") => "image/jpeg",
+            Some("webp") => "image/webp",
+            Some("gif") => "image/gif",
+            Some("bmp") => "image/bmp",
+            Some("heic" | "heif") => "image/heic",
+            _ => "image/png",
+        }
+    }
+
+    /// 图片缩到最长边不超过 max_pixel、编成 JPEG（有 ffmpeg 用 ffmpeg，macOS 也能用 sips）；都没有时回原文件（常见格式接口都认）
+    pub fn jpeg(input: &str, max_pixel: u32) -> Result<(Vec<u8>, &'static str)> {
+        let path = local(input);
+        let data = std::fs::read(&path).map_err(|_| Error::new(format!("无法读取图片：{}", path.display())))?;
+        let mime = image_mime(&path, &data);
+        let small = data.len() < 2 * 1024 * 1024 && matches!(mime, "image/png" | "image/jpeg" | "image/webp" | "image/gif");
+        if small {
+            return Ok((data, mime));
+        }
+        let temp = std::env::temp_dir().join(format!("edith-friday-image-{}.jpg", uuid::Uuid::new_v4().simple()));
+        let scale = format!("scale='min({max_pixel},iw)':'min({max_pixel},ih)':force_original_aspect_ratio=decrease");
+        let converted = if let Some(ffmpeg) = which("ffmpeg") {
+            let arguments: Vec<String> = ["-v", "error", "-y", "-i"]
+                .iter()
+                .map(|text| text.to_string())
+                .chain([
+                    path.to_string_lossy().into_owned(),
+                    "-vf".into(),
+                    scale,
+                    "-frames:v".into(),
+                    "1".into(),
+                    "-q:v".into(),
+                    "3".into(),
+                    temp.to_string_lossy().into_owned(),
+                ])
+                .collect();
+            run(&ffmpeg, &arguments, 60).is_some_and(|(ok, _, _)| ok)
+        } else if cfg!(target_os = "macos") {
+            let arguments: Vec<String> = vec![
+                "-s".into(),
+                "format".into(),
+                "jpeg".into(),
+                "-Z".into(),
+                max_pixel.to_string(),
+                path.to_string_lossy().into_owned(),
+                "--out".into(),
+                temp.to_string_lossy().into_owned(),
+            ];
+            run(Path::new("/usr/bin/sips"), &arguments, 60).is_some_and(|(ok, _, _)| ok)
+        } else {
+            false
+        };
+        if converted && let Ok(jpeg) = std::fs::read(&temp) {
+            let _ = std::fs::remove_file(&temp);
+            return Ok((jpeg, "image/jpeg"));
+        }
+        let _ = std::fs::remove_file(&temp);
+        Ok((data, mime))
+    }
+
+    /// 接口要的图片地址：http(s) 原样，本地的编成 data URL
+    pub fn image_url(input: &str, max_pixel: u32) -> Result<String> {
+        if is_remote(input) {
+            return Ok(input.to_string());
+        }
+        let (data, mime) = jpeg(input, max_pixel)?;
+        Ok(data_url(&data, mime))
+    }
+
+    /// 视频均匀抽 count 帧（避开首尾：在 (i + 0.5) / n 处），每帧 JPEG；要 ffmpeg / ffprobe
+    pub fn video_frames(input: &str, count: usize, max_pixel: u32) -> Result<Vec<Vec<u8>>> {
+        let path = local(input);
+        let (Some(ffprobe), Some(ffmpeg)) = (which("ffprobe"), which("ffmpeg")) else {
+            return Err(Error::new(format!("无法读取视频：这台没有找到 ffmpeg / ffprobe（装好并加入 PATH）：{}", path.display())));
+        };
+        let probe: Vec<String> = ["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1"]
+            .iter()
+            .map(|text| text.to_string())
+            .chain([path.to_string_lossy().into_owned()])
+            .collect();
+        let duration = run(&ffprobe, &probe, 30)
+            .filter(|(ok, _, _)| *ok)
+            .and_then(|(_, out, _)| String::from_utf8_lossy(&out).lines().next().and_then(|line| line.trim().parse::<f64>().ok()))
+            .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+            .ok_or_else(|| Error::new(format!("无法读取视频时长：{}", path.display())))?;
+        let count = count.max(1);
+        let mut frames = Vec::new();
+        for index in 0..count {
+            let at = duration * (index as f64 + 0.5) / count as f64;
+            let arguments: Vec<String> = vec![
+                "-v".into(),
+                "error".into(),
+                "-ss".into(),
+                format!("{at:.3}"),
+                "-i".into(),
+                path.to_string_lossy().into_owned(),
+                "-frames:v".into(),
+                "1".into(),
+                "-vf".into(),
+                format!("scale='min({max_pixel},iw)':'min({max_pixel},ih)':force_original_aspect_ratio=decrease"),
+                "-f".into(),
+                "image2pipe".into(),
+                "-vcodec".into(),
+                "mjpeg".into(),
+                "-".into(),
+            ];
+            match run(&ffmpeg, &arguments, 60) {
+                Some((true, out, _)) if !out.is_empty() => frames.push(out),
+                Some((_, _, error)) => {
+                    let detail = error.trim().lines().last().unwrap_or("").to_string();
+                    return Err(Error::new(if detail.is_empty() {
+                        format!("无法读取视频帧：{}", path.display())
+                    } else {
+                        format!("无法读取视频帧：{}（{detail}）", path.display())
+                    }));
+                }
+                None => return Err(Error::new("起不了 ffmpeg")),
+            }
+        }
+        Ok(frames)
+    }
+
+    // MARK: 录音
+
+    /// 16 位有符号 PCM（多声道交错）
+    #[derive(Clone, Debug, Default)]
+    pub struct Pcm {
+        pub samples: Vec<i16>,
+        pub rate: u32,
+        pub channels: u16,
+    }
+
+    impl Pcm {
+        pub fn frames(&self) -> usize {
+            if self.channels == 0 { 0 } else { self.samples.len() / self.channels as usize }
+        }
+
+        pub fn seconds(&self) -> f64 {
+            if self.rate == 0 { 0.0 } else { self.frames() as f64 / self.rate as f64 }
+        }
+
+        pub fn from_bytes(data: &[u8], rate: u32, channels: u16) -> Pcm {
+            Pcm { samples: data.as_chunks::<2>().0.iter().map(|pair| i16::from_le_bytes(*pair)).collect(), rate, channels: channels.max(1) }
+        }
+    }
+
+    /// 一段录音文件的内容
+    pub struct Clip {
+        pub data: Vec<u8>,
+        pub extension: String,
+        pub mime: String,
+    }
+
+    pub fn audio_mime(extension: &str) -> &'static str {
+        match extension.to_lowercase().as_str() {
+            "m4a" | "mp4" | "m4b" => "audio/mp4",
+            "mp3" => "audio/mpeg",
+            "wav" => "audio/wav",
+            "ogg" | "oga" | "opus" => "audio/ogg",
+            "aac" => "audio/aac",
+            "flac" => "audio/flac",
+            "amr" => "audio/amr",
+            "webm" => "audio/webm",
+            "caf" => "audio/x-caf",
+            _ => "application/octet-stream",
+        }
+    }
+
+    /// 按内容认格式（有人把 mp3 存成 .m4a）
+    pub fn sniff(data: &[u8]) -> &'static str {
+        if data.len() >= 12 && data.starts_with(b"RIFF") && &data[8..12] == b"WAVE" {
+            return "wav";
+        }
+        if data.starts_with(b"OggS") {
+            return "ogg";
+        }
+        if data.starts_with(b"fLaC") {
+            return "flac";
+        }
+        if data.starts_with(b"#!AMR") {
+            return "amr";
+        }
+        if data.starts_with(b"caff") {
+            return "caf";
+        }
+        if data.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+            return "webm";
+        }
+        if data.len() >= 8 && &data[4..8] == b"ftyp" {
+            return "m4a";
+        }
+        if data.starts_with(b"ID3") {
+            return "mp3";
+        }
+        if data.len() >= 2 && data[0] == 0xFF {
+            let second = data[1];
+            if second & 0xF6 == 0xF0 {
+                return "aac";
+            }
+            if second & 0xE0 == 0xE0 && second & 0x06 != 0 {
+                return "mp3";
+            }
+        }
+        ""
+    }
+
+    /// 读录音：本地路径或 http(s) 地址（先下载）；最多 100 MB
+    pub fn load_clip(input: &str) -> Result<Clip> {
+        const MAX: usize = 100 * 1024 * 1024;
+        let (data, name) = if is_remote(input) {
+            let response = send("GET", input, &[], None, 120)?;
+            if !response.ok() {
+                return Err(Error::http(response.status, &format!("下载 {input} 失败")));
+            }
+            (response.body, input.split('?').next().unwrap_or(input).to_string())
+        } else {
+            let path = local(input);
+            let data = std::fs::read(&path).map_err(|_| Error::new(format!("无法读取录音：{}", path.display())))?;
+            (data, path.to_string_lossy().into_owned())
+        };
+        if data.is_empty() {
+            return Err(Error::new(format!("录音是空的：{input}")));
+        }
+        if data.len() > MAX {
+            return Err(Error::new(format!("录音太大（{:.1} MB，最多 100 MB）", data.len() as f64 / 1048576.0)));
+        }
+        let mut extension = sniff(&data).to_string();
+        if extension.is_empty() {
+            extension = Path::new(&name).extension().map(|ext| ext.to_string_lossy().to_lowercase()).unwrap_or_default();
+        }
+        let mime = audio_mime(&extension).to_string();
+        Ok(Clip { data, extension, mime })
+    }
+
+    /// 16 位 PCM 的 WAV（其他位深、压缩格式回 None）
+    pub fn parse_wav(data: &[u8]) -> Option<Pcm> {
+        if data.len() < 12 || !data.starts_with(b"RIFF") || &data[8..12] != b"WAVE" {
+            return None;
+        }
+        let u16_at = |offset: usize| u16::from_le_bytes([data[offset], data[offset + 1]]);
+        let u32_at = |offset: usize| u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
+        let (mut format, mut channels, mut rate, mut bits) = (0u16, 0u16, 0u32, 0u16);
+        let mut offset = 12;
+        while offset + 8 <= data.len() {
+            let id = &data[offset..offset + 4];
+            let mut size = u32_at(offset + 4) as usize;
+            let body = offset + 8;
+            if id == b"fmt " && body + 16 <= data.len() {
+                format = u16_at(body);
+                channels = u16_at(body + 2);
+                rate = u32_at(body + 4);
+                bits = u16_at(body + 14);
+                if format == 0xFFFE && size >= 40 && body + 26 <= data.len() {
+                    format = u16_at(body + 24);
+                }
+            } else if id == b"data" {
+                if format != 1 || bits != 16 || channels == 0 || rate == 0 {
+                    return None;
+                }
+                // 流式写出的 WAV 常把长度写成 0 或 0xFFFFFFFF：取到文件末尾
+                if size == 0 || body + size > data.len() {
+                    size = data.len() - body;
+                }
+                let usable = size - size % (2 * channels as usize);
+                return Some(Pcm::from_bytes(&data[body..body + usable], rate, channels));
+            }
+            offset = body + size + size % 2;
+        }
+        None
+    }
+
+    pub fn wav(pcm: &Pcm) -> Vec<u8> {
+        let channels = pcm.channels.max(1) as u32;
+        let size = (pcm.samples.len() * 2) as u32;
+        let mut out = Vec::with_capacity(44 + size as usize);
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&(36 + size).to_le_bytes());
+        out.extend_from_slice(b"WAVEfmt ");
+        out.extend_from_slice(&16u32.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&(channels as u16).to_le_bytes());
+        out.extend_from_slice(&pcm.rate.to_le_bytes());
+        out.extend_from_slice(&(pcm.rate * channels * 2).to_le_bytes());
+        out.extend_from_slice(&((channels * 2) as u16).to_le_bytes());
+        out.extend_from_slice(&16u16.to_le_bytes());
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&size.to_le_bytes());
+        for sample in &pcm.samples {
+            out.extend_from_slice(&sample.to_le_bytes());
+        }
+        out
+    }
+
+    /// 混成单声道（channels 为 1 时）并线性插值换采样率
+    pub fn convert(pcm: &Pcm, rate: u32, channels: u16) -> Pcm {
+        if pcm.frames() == 0 || rate == 0 {
+            return Pcm { samples: Vec::new(), rate, channels: channels.max(1) };
+        }
+        let mix_down = channels == 1 && pcm.channels > 1;
+        if !mix_down && pcm.rate == rate {
+            return pcm.clone();
+        }
+        let input_channels = pcm.channels.max(1) as usize;
+        let output_channels = if mix_down { 1 } else { input_channels };
+        let frames = pcm.frames();
+        let mut mixed = vec![0f32; frames * output_channels];
+        for frame in 0..frames {
+            if mix_down {
+                let sum: f32 = (0..input_channels).map(|c| pcm.samples[frame * input_channels + c] as f32).sum();
+                mixed[frame] = sum / input_channels as f32;
+            } else {
+                for c in 0..output_channels {
+                    mixed[frame * output_channels + c] = pcm.samples[frame * input_channels + c] as f32;
+                }
+            }
+        }
+        let out_frames = if pcm.rate == rate { frames } else { (frames as f64 * rate as f64 / pcm.rate as f64).round() as usize };
+        let step = pcm.rate as f64 / rate as f64;
+        let mut samples = vec![0i16; out_frames * output_channels];
+        for frame in 0..out_frames {
+            let position = frame as f64 * step;
+            let left = (position as usize).min(frames - 1);
+            let right = (left + 1).min(frames - 1);
+            let t = (position - left as f64) as f32;
+            for c in 0..output_channels {
+                let value = mixed[left * output_channels + c] * (1.0 - t) + mixed[right * output_channels + c] * t;
+                samples[frame * output_channels + c] = value.round().clamp(-32768.0, 32767.0) as i16;
+            }
+        }
+        Pcm { samples, rate, channels: output_channels as u16 }
+    }
+
+    /// 拼接：后面几段先换成第一段的采样率和声道数；gap 是段间静音（秒）
+    pub fn concat(parts: &[Pcm], gap: f64) -> Pcm {
+        let mut result: Option<Pcm> = None;
+        for part in parts.iter().filter(|part| part.frames() > 0) {
+            match &mut result {
+                None => result = Some(part.clone()),
+                Some(result) => {
+                    if gap > 0.0 {
+                        result.samples.extend(std::iter::repeat_n(0i16, (gap * result.rate as f64) as usize * result.channels as usize));
+                    }
+                    let same = if part.rate == result.rate && part.channels == result.channels {
+                        part.clone()
+                    } else {
+                        convert(part, result.rate, if result.channels == 1 { 1 } else { part.channels })
+                    };
+                    result.samples.extend(same.samples);
+                }
+            }
+        }
+        result.unwrap_or(Pcm { samples: Vec::new(), rate: 16000, channels: 1 })
+    }
+
+    /// 切成每段不超过 max_seconds 秒（在最后 20% 里找最安静的 50 毫秒处切）
+    pub fn split(pcm: &Pcm, max_seconds: f64) -> Vec<Pcm> {
+        if pcm.seconds() <= max_seconds || max_seconds <= 0.0 {
+            return vec![pcm.clone()];
+        }
+        let channels = pcm.channels.max(1) as usize;
+        let total = pcm.frames();
+        let max_frames = ((max_seconds * pcm.rate as f64) as usize).max(1);
+        let window = (pcm.rate as usize / 20).max(1);
+        let mut parts = Vec::new();
+        let mut start = 0;
+        while start < total {
+            let mut end = total.min(start + max_frames);
+            if end < total {
+                let from = start + (max_frames as f64 * 0.8) as usize;
+                let (mut best, mut best_at) = (f64::MAX, end);
+                let mut at = from;
+                while at + window <= end {
+                    let energy: f64 = (at..at + window).map(|frame| (pcm.samples[frame * channels] as f64).abs()).sum();
+                    if energy < best {
+                        best = energy;
+                        best_at = at + window / 2;
+                    }
+                    at += (window / 2).max(1);
+                }
+                end = best_at.clamp(start + 1, total);
+            }
+            parts.push(Pcm { samples: pcm.samples[start * channels..end * channels].to_vec(), rate: pcm.rate, channels: channels as u16 });
+            start = end;
+        }
+        parts
+    }
+
+    pub fn can_decode(extension: &str) -> bool {
+        extension.eq_ignore_ascii_case("wav") || which("ffmpeg").is_some()
+    }
+
+    /// 解成单声道、换成 rate 的 PCM：WAV 自己解，别的用 ffmpeg
+    pub fn decode(clip: &Clip, rate: u32) -> Result<Pcm> {
+        if let Some(pcm) = parse_wav(&clip.data) {
+            return Ok(convert(&pcm, rate, 1));
+        }
+        let Some(ffmpeg) = which("ffmpeg") else {
+            return Err(Error::new(format!(
+                "解不开这段录音（{}）：这台没有找到 ffmpeg（请安装 ffmpeg 并加入 PATH）",
+                if clip.extension.is_empty() { "未知格式" } else { &clip.extension }
+            )));
+        };
+        let temp = std::env::temp_dir().join(format!(
+            "edith-friday-audio-{}.{}",
+            uuid::Uuid::new_v4().simple(),
+            if clip.extension.is_empty() { "bin" } else { &clip.extension }
+        ));
+        std::fs::write(&temp, &clip.data).map_err(|error| Error::new(format!("写不了临时文件：{error}")))?;
+        let arguments: Vec<String> = ["-v", "error", "-i"]
+            .iter()
+            .map(|text| text.to_string())
+            .chain([temp.to_string_lossy().into_owned()])
+            .chain(["-vn", "-f", "s16le", "-acodec", "pcm_s16le", "-ac", "1", "-ar"].iter().map(|text| text.to_string()))
+            .chain([rate.to_string(), "-".into()])
+            .collect();
+        let result = run(&ffmpeg, &arguments, 300);
+        let _ = std::fs::remove_file(&temp);
+        match result {
+            Some((true, out, _)) if !out.is_empty() => Ok(Pcm::from_bytes(&out, rate, 1)),
+            _ => Err(Error::new("解不开这段录音")),
+        }
+    }
+
+    /// 编成 m4a（AAC，64k）：要 ffmpeg，没有回 None
+    pub fn encode_m4a(pcm: &Pcm) -> Option<Vec<u8>> {
+        let ffmpeg = which("ffmpeg")?;
+        if pcm.frames() == 0 {
+            return None;
+        }
+        let stem = std::env::temp_dir().join(format!("edith-friday-m4a-{}", uuid::Uuid::new_v4().simple()));
+        let (input, output) = (stem.with_extension("wav"), stem.with_extension("m4a"));
+        std::fs::write(&input, wav(pcm)).ok()?;
+        let arguments: Vec<String> = ["-v", "error", "-y", "-i"]
+            .iter()
+            .map(|text| text.to_string())
+            .chain([input.to_string_lossy().into_owned()])
+            .chain(["-c:a", "aac", "-b:a", "64k", "-movflags", "+faststart"].iter().map(|text| text.to_string()))
+            .chain([output.to_string_lossy().into_owned()])
+            .collect();
+        let ok = run(&ffmpeg, &arguments, 300).is_some_and(|(ok, _, _)| ok);
+        let data = if ok { std::fs::read(&output).ok().filter(|data| !data.is_empty()) } else { None };
+        let _ = std::fs::remove_file(&input);
+        let _ = std::fs::remove_file(&output);
+        data
+    }
+
+    /// 合成用：按句（。！？；换行，再不行按逗号、空格，最后硬切）切成每段不超过 max_chars 个字
+    pub fn speech_chunks(text: &str, max_chars: usize) -> Vec<String> {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Vec::new();
+        }
+        if max_chars == 0 || trimmed.chars().count() <= max_chars {
+            return vec![trimmed.to_string()];
+        }
+        let pieces = |source: &str, marks: &str| {
+            let mut out = Vec::new();
+            let mut current = String::new();
+            for c in source.chars() {
+                current.push(c);
+                if marks.contains(c) {
+                    out.push(std::mem::take(&mut current));
+                }
+            }
+            if !current.is_empty() {
+                out.push(current);
+            }
+            out
+        };
+        let mut units = Vec::new();
+        for sentence in pieces(trimmed, "。！？；!?;\n") {
+            if sentence.chars().count() <= max_chars {
+                units.push(sentence);
+                continue;
+            }
+            for clause in pieces(&sentence, "，、,： ") {
+                let chars: Vec<char> = clause.chars().collect();
+                for chunk in chars.chunks(max_chars) {
+                    units.push(chunk.iter().collect());
+                }
+            }
+        }
+        let mut chunks = Vec::new();
+        let mut current = String::new();
+        for unit in units {
+            if !current.is_empty() && current.chars().count() + unit.chars().count() > max_chars {
+                if !current.trim().is_empty() {
+                    chunks.push(current.trim().to_string());
+                }
+                current.clear();
+            }
+            current.push_str(&unit);
+        }
+        if !current.trim().is_empty() {
+            chunks.push(current.trim().to_string());
+        }
+        chunks
+    }
+
+    const LANGUAGES: [(&str, &str, &[&str]); 11] = [
+        ("Chinese", "zh", &["zh", "chinese", "中文", "汉语", "普通话", "cn", "zh-cn"]),
+        ("English", "en", &["en", "english", "英文", "英语", "en-us"]),
+        ("Japanese", "ja", &["ja", "japanese", "日语", "日文", "jp"]),
+        ("Korean", "ko", &["ko", "korean", "韩语", "韩文"]),
+        ("Cantonese", "yue", &["yue", "cantonese", "粤语", "广东话"]),
+        ("German", "de", &["de", "german", "德语"]),
+        ("French", "fr", &["fr", "french", "法语"]),
+        ("Russian", "ru", &["ru", "russian", "俄语"]),
+        ("Italian", "it", &["it", "italian", "意大利语"]),
+        ("Spanish", "es", &["es", "spanish", "西班牙语"]),
+        ("Portuguese", "pt", &["pt", "portuguese", "葡萄牙语"]),
+    ];
+
+    /// language 参数 → 语言名（Chinese…）；认不出的原样
+    pub fn language_name(raw: Option<&str>) -> Option<String> {
+        let raw = raw?.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        let lower = raw.to_lowercase();
+        Some(
+            LANGUAGES
+                .iter()
+                .find(|(_, _, aliases)| aliases.contains(&lower.as_str()))
+                .map_or(raw.to_string(), |(name, _, _)| name.to_string()),
+        )
+    }
+
+    /// language 参数 → 语言代码（zh / en…）；认不出且不超过 3 个字母的原样，否则 None（自动判断）
+    pub fn language_code(raw: Option<&str>) -> Option<String> {
+        let lower = raw?.trim().to_lowercase();
+        if lower.is_empty() {
+            return None;
+        }
+        if let Some((_, code, _)) = LANGUAGES.iter().find(|(_, _, aliases)| aliases.contains(&lower.as_str())) {
+            return Some(code.to_string());
+        }
+        (lower.chars().count() <= 3 && lower.chars().all(|c| c.is_ascii_lowercase())).then_some(lower)
+    }
+
+    /// 几段识别结果接起来（英文段之间补空格）；全空时是「（没听出说了什么）」
+    pub fn transcript(parts: &[String]) -> String {
+        let mut joined = String::new();
+        for part in parts {
+            let text = part.trim();
+            if text.is_empty() {
+                continue;
+            }
+            let ascii = |c: char| (c as u32) < 0x2E80;
+            if let (Some(last), Some(first)) = (joined.chars().last(), text.chars().next())
+                && last.is_alphanumeric()
+                && ascii(last)
+                && ascii(first)
+            {
+                joined.push(' ');
+            }
+            joined.push_str(text);
+        }
+        if joined.is_empty() { "（没听出说了什么）".into() } else { joined }
+    }
+
+    pub fn wants_wav(format: Option<&str>) -> bool {
+        format.is_some_and(|format| format.trim().eq_ignore_ascii_case("wav"))
+    }
+
+    /// 结果文件：地址（带下载时要的请求头）或已经拿到的内容
+    #[derive(Clone, Debug, Default)]
+    pub struct ResultFile {
+        pub url: Option<String>,
+        pub headers: Vec<(String, String)>,
+        pub data: Option<Vec<u8>>,
+        /// 本机已有的文件（脚本提供方、本地能力的产出）
+        pub path: Option<PathBuf>,
+        pub extension: String,
+        pub mime: Option<String>,
+    }
+
+    impl ResultFile {
+        pub fn remote(url: &str, default_extension: &str) -> ResultFile {
+            let extension = url
+                .split('?')
+                .next()
+                .and_then(|path| path.rsplit('/').next())
+                .and_then(|name| name.rsplit_once('.').map(|(_, ext)| ext.to_lowercase()))
+                .filter(|ext| !ext.is_empty() && ext.len() <= 5)
+                .unwrap_or_else(|| default_extension.to_string());
+            ResultFile { url: Some(url.to_string()), extension, ..Default::default() }
+        }
+
+        pub fn encoded(data: Vec<u8>, extension: &str) -> ResultFile {
+            ResultFile { data: Some(data), extension: extension.into(), mime: Some(audio_mime(extension).into()), ..Default::default() }
+        }
+    }
+
+    /// 合成的 PCM → 结果文件：要 wav 给 WAV；其余能编 m4a 就编，编不了给 WAV
+    pub fn speech_output(pcm: &Pcm, format: Option<&str>) -> ResultFile {
+        if !wants_wav(format)
+            && let Some(m4a) = encode_m4a(pcm)
+        {
+            return ResultFile::encoded(m4a, "m4a");
+        }
+        ResultFile::encoded(wav(pcm), "wav")
+    }
+
+    /// 最小的 zip（只存不压缩）：(包里的路径, 内容)
+    pub fn zip_stored(files: &[(String, Vec<u8>)]) -> Vec<u8> {
+        fn crc32(data: &[u8]) -> u32 {
+            let mut table = [0u32; 256];
+            for (index, slot) in table.iter_mut().enumerate() {
+                let mut value = index as u32;
+                for _ in 0..8 {
+                    value = if value & 1 != 0 { 0xEDB8_8320 ^ (value >> 1) } else { value >> 1 };
+                }
+                *slot = value;
+            }
+            let mut crc = 0xFFFF_FFFFu32;
+            for byte in data {
+                crc = table[((crc ^ *byte as u32) & 0xFF) as usize] ^ (crc >> 8);
+            }
+            !crc
+        }
+        let mut out = Vec::new();
+        let mut central = Vec::new();
+        for (name, data) in files {
+            let (crc, size, offset) = (crc32(data), data.len() as u32, out.len() as u32);
+            let name_bytes = name.as_bytes();
+            out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+            out.extend_from_slice(&[20, 0, 0, 0x08, 0, 0, 0, 0, 0x21, 0]);
+            out.extend_from_slice(&crc.to_le_bytes());
+            out.extend_from_slice(&size.to_le_bytes());
+            out.extend_from_slice(&size.to_le_bytes());
+            out.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(name_bytes);
+            out.extend_from_slice(data);
+            central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+            central.extend_from_slice(&[20, 0, 20, 0, 0, 0x08, 0, 0, 0, 0, 0x21, 0]);
+            central.extend_from_slice(&crc.to_le_bytes());
+            central.extend_from_slice(&size.to_le_bytes());
+            central.extend_from_slice(&size.to_le_bytes());
+            central.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            central.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
+            central.extend_from_slice(&0u32.to_le_bytes());
+            central.extend_from_slice(&offset.to_le_bytes());
+            central.extend_from_slice(name_bytes);
+        }
+        let (start, length) = (out.len() as u32, central.len() as u32);
+        out.extend_from_slice(&central);
+        out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        out.extend_from_slice(&[0, 0, 0, 0]);
+        out.extend_from_slice(&(files.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(files.len() as u16).to_le_bytes());
+        out.extend_from_slice(&length.to_le_bytes());
+        out.extend_from_slice(&start.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use serde_json::json;
+
+        #[test]
+        fn audio_round_trips() {
+            let pcm = Pcm { samples: (0..32000).map(|i| ((i % 100) as i16 - 50) * 100).collect(), rate: 16000, channels: 1 };
+            let back = parse_wav(&wav(&pcm)).unwrap();
+            assert_eq!((back.rate, back.channels, back.samples.len()), (16000, 1, 32000));
+            let up = convert(&pcm, 24000, 1);
+            assert_eq!(up.frames(), 48000);
+            let joined = concat(&[pcm.clone(), up], 0.5);
+            assert_eq!(joined.rate, 16000);
+            assert_eq!(joined.frames(), 32000 + 8000 + 32000);
+            let parts = split(&joined, 1.5);
+            assert!(parts.iter().all(|part| part.seconds() <= 1.5) && parts.iter().map(Pcm::frames).sum::<usize>() == joined.frames());
+            assert_eq!(sniff(b"RIFF\0\0\0\0WAVEfmt "), "wav");
+            assert_eq!(sniff(b"ID3\x03"), "mp3");
+        }
+
+        #[test]
+        fn chunks_sizes_and_languages() {
+            assert_eq!(speech_chunks("你好。今天天气不错！", 100), vec!["你好。今天天气不错！"]);
+            let chunks = speech_chunks("第一句话。第二句话，有点长。第三句。", 8);
+            assert!(chunks.iter().all(|chunk| chunk.chars().count() <= 8), "{chunks:?}");
+            assert_eq!(chunks.concat(), "第一句话。第二句话，有点长。第三句。");
+            assert_eq!(parse_size(Some("1024x768"), 1024), Some((1024, 768)));
+            assert_eq!(parse_size(Some("16:9"), 1024), Some((1024, 576)));
+            assert_eq!(parse_size(Some("nope"), 1024), None);
+            assert_eq!(language_code(Some("中文")).as_deref(), Some("zh"));
+            assert_eq!(language_name(Some("en")).as_deref(), Some("English"));
+            assert_eq!(transcript(&["hello".into(), "world".into(), "你好".into()]), "hello world你好");
+            assert_eq!(at(&json!({ "a": [{ "b": 1 }] }), "a.0.b"), Some(&json!(1)));
+        }
+    }
+}
+
+mod caps {
+    //! 能力层（照 Friday 的 CapabilityRegistry，Friday 仓库的 qt/src/core/capabilities）：看图、看视频、生图、生视频、听录音、说话，
+    //! 还有提供方包带来的新能力。提供方有几种：
+    //! - 本机（power-<id>）：设置 › 能力 里装好的本地语音（听录音、说话）、friday-diffusion（生图、生视频，模型库里「使用」的模型）；
+    //! - 在线（dashscope 百炼、openAICompatible、volcengineArk 火山方舟、volcengineSpeech 豆包语音）：设置 › 服务与密钥 接入在线服务时建，
+    //!   密钥在 EDITH 的 secrets.json；
+    //! - 脚本提供方（script）：`~/.edith/friday/providers/<id>/` 下的包（智能体用 create_provider 写，或在设置里导入 .fridayprovider）。
+    //!
+    //! 智能体看到的是固定的几个工具（analyze_image…、check_job、新能力的工具），是常驻那份的动作；有允许的提供方才给。provider 参数指定用哪家，
+    //! 不填自动选：本机优先，本机不可用再用在线。生视频这类异步任务记在 jobs.json，check_job 查进度、做完取回文件（存在 ~/.edith/friday/media/）。
+    //! 存档同 Friday：capabilities.json（entries / scriptEntries / powerEntries）、jobs.json，格式用 friday-core 的 capability_store。
+
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
     use std::sync::{LazyLock, Mutex};
     use std::time::Duration;
 
     use base64::Engine;
     use serde_json::{Map, Value, json};
 
+    use crate::capnet::{self, Error, ResultFile};
     use crate::{models, powers};
 
-    struct Kind {
+    // MARK: 能力
+
+    struct Builtin {
         raw: &'static str,
         title: &'static str,
         symbol: &'static str,
         tool: &'static str,
         detail: &'static str,
-        /// 装着的 Power 清单里的 capabilities 写的
-        power: &'static str,
+        paid: bool,
     }
 
-    const KINDS: [Kind; 4] = [
-        Kind {
+    const BUILTINS: [Builtin; 6] = [
+        Builtin {
+            raw: "vision",
+            title: "看图",
+            symbol: "eye",
+            tool: "analyze_image",
+            detail: "理解图片内容、读取截图里的文字",
+            paid: false,
+        },
+        Builtin {
+            raw: "videoUnderstanding",
+            title: "看视频",
+            symbol: "film.stack",
+            tool: "analyze_video",
+            detail: "概括视频内容、回答关于视频的问题",
+            paid: false,
+        },
+        Builtin {
+            raw: "imageGeneration",
+            title: "生成图片",
+            symbol: "paintbrush.pointed",
+            tool: "generate_image",
+            detail: "按文字描述生成图片，或基于参考图生成",
+            paid: true,
+        },
+        Builtin {
+            raw: "videoGeneration",
+            title: "生成视频",
+            symbol: "video.badge.waveform",
+            tool: "generate_video",
+            detail: "按文字或图片生成短视频（异步任务，需要几分钟）",
+            paid: true,
+        },
+        Builtin {
             raw: "transcription",
             title: "听录音",
-            symbol: "waveform",
+            symbol: "mic",
             tool: "transcribe_audio",
-            detail: "把录音转成文字",
-            power: "transcription",
+            detail: "把录音、语音消息转成文字",
+            paid: false,
         },
-        Kind { raw: "speech", title: "说话", symbol: "speaker.wave.2", tool: "speak", detail: "把文字合成语音", power: "speech" },
-        Kind {
-            raw: "imageGeneration",
-            title: "生图",
-            symbol: "photo",
-            tool: "generate_image",
-            detail: "按描述生成图片",
-            power: "imageGeneration",
-        },
-        Kind {
-            raw: "videoGeneration",
-            title: "生视频",
-            symbol: "film",
-            tool: "generate_video",
-            detail: "按描述生成短视频",
-            power: "videoGeneration",
+        Builtin {
+            raw: "speech", title: "说话", symbol: "waveform", tool: "speak", detail: "把文字说出来：合成语音", paid: false
         },
     ];
 
-    fn kind(raw: &str) -> Option<&'static Kind> {
-        KINDS.iter().find(|kind| kind.raw == raw || kind.tool == raw)
+    /// 提供方包带来的新能力的定义（id → {id, title, symbol, detail, tool, description, parameters, paid}）
+    static CATALOG: LazyLock<Mutex<Vec<Value>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+    fn builtin(raw: &str) -> Option<&'static Builtin> {
+        BUILTINS.iter().find(|kind| kind.raw == raw)
     }
+
+    fn definition(raw: &str) -> Option<Value> {
+        CATALOG.lock().unwrap().iter().find(|definition| definition["id"] == raw).cloned()
+    }
+
+    fn text_of(value: &Value, key: &str) -> String {
+        value.get(key).and_then(Value::as_str).unwrap_or("").to_string()
+    }
+
+    pub fn kind_title(raw: &str) -> String {
+        builtin(raw)
+            .map(|kind| kind.title.to_string())
+            .or_else(|| definition(raw).map(|value| text_of(&value, "title")))
+            .unwrap_or(raw.into())
+    }
+
+    fn kind_symbol(raw: &str) -> String {
+        builtin(raw)
+            .map(|kind| kind.symbol.to_string())
+            .or_else(|| definition(raw).map(|value| text_of(&value, "symbol")))
+            .unwrap_or_else(|| "puzzlepiece.extension".into())
+    }
+
+    fn kind_detail(raw: &str) -> String {
+        builtin(raw)
+            .map(|kind| kind.detail.to_string())
+            .or_else(|| definition(raw).map(|value| text_of(&value, "detail")))
+            .unwrap_or_default()
+    }
+
+    pub fn kind_tool(raw: &str) -> String {
+        builtin(raw)
+            .map(|kind| kind.tool.to_string())
+            .or_else(|| definition(raw).map(|value| text_of(&value, "tool")))
+            .unwrap_or(raw.into())
+    }
+
+    fn kind_paid(raw: &str) -> bool {
+        builtin(raw).map(|kind| kind.paid).unwrap_or_else(|| definition(raw).is_some_and(|value| value["paid"] == true))
+    }
+
+    /// 全部能力：内置在前，其余按 id 排
+    fn all_kinds() -> Vec<String> {
+        let mut custom: Vec<String> = CATALOG.lock().unwrap().iter().map(|definition| text_of(definition, "id")).collect();
+        custom.sort();
+        BUILTINS.iter().map(|kind| kind.raw.to_string()).chain(custom).collect()
+    }
+
+    fn kind_for_tool(tool: &str) -> Option<String> {
+        all_kinds().into_iter().find(|raw| kind_tool(raw) == tool)
+    }
+
+    // MARK: 提供方类型
+
+    fn type_title(kind: &str) -> &'static str {
+        match kind {
+            "dashscope" => "阿里云百炼（通义 / 万相）",
+            "openAICompatible" => "OpenAI 兼容接口",
+            "volcengineArk" => "火山方舟（豆包 / Seedream / Seedance）",
+            "volcengineSpeech" => "豆包语音（识别 / 合成）",
+            "script" => "脚本提供方",
+            "power" => "本地能力",
+            _ => "提供方",
+        }
+    }
+
+    fn type_detail(kind: &str) -> &'static str {
+        match kind {
+            "dashscope" => {
+                "国内直连。看图用 Qwen-VL，生图用万相 / Qwen-Image，生视频用万相，听录音用 Qwen3-ASR，说话用 Qwen3-TTS。需要 DASHSCOPE_API_KEY"
+            }
+            "openAICompatible" => "OpenAI、DeepSeek、Moonshot、硅基流动等任何兼容 /v1 的服务；也可指向本机 Ollama",
+            "volcengineArk" => "国内直连。看图用豆包，生图用 Seedream，生视频用 Seedance。需要 ARK_API_KEY",
+            "volcengineSpeech" => {
+                "国内直连。听录音用录音文件识别极速版，说话用豆包语音合成大模型。需要 VOLC_SPEECH_KEY（火山引擎语音技术控制台的 API Key）"
+            }
+            "script" => "由智能体创建或从文件导入的提供方：一个脚本实现一项或几项能力，可以是现有能力的另一种实现，也可以是新能力",
+            "power" => "在 设置 › 能力 里装的本机服务（如本地语音）：用本机 GPU 听录音、说话，不联网、不花钱",
+            _ => "",
+        }
+    }
+
+    const TYPES: [&str; 6] = ["dashscope", "openAICompatible", "volcengineArk", "volcengineSpeech", "script", "power"];
+
+    // MARK: 存档
 
     fn settings_path() -> PathBuf {
         crate::serve_dir().join("capabilities.json")
@@ -13970,185 +16717,1878 @@ mod caps {
         crate::serve_dir().join("media")
     }
 
-    /// 本机的提供方：装着、清单里写了这几项能力的 Power（用户的开关、关掉的项、名字记在 capabilities.json 的 powerEntries）
-    fn entries() -> Vec<Value> {
-        let saved = crate::read_json_file(&settings_path());
-        let state = powers::state();
-        state["powers"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|power| power["installedVersion"].as_str().is_some_and(|version| !version.is_empty()))
-            .filter_map(|power| {
-                let id = power["id"].as_str().unwrap_or("").to_string();
-                let declared: Vec<&str> = power["capabilities"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
-                let kinds: Vec<&str> = KINDS.iter().filter(|kind| declared.contains(&kind.power)).map(|kind| kind.raw).collect();
-                if kinds.is_empty() {
-                    return None;
+    pub fn providers_root() -> PathBuf {
+        crate::serve_dir().join("providers")
+    }
+
+    struct Registry {
+        loaded: bool,
+        entries: Vec<Value>,
+        jobs: Vec<Value>,
+        packages: Vec<Value>,
+        problems: Vec<String>,
+        /// refreshAvailability 的结果：「提供方 id|能力」→ {ready, needs}
+        availability: Map<String, Value>,
+    }
+
+    static REGISTRY: LazyLock<Mutex<Registry>> = LazyLock::new(|| {
+        Mutex::new(Registry {
+            loaded: false,
+            entries: Vec::new(),
+            jobs: Vec::new(),
+            packages: Vec::new(),
+            problems: Vec::new(),
+            availability: Map::new(),
+        })
+    });
+
+    /// 在常驻那份里（注册表只在它那里改；网关进程里每次从文件读）
+    pub static IS_HUB: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// 改之前先读一遍（第一次用到时；之前的版本存的格式换成 Friday 的）
+    fn with<T>(change: impl FnOnce(&mut Registry) -> T) -> T {
+        let mut registry = REGISTRY.lock().unwrap();
+        if !registry.loaded || !IS_HUB.load(std::sync::atomic::Ordering::Relaxed) {
+            registry.loaded = true;
+            load(&mut registry);
+        }
+        change(&mut registry)
+    }
+
+    /// 全部提供方（在线服务的接入、开关要按它找）
+    pub fn all_entries() -> Vec<Value> {
+        entries()
+    }
+
+    pub fn secret_names_of(entry: &Value) -> Vec<String> {
+        secret_names(entry)
+    }
+
+    /// 新建提供方（id = 类型小写，重复时加 -<6 位>）；回 id
+    pub fn add_entry(kind: &str, title: &str, options: Map<String, Value>) -> String {
+        let id = with(|registry| {
+            let base = kind.to_lowercase();
+            let taken = registry.entries.iter().any(|entry| entry["id"] == json!(base));
+            let id = if taken { format!("{base}-{}", &uuid::Uuid::new_v4().simple().to_string()[..6]) } else { base };
+            registry.entries.push(json!({ "id": id, "type": kind, "title": title, "options": options, "enabled": true }));
+            save(registry);
+            id
+        });
+        changed();
+        id
+    }
+
+    pub fn change_entry(id: &str, change: impl FnOnce(&mut Value)) -> bool {
+        update_entry(id, change)
+    }
+
+    pub fn remove_entry(id: &str) {
+        with(|registry| {
+            registry.entries.retain(|entry| entry["id"] != id);
+            save(registry);
+        });
+        changed();
+    }
+
+    fn load(registry: &mut Registry) {
+        let raw = crate::read_json_file(&settings_path());
+        // edith-friday 0.3：本地能力的开关、改名、关掉的项记在 powerEntries 的对象里（{id: {...}}）：换成条目
+        if let Some(old) = raw["powerEntries"].as_object() {
+            let mut entries = Vec::new();
+            for (id, user) in old {
+                let power = id.strip_prefix("power-").unwrap_or(id);
+                let mut entry = json!({ "id": id, "type": "power", "title": user["title"].as_str().unwrap_or(power), "options": { "power": power },
+                    "enabled": user["enabled"].as_bool().unwrap_or(true) });
+                if let Some(kinds) = user["disabledKinds"].as_array().filter(|kinds| !kinds.is_empty()) {
+                    entry["disabledKinds"] = json!(kinds);
                 }
-                let entry_id = format!("power-{id}");
-                let user = &saved["powerEntries"][&entry_id];
-                Some(json!({
-                    "id": entry_id,
-                    "type": "power",
-                    "title": user["title"].as_str().map(str::to_string).unwrap_or_else(|| power["title"].as_str().unwrap_or(&id).to_string()),
-                    "options": { "power": id, "capabilities": kinds.join(",") },
-                    "enabled": user["enabled"].as_bool().unwrap_or(true),
-                    "disabledKinds": user["disabledKinds"].as_array().cloned().unwrap_or_default(),
-                    "kinds": kinds,
-                    "powerEnabled": power["enabled"].as_bool().unwrap_or(true),
-                }))
+                entries.push(entry);
+            }
+            registry.entries = entries;
+        } else {
+            registry.entries = friday_core::capability_store::load_config(&settings_path())["entries"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|entry| {
+                    entry["id"].is_string() && entry["title"].is_string() && TYPES.contains(&entry["type"].as_str().unwrap_or(""))
+                })
+                .collect();
+        }
+        // 0.3 的任务（{jobs: [...]}，provider / files 这几个键）：换成 Friday 的
+        let jobs_raw = crate::read_json_file(&jobs_path());
+        registry.jobs = match jobs_raw {
+            Value::Object(object) => object
+                .get("jobs")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|mut job| {
+                    if let Some(provider) = job.get("provider").cloned() {
+                        job["providerID"] = provider;
+                    }
+                    let files: Vec<Value> = job["files"].as_array().cloned().unwrap_or_default();
+                    job["media"] = json!(files.iter().filter_map(Value::as_str).map(media_json).collect::<Vec<_>>());
+                    job
+                })
+                .collect(),
+            _ => friday_core::capability_store::load_jobs(&jobs_path()),
+        };
+    }
+
+    fn save(registry: &Registry) {
+        let _ = std::fs::create_dir_all(crate::serve_dir());
+        let _ = friday_core::capability_store::save_config(&settings_path(), &registry.entries);
+    }
+
+    fn save_jobs(registry: &mut Registry) {
+        registry.jobs.truncate(50);
+        let _ = friday_core::capability_store::save_jobs(&jobs_path(), &registry.jobs);
+    }
+
+    fn entries() -> Vec<Value> {
+        with(|registry| registry.entries.clone())
+    }
+
+    fn entry(id: &str) -> Option<Value> {
+        entries().into_iter().find(|entry| entry["id"] == id)
+    }
+
+    fn update_entry(id: &str, change: impl FnOnce(&mut Value)) -> bool {
+        let found = with(|registry| {
+            let found = registry.entries.iter_mut().find(|entry| entry["id"] == id).map(|entry| {
+                change(entry);
+            });
+            if found.is_some() {
+                save(registry);
+            }
+            found.is_some()
+        });
+        if found {
+            changed();
+        }
+        found
+    }
+
+    fn kind_of(entry: &Value) -> &str {
+        entry["type"].as_str().unwrap_or("")
+    }
+
+    /// 选项值（去空白后为空用默认值）
+    fn option(entry: &Value, key: &str, default: &str) -> String {
+        let value = entry["options"][key].as_str().unwrap_or("").trim();
+        if value.is_empty() { default.to_string() } else { value.to_string() }
+    }
+
+    fn allows(entry: &Value, kind: &str) -> bool {
+        !entry["disabledKinds"].as_array().is_some_and(|kinds| kinds.iter().any(|item| item == kind))
+    }
+
+    fn enabled(entry: &Value) -> bool {
+        entry["enabled"].as_bool().unwrap_or(true)
+    }
+
+    // MARK: 本机（Power）的提供方：跟着装好的 Power 走
+
+    /// 装好、清单里写了这几项能力的 Power 各一个提供方（power-<id>）；卸掉的删掉。用户的开关、改的名字留着
+    pub fn sync_powers() {
+        let state = powers::state();
+        let known = ["transcription", "speech", "imageGeneration", "videoGeneration"];
+        let mut wanted: Vec<(String, String, String)> = Vec::new();
+        for power in state["powers"].as_array().into_iter().flatten() {
+            if power["installedVersion"].as_str().is_none_or(|version| version.is_empty()) {
+                continue;
+            }
+            let declared: Vec<&str> = power["capabilities"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .filter(|raw| known.contains(raw))
+                .collect();
+            if declared.is_empty() {
+                continue;
+            }
+            let id = power["id"].as_str().unwrap_or("").to_string();
+            wanted.push((id.clone(), power["title"].as_str().unwrap_or(&id).to_string(), declared.join(",")));
+        }
+        let changed_any = with(|registry| {
+            let mut changed_any = false;
+            for (power, title, capabilities) in &wanted {
+                let id = format!("power-{power}");
+                match registry.entries.iter_mut().find(|entry| entry["id"] == json!(id)) {
+                    Some(entry) => {
+                        if entry["options"]["capabilities"] != json!(capabilities) || entry["type"] != "power" {
+                            entry["type"] = json!("power");
+                            entry["options"]["power"] = json!(power);
+                            entry["options"]["capabilities"] = json!(capabilities);
+                            changed_any = true;
+                        }
+                    }
+                    None => {
+                        registry.entries.push(json!({ "id": id, "type": "power", "title": title, "options": { "power": power, "capabilities": capabilities }, "enabled": true }));
+                        changed_any = true;
+                    }
+                }
+            }
+            let before = registry.entries.len();
+            registry.entries.retain(|entry| {
+                entry["type"] != "power" || wanted.iter().any(|(power, _, _)| entry["id"] == json!(format!("power-{power}")))
+            });
+            changed_any |= registry.entries.len() != before;
+            if changed_any {
+                save(registry);
+            }
+            changed_any
+        });
+        if changed_any {
+            changed();
+        }
+    }
+
+    // MARK: 脚本提供方的包
+
+    fn builtin_ids() -> Vec<String> {
+        BUILTINS.iter().map(|kind| kind.raw.to_string()).collect()
+    }
+
+    /// 重新读 providers/：登记新能力的定义，给每个包建（或删掉）对应的提供方
+    pub fn reload_packages() {
+        let root = providers_root();
+        let loaded = friday_core::provider_store::load_all(&root);
+        let mut problems: Vec<String> =
+            loaded["problems"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect();
+        let packages: Vec<Value> = loaded["packages"].as_array().cloned().unwrap_or_default();
+        // 先登记全部定义（一个包可以实现别的包定义的新能力）：内置能力、已有工具名撞了的不收
+        let mut accepted: Vec<Value> = Vec::new();
+        let mut rejected: HashMap<String, String> = HashMap::new();
+        let mut tools: Vec<String> = BUILTINS.iter().map(|kind| kind.tool.to_string()).collect();
+        tools.extend(["check_job", "create_provider", "read_provider"].iter().map(|name| name.to_string()));
+        for package in &packages {
+            for definition in package["manifest"]["definitions"].as_array().into_iter().flatten() {
+                let id = text_of(definition, "id");
+                if builtin(&id).is_some() || accepted.iter().any(|existing| existing["id"] == json!(id)) {
+                    continue;
+                }
+                let tool = definition["tool"].as_str().map(str::to_string).unwrap_or_else(|| id.clone());
+                if tools.contains(&tool) {
+                    rejected.insert(id, format!("工具名 {tool} 已被占用"));
+                    continue;
+                }
+                tools.push(tool.clone());
+                let mut normalized = definition.clone();
+                normalized["tool"] = json!(tool);
+                if normalized["title"].as_str().is_none_or(str::is_empty) {
+                    normalized["title"] = json!(id);
+                }
+                if normalized["symbol"].as_str().is_none_or(str::is_empty) {
+                    normalized["symbol"] = json!("puzzlepiece.extension");
+                }
+                accepted.push(normalized);
+                rejected.remove(&id);
+            }
+        }
+        *CATALOG.lock().unwrap() = accepted;
+        let known = all_kinds();
+        let builtins = builtin_ids();
+        let catalog: Vec<String> = known.iter().filter(|raw| !builtins.contains(raw)).cloned().collect();
+        let mut valid = Vec::new();
+        for package in packages {
+            let manifest = package["manifest"].as_object().cloned().unwrap_or_default();
+            let id = manifest.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+            let missing = manifest
+                .get("capabilities")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .find(|raw| !known.iter().any(|known| known == raw))
+                .map(str::to_string);
+            let clashes = entries().iter().any(|entry| entry["id"] == json!(id) && entry["type"] != "script");
+            if let Some(problem) = friday_core::provider_store::problem(&manifest, &builtins, &catalog) {
+                problems.push(format!("Providers/{id}：{problem}"));
+            } else if let Some(missing) = missing {
+                let reason = rejected.get(&missing).map(|reason| format!("（{reason}）")).unwrap_or_default();
+                problems.push(format!("Providers/{id}：能力 {missing} 的定义没有生效{reason}，这个提供方先不载入"));
+            } else if clashes {
+                problems.push(format!("Providers/{id}：id 和内置提供方重名，换个 id"));
+            } else {
+                valid.push(package);
+            }
+        }
+        let changed_any = with(|registry| {
+            registry.packages = valid.clone();
+            registry.problems = problems;
+            let ids: Vec<String> = valid.iter().map(|package| text_of(&package["manifest"], "id")).collect();
+            let before = registry.entries.len();
+            registry.entries.retain(|entry| entry["type"] != "script" || ids.iter().any(|id| entry["id"] == json!(id)));
+            let mut changed_any = registry.entries.len() != before;
+            for package in &valid {
+                let id = text_of(&package["manifest"], "id");
+                if registry.entries.iter().any(|entry| entry["id"] == json!(id)) {
+                    continue;
+                }
+                registry.entries.push(
+                    json!({ "id": id, "type": "script", "title": text_of(&package["manifest"], "title"), "options": {}, "enabled": true }),
+                );
+                changed_any = true;
+            }
+            if changed_any {
+                save(registry);
+            }
+            true
+        });
+        if changed_any {
+            changed();
+        }
+    }
+
+    fn package_of(entry: &Value) -> Option<Value> {
+        if entry["type"] != "script" {
+            return None;
+        }
+        with(|registry| registry.packages.iter().find(|package| package["manifest"]["id"] == entry["id"]).cloned())
+    }
+
+    fn package(id: &str) -> Option<Value> {
+        with(|registry| registry.packages.iter().find(|package| package["manifest"]["id"] == id).cloned())
+    }
+
+    // MARK: 设置项
+
+    fn spec(key: &str, title: &str, default: &str, hint: &str, kind: Option<&str>) -> Value {
+        json!({ "id": key, "key": key, "title": title, "defaultValue": default, "hint": hint, "kind": kind.unwrap_or(""), "control": "text",
+            "choices": [], "on": "on", "off": "off", "minimum": 0, "maximum": 100, "step": 1, "start": null, "pathKind": "folder",
+            "advanced": false, "placeholder": "", "hasPlaceholder": false })
+    }
+
+    fn choices(mut spec: Value, items: &[(&str, &str)]) -> Value {
+        spec["choices"] = json!(
+            items
+                .iter()
+                .map(|(value, title)| json!({ "value": value, "title": if title.is_empty() { *value } else { *title } }))
+                .collect::<Vec<_>>()
+        );
+        spec
+    }
+
+    fn advanced(mut spec: Value) -> Value {
+        spec["advanced"] = json!(true);
+        spec
+    }
+
+    fn placeholder(mut spec: Value, text: &str) -> Value {
+        spec["placeholder"] = json!(text);
+        spec["hasPlaceholder"] = json!(true);
+        spec
+    }
+
+    fn secret_control(mut spec: Value) -> Value {
+        spec["control"] = json!("secret");
+        spec
+    }
+
+    const QWEN_VOICES: [(&str, &str); 19] = [
+        ("longanhuan_v3.6", "longanhuan_v3.6 龙安欢（Qwen-Audio-3.0，Token Plan 默认）"),
+        ("longxiaochun", "longxiaochun 龙小淳（Qwen-Audio-3.0）"),
+        ("Cherry", "Cherry 芊悦（阳光女声）"),
+        ("Ethan", "Ethan 晨煦（阳光男声）"),
+        ("Nofish", "Nofish 不吃鱼（男声）"),
+        ("Jennifer", "Jennifer 詹妮弗（美式英语女声）"),
+        ("Ryan", "Ryan 甜茶（男声）"),
+        ("Katerina", "Katerina 卡捷琳娜（女声）"),
+        ("Elias", "Elias 墨讲师（男声）"),
+        ("Dylan", "Dylan 北京-晓东（北京话）"),
+        ("Jada", "Jada 上海-阿珍（上海话）"),
+        ("Sunny", "Sunny 四川-晴儿（四川话）"),
+        ("Eric", "Eric 四川-程川（四川话）"),
+        ("Li", "Li 南京-老李（南京话）"),
+        ("Marcus", "Marcus 陕西-秦川（陕西话）"),
+        ("Roy", "Roy 闽南-阿杰（闽南语）"),
+        ("Peter", "Peter 天津-李彼得（天津话）"),
+        ("Rocky", "Rocky 粤语-阿强（粤语）"),
+        ("Kiki", "Kiki 粤语-阿清（粤语）"),
+    ];
+
+    const DASHSCOPE_BASE: &str = "https://dashscope.aliyuncs.com";
+    const TOKEN_PLAN_BASE: &str = "https://token-plan.maas.qianwenaiapi.com";
+    const OPENAI_BASE: &str = "https://api.openai.com/v1";
+    const ARK_BASE: &str = "https://ark.cn-beijing.volces.com/api/v3";
+    const SPEECH_BASE: &str = "https://openspeech.bytedance.com";
+    const DOUBAO_VOICE: &str = "zh_female_shuangkuaisisi_moon_bigtts";
+    const DOUBAO_ASR: &str = "volc.bigasr.auc_turbo";
+
+    fn type_specs(kind: &str) -> Vec<Value> {
+        match kind {
+            "dashscope" => {
+                let vl = [("qwen-vl-max", ""), ("qwen-vl-plus", ""), ("qwen3-vl-plus", "")];
+                vec![
+                    choices(spec("visionModel", "看图模型", "qwen-vl-max", "", Some("vision")), &vl),
+                    choices(spec("videoUnderstandingModel", "看视频模型", "qwen-vl-max", "", Some("videoUnderstanding")), &vl),
+                    choices(
+                        spec("imageModel", "生图模型", "wan2.2-t2i-flash", "", Some("imageGeneration")),
+                        &[("wan2.2-t2i-flash", ""), ("wan2.2-t2i-plus", ""), ("qwen-image", "")],
+                    ),
+                    spec("imageEditModel", "参考图生图模型", "qwen-image-edit", "给了参考图时使用", Some("imageGeneration")),
+                    spec("videoModel", "文生视频模型", "wan2.2-t2v-plus", "", Some("videoGeneration")),
+                    spec("i2vModel", "图生视频模型", "wan2.2-i2v-plus", "给了参考图时使用", Some("videoGeneration")),
+                    choices(
+                        spec(
+                            "transcriptionModel",
+                            "识别模型",
+                            "qwen3-asr-flash",
+                            "Token Plan 不填用 qwen-audio-3.0-asr-flash",
+                            Some("transcription"),
+                        ),
+                        &[("qwen3-asr-flash", ""), ("qwen-audio-3.0-asr-flash", "")],
+                    ),
+                    choices(
+                        spec("speechModel", "合成模型", "qwen3-tts-flash", "Token Plan 不填用 qwen-audio-3.0-tts-plus", Some("speech")),
+                        &[("qwen3-tts-flash", ""), ("qwen-audio-3.0-tts-plus", ""), ("qwen-audio-3.0-tts-flash", "")],
+                    ),
+                    choices(
+                        spec(
+                            "speechVoice",
+                            "音色",
+                            "Cherry",
+                            "智能体没指定音色时用；Qwen-Audio-3.0 的模型不填用 longanhuan_v3.6",
+                            Some("speech"),
+                        ),
+                        &QWEN_VOICES,
+                    ),
+                    advanced(choices(
+                        spec(
+                            "baseURL",
+                            "接口地址",
+                            DASHSCOPE_BASE,
+                            "Token Plan 的密钥（sk-sp- 开头）只能用 Token Plan 的地址，填了百炼的地址也会自动换过去",
+                            None,
+                        ),
+                        &[(DASHSCOPE_BASE, "国内版"), ("https://dashscope-intl.aliyuncs.com", "国际版"), (TOKEN_PLAN_BASE, "Token Plan")],
+                    )),
+                ]
+            }
+            "openAICompatible" => vec![
+                spec("visionModel", "看图模型", "gpt-4o-mini", "", Some("vision")),
+                placeholder(
+                    spec("videoUnderstandingModel", "看视频模型", "", "按抽帧的多张图片发送", Some("videoUnderstanding")),
+                    "和看图模型相同",
+                ),
+                spec("imageModel", "生图模型", "gpt-image-1", "", Some("imageGeneration")),
+                spec("videoModel", "生视频模型", "sora-2", "仅 OpenAI 的 /videos 接口", Some("videoGeneration")),
+                choices(
+                    spec(
+                        "transcriptionModel",
+                        "识别模型",
+                        "gpt-4o-mini-transcribe",
+                        "audio/transcriptions 接口；Groq、硅基流动等也有",
+                        Some("transcription"),
+                    ),
+                    &[("gpt-4o-mini-transcribe", ""), ("gpt-4o-transcribe", ""), ("whisper-1", "")],
+                ),
+                choices(
+                    spec("speechModel", "合成模型", "gpt-4o-mini-tts", "audio/speech 接口", Some("speech")),
+                    &[("gpt-4o-mini-tts", ""), ("tts-1", ""), ("tts-1-hd", "")],
+                ),
+                choices(
+                    spec("speechVoice", "音色", "alloy", "智能体没指定音色时用", Some("speech")),
+                    &[
+                        ("alloy", ""),
+                        ("ash", ""),
+                        ("coral", ""),
+                        ("echo", ""),
+                        ("fable", ""),
+                        ("nova", ""),
+                        ("onyx", ""),
+                        ("sage", ""),
+                        ("shimmer", ""),
+                    ],
+                ),
+                advanced(spec(
+                    "baseURL",
+                    "接口地址",
+                    OPENAI_BASE,
+                    "以 /v1 结尾。DeepSeek：https://api.deepseek.com/v1；硅基流动：https://api.siliconflow.cn/v1；本机 Ollama：http://localhost:11434/v1",
+                    None,
+                )),
+                advanced(secret_control(spec(
+                    "apiKeySecret",
+                    "密钥",
+                    "OPENAI_API_KEY",
+                    "用密钥库里的哪一个；本机 Ollama 这类不需要密钥的选「不需要」",
+                    None,
+                ))),
+            ],
+            "volcengineArk" => vec![
+                spec("visionModel", "看图模型", "doubao-seed-1-6-250615", "在方舟控制台开通的视觉模型或接入点 ID", Some("vision")),
+                spec("videoUnderstandingModel", "看视频模型", "doubao-seed-1-6-250615", "", Some("videoUnderstanding")),
+                spec("imageModel", "生图模型", "doubao-seedream-4-0-250828", "", Some("imageGeneration")),
+                spec("videoModel", "生视频模型", "doubao-seedance-1-0-pro-250528", "", Some("videoGeneration")),
+                advanced(spec("baseURL", "接口地址", ARK_BASE, "", None)),
+            ],
+            "volcengineSpeech" => vec![
+                choices(
+                    spec(
+                        "speechVoice",
+                        "音色",
+                        DOUBAO_VOICE,
+                        "音色 ID，在控制台「音色列表」里查；要先开通对应的合成模型（1.0 / 2.0）",
+                        Some("speech"),
+                    ),
+                    &[
+                        ("zh_female_shuangkuaisisi_moon_bigtts", "爽快思思（1.0）"),
+                        ("zh_male_wennuanahu_moon_bigtts", "温暖阿虎（1.0）"),
+                        ("zh_female_wanwanxiaohe_moon_bigtts", "湾湾小何（1.0）"),
+                        ("zh_male_jingqiangkanye_moon_bigtts", "京腔侃爷（1.0）"),
+                        ("zh_female_vv_uranus_bigtts", "Vivi（2.0）"),
+                    ],
+                ),
+                placeholder(
+                    advanced(spec(
+                        "appID",
+                        "APP ID",
+                        "",
+                        "只有旧版控制台要填：填了以后 VOLC_SPEECH_KEY 当 Access Token 用；新版控制台的 API Key 不用填",
+                        None,
+                    )),
+                    "新版控制台不用填",
+                ),
+                placeholder(
+                    advanced(spec(
+                        "speechResource",
+                        "合成资源 ID",
+                        "",
+                        "不填按音色自动选：seed-tts-1.0 / seed-tts-2.0 / seed-icl-2.0",
+                        Some("speech"),
+                    )),
+                    "按音色自动",
+                ),
+                advanced(spec("transcriptionResource", "识别资源 ID", DOUBAO_ASR, "", Some("transcription"))),
+                advanced(spec("baseURL", "接口地址", SPEECH_BASE, "", None)),
+            ],
+            _ => Vec::new(),
+        }
+    }
+
+    /// 脚本提供方清单里的设置项 → 设置页的
+    fn manifest_spec(item: &Value) -> Value {
+        let key = text_of(item, "key");
+        let control = item["control"].as_str().unwrap_or("text");
+        let mut value = spec(
+            &key,
+            item["title"].as_str().unwrap_or(&key),
+            &match &item["default"] {
+                Value::String(text) => text.clone(),
+                Value::Null => String::new(),
+                other => other.to_string(),
+            },
+            item["hint"].as_str().unwrap_or(""),
+            item["capability"].as_str(),
+        );
+        let (control, path) = match control {
+            "folder" | "file" | "audio" => ("path", control),
+            other => (other, "folder"),
+        };
+        value["control"] = json!(control);
+        value["pathKind"] = json!(path);
+        if let Some(items) = item["choices"].as_array() {
+            value["choices"] = json!(
+                items
+                    .iter()
+                    .map(|choice| {
+                        let value = choice["value"].as_str().map(str::to_string).unwrap_or_else(|| choice["value"].to_string());
+                        json!({ "value": value, "title": choice["title"].as_str().unwrap_or(&value) })
+                    })
+                    .collect::<Vec<_>>()
+            );
+        }
+        for key in ["minimum", "maximum", "step"] {
+            if let Some(number) = item[key].as_i64() {
+                value[key] = json!(number);
+            }
+        }
+        if let Some(text) = item["placeholder"].as_str() {
+            value = placeholder(value, text);
+        }
+        if item["advanced"] == true {
+            value = advanced(value);
+        }
+        value
+    }
+
+    fn option_specs(entry: &Value) -> Vec<Value> {
+        match kind_of(entry) {
+            "script" => package_of(entry)
+                .map(|package| package["manifest"]["options"].as_array().cloned().unwrap_or_default().iter().map(manifest_spec).collect())
+                .unwrap_or_default(),
+            other => type_specs(other),
+        }
+    }
+
+    /// 选项的默认值（脚本提供方的 settings 要带上）
+    fn option_with_default(entry: &Value, key: &str) -> String {
+        let default =
+            option_specs(entry).iter().find(|spec| spec["key"] == key).map(|spec| text_of(spec, "defaultValue")).unwrap_or_default();
+        option(entry, key, &default)
+    }
+
+    /// 只认一个固定密钥名的（百炼、方舟、豆包语音）也能按实例配：apiKeySecret 选项（同一家服务接了第二个账号时是 X_2…）
+    fn instance_secret(entry: &Value, default: &str) -> String {
+        let name = option(entry, "apiKeySecret", "");
+        if name.is_empty() { default.to_string() } else { name }
+    }
+
+    fn secret_names(entry: &Value) -> Vec<String> {
+        match kind_of(entry) {
+            "dashscope" => vec![instance_secret(entry, "DASHSCOPE_API_KEY")],
+            "volcengineArk" => vec![instance_secret(entry, "ARK_API_KEY")],
+            "volcengineSpeech" => vec![instance_secret(entry, "VOLC_SPEECH_KEY")],
+            "openAICompatible" => {
+                let name = option(entry, "apiKeySecret", "OPENAI_API_KEY");
+                if name.eq_ignore_ascii_case("none") { Vec::new() } else { vec![name.trim().to_uppercase().replace(['-', ' '], "_")] }
+            }
+            "script" => package_of(entry)
+                .map(|package| {
+                    package["manifest"]["secrets"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect()
+                })
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// 这个提供方要的密钥（EDITH 的 secrets.json 里取）
+    fn secrets_of(entry: &Value) -> HashMap<String, String> {
+        let store = crate::read_json_file(&crate::edith_home().join("secrets.json"));
+        secret_names(entry).into_iter().filter_map(|name| store[&name].as_str().map(|value| (name, value.to_string()))).collect()
+    }
+
+    /// 能做的能力：OpenAI 兼容按配了哪些模型（看视频不单独配时跟看图），脚本提供方按包里的，本机按 Power 声明的
+    fn kinds_for(entry: &Value) -> Vec<String> {
+        let all6 = || BUILTINS.iter().map(|kind| kind.raw.to_string()).collect::<Vec<_>>();
+        match kind_of(entry) {
+            "dashscope" => all6(),
+            "volcengineArk" => vec!["vision".into(), "videoUnderstanding".into(), "imageGeneration".into(), "videoGeneration".into()],
+            "volcengineSpeech" => vec!["transcription".into(), "speech".into()],
+            "openAICompatible" => {
+                let keys = [
+                    ("visionModel", "vision"),
+                    ("videoUnderstandingModel", "videoUnderstanding"),
+                    ("imageModel", "imageGeneration"),
+                    ("videoModel", "videoGeneration"),
+                    ("transcriptionModel", "transcription"),
+                    ("speechModel", "speech"),
+                ];
+                let mut configured: Vec<&str> =
+                    keys.iter().filter(|(key, _)| !option(entry, key, "").is_empty()).map(|(_, kind)| *kind).collect();
+                if configured.contains(&"vision") && !configured.contains(&"videoUnderstanding") {
+                    configured.push("videoUnderstanding");
+                }
+                if configured.is_empty() {
+                    return all6();
+                }
+                BUILTINS.iter().filter(|kind| configured.contains(&kind.raw)).map(|kind| kind.raw.to_string()).collect()
+            }
+            "script" => package_of(entry)
+                .map(|package| {
+                    package["manifest"]["capabilities"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            "power" => {
+                let declared = option(entry, "capabilities", "");
+                ["transcription", "speech", "imageGeneration", "videoGeneration"]
+                    .iter()
+                    .filter(|raw| declared.split(',').any(|item| item.trim() == **raw))
+                    .map(|raw| raw.to_string())
+                    .collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn is_local(entry: &Value) -> bool {
+        match kind_of(entry) {
+            "power" => true,
+            "script" => package_of(entry).is_none_or(|package| package["manifest"]["online"] != true),
+            _ => false,
+        }
+    }
+
+    fn supports(entry: &Value, kind: &str) -> bool {
+        kinds_for(entry).iter().any(|raw| raw == kind)
+    }
+
+    fn is_active(entry: &Value) -> bool {
+        let kinds = kinds_for(entry);
+        enabled(entry) && (kinds.is_empty() || kinds.iter().any(|kind| allows(entry, kind)))
+    }
+
+    /// 能做这项能力的提供方：本机排在前面。默认只要用户允许的
+    fn providers(kind: &str, include_disabled: bool) -> Vec<Value> {
+        let all = entries();
+        let (mut local, mut online): (Vec<Value>, Vec<Value>) = (Vec::new(), Vec::new());
+        for entry in all {
+            if !supports(&entry, kind) || !(include_disabled || (enabled(&entry) && allows(&entry, kind))) {
+                continue;
+            }
+            if is_local(&entry) { local.push(entry) } else { online.push(entry) }
+        }
+        local.extend(online);
+        local
+    }
+
+    fn usable(kind: &str) -> bool {
+        !providers(kind, false).is_empty()
+    }
+
+    // MARK: 可用性
+
+    /// 这一项能不能用、缺什么（文字直接给智能体和用户看）
+    fn availability(entry: &Value, kind: &str) -> (bool, String) {
+        if !supports(entry, kind) {
+            return (false, format!("{} 不支持{}", text_of(entry, "title"), kind_title(kind)));
+        }
+        match kind_of(entry) {
+            "power" => {
+                let power = option(entry, "power", "");
+                if !powers::is_installed(&power) {
+                    return (false, "还没安装（设置 › 能力）".into());
+                }
+                if !powers::is_enabled(&power) {
+                    return (false, "被关掉了（设置 › 能力）".into());
+                }
+                if kind == "imageGeneration" || kind == "videoGeneration" {
+                    let what = if kind == "videoGeneration" { "video" } else { "image" };
+                    let model = models::selected(what);
+                    if model.is_empty() {
+                        return (
+                            false,
+                            if what == "video" {
+                                "还没选本地生视频模型（模型库里类型选「生视频」，点「使用」）".into()
+                            } else {
+                                "还没选本地生图模型（模型库里类型选「生图」，点「使用」）".into()
+                            },
+                        );
+                    }
+                    if models::diffusion_request(&model).is_none() {
+                        return (false, format!("{model} 的文件还没下完（设置 › 能力里能看到进度）"));
+                    }
+                }
+                (true, String::new())
+            }
+            "script" => {
+                let Some(package) = package_of(entry) else {
+                    return (false, format!("提供方包 Providers/{} 不见了", text_of(entry, "id")));
+                };
+                let secrets = secrets_of(entry);
+                let missing: Vec<String> = secret_names(entry).into_iter().filter(|name| !secrets.contains_key(name)).collect();
+                if !missing.is_empty() {
+                    return (false, format!("需要密钥 {}（在 设置 › 服务与密钥 里添加）", missing.join("、")));
+                }
+                let language = package["manifest"]["language"].as_str().unwrap_or("python");
+                if crate::scripts::interpreter_of(language).is_none() {
+                    return (false, format!("找不到 {}，需要先安装", if language == "python" { "python3" } else { language }));
+                }
+                if package["manifest"]["check"] != true {
+                    return (true, String::new());
+                }
+                match run_script(&package, entry, &secrets, 30, None, json!({ "action": "check", "capability": kind }), None) {
+                    Err(error) => (false, format!("检查失败：{error}")),
+                    Ok(run) if !run.0 => (false, format!("检查失败：{}", run.2)),
+                    Ok(run) => match serde_json::from_str::<Value>(&run.1) {
+                        Ok(object) if object["ready"] == false => {
+                            (false, object["reason"].as_str().unwrap_or("脚本说还没准备好").to_string())
+                        }
+                        _ => (true, String::new()),
+                    },
+                }
+            }
+            _ => {
+                let secrets = secrets_of(entry);
+                let missing: Vec<String> = secret_names(entry).into_iter().filter(|name| !secrets.contains_key(name)).collect();
+                if missing.is_empty() {
+                    (true, String::new())
+                } else {
+                    (false, format!("需要密钥 {}（在 设置 › 服务与密钥 里添加）", missing.join("、")))
+                }
+            }
+        }
+    }
+
+    // MARK: 请求、结果
+
+    pub struct Request {
+        kind: String,
+        prompt: String,
+        inputs: Vec<String>,
+        options: HashMap<String, String>,
+        provider: Option<String>,
+        session: String,
+        /// 工具调用的原始参数（脚本提供方原样拿到；新能力只有这个）
+        arguments: Map<String, Value>,
+        cwd: Option<String>,
+    }
+
+    impl Request {
+        fn option(&self, key: &str) -> Option<&str> {
+            self.options.get(key).map(String::as_str).filter(|value| !value.trim().is_empty())
+        }
+
+        /// 生图张数：1–4
+        fn image_count(&self) -> u32 {
+            self.option("count").and_then(|count| count.trim().parse::<i64>().ok()).unwrap_or(1).clamp(1, 4) as u32
+        }
+    }
+
+    enum Outcome {
+        Text(String),
+        Files(Vec<ResultFile>, Option<String>),
+        Job(String, Option<String>),
+    }
+
+    enum Poll {
+        Pending(Option<String>),
+        Running(Option<String>),
+        Succeeded(Vec<ResultFile>, Option<String>),
+        Failed(String),
+    }
+
+    type Done = Result<Outcome, Error>;
+
+    fn secret_value(secrets: &HashMap<String, String>, name: &str) -> Option<String> {
+        secrets.get(name).cloned()
+    }
+
+    // MARK: OpenAI 风格的公共部分（百炼兼容模式、方舟、OpenAI 兼容都用）
+
+    /// 看图 / 看视频（抽帧后当多张图）。video_list：百炼兼容模式的 {"type":"video","video":[帧…]}
+    fn describe(base: &str, key: Option<&str>, model: &str, request: &Request, video_list: bool) -> Result<String, Error> {
+        let mut content = Vec::new();
+        for input in &request.inputs {
+            if request.kind == "videoUnderstanding" {
+                let frames = capnet::video_frames(input, 8, 1280)?;
+                let urls: Vec<String> = frames.iter().map(|frame| capnet::data_url(frame, "image/jpeg")).collect();
+                if video_list {
+                    content.push(json!({ "type": "video", "video": urls }));
+                } else {
+                    content.extend(urls.into_iter().map(|url| json!({ "type": "image_url", "image_url": { "url": url } })));
+                }
+            } else {
+                content.push(json!({ "type": "image_url", "image_url": { "url": capnet::image_url(input, 2048)? } }));
+            }
+        }
+        let text = if request.kind == "videoUnderstanding" && !video_list {
+            format!("以下是一段视频按时间顺序均匀抽取的 {} 帧。{}", content.len().max(1), request.prompt)
+        } else {
+            request.prompt.clone()
+        };
+        content.push(json!({ "type": "text", "text": text }));
+        let body = json!({ "model": model, "messages": [{ "role": "user", "content": content }], "max_tokens": 2048 });
+        let object = capnet::json("POST", &capnet::endpoint(base, "chat/completions")?, &capnet::bearer(key), Some(&body), 180)?;
+        if let Some(message) = capnet::string_at(&object, "choices.0.message.content") {
+            return Ok(message);
+        }
+        if let Some(parts) = capnet::at(&object, "choices.0.message.content").and_then(Value::as_array) {
+            let joined: String = parts.iter().filter_map(|part| part["text"].as_str()).collect();
+            if !joined.is_empty() {
+                return Ok(joined);
+            }
+        }
+        if let Some(error) = capnet::string_at(&object, "error.message") {
+            return Err(Error::new(error));
+        }
+        Err(Error::malformed(&capnet::describe(&object)))
+    }
+
+    fn parse_images(object: &Value) -> Result<Vec<ResultFile>, Error> {
+        let Some(items) = object["data"].as_array().filter(|items| !items.is_empty()) else {
+            if let Some(error) = capnet::string_at(object, "error.message") {
+                return Err(Error::new(error));
+            }
+            return Err(Error::malformed(&capnet::describe(object)));
+        };
+        let mut files = Vec::new();
+        for item in items {
+            if let Some(data) = item["b64_json"].as_str().and_then(|text| base64::engine::general_purpose::STANDARD.decode(text).ok()) {
+                files.push(ResultFile { data: Some(data), extension: "png".into(), mime: Some("image/png".into()), ..Default::default() });
+            } else if let Some(url) = item["url"].as_str() {
+                files.push(ResultFile::remote(url, "png"));
+            } else {
+                return Err(Error::malformed("images 结果里既没有 url 也没有 b64_json"));
+            }
+        }
+        Ok(files)
+    }
+
+    fn generate_image(
+        base: &str,
+        key: Option<&str>,
+        model: &str,
+        prompt: &str,
+        size: Option<String>,
+        count: u32,
+        extra: &Value,
+    ) -> Result<Vec<ResultFile>, Error> {
+        let mut body = json!({ "model": model, "prompt": prompt, "n": count });
+        if let Some(size) = size {
+            body["size"] = json!(size);
+        }
+        for (key, value) in extra.as_object().into_iter().flatten() {
+            body[key] = value.clone();
+        }
+        let object = capnet::json("POST", &capnet::endpoint(base, "images/generations")?, &capnet::bearer(key), Some(&body), 300)?;
+        parse_images(&object)
+    }
+
+    fn edit_image(
+        base: &str,
+        key: Option<&str>,
+        model: &str,
+        prompt: &str,
+        image: &str,
+        size: Option<String>,
+        count: u32,
+    ) -> Result<Vec<ResultFile>, Error> {
+        let (jpeg, mime) = capnet::jpeg(image, 2048)?;
+        let mut fields = vec![("model", model.to_string()), ("prompt", prompt.to_string()), ("n", count.to_string())];
+        if let Some(size) = size {
+            fields.push(("size", size));
+        }
+        let extension = if mime == "image/png" { "png" } else { "jpg" };
+        let file_name = format!("reference.{extension}");
+        let (content_type, body) = capnet::multipart(&fields, &[("image", &file_name, mime, &jpeg)]);
+        let response =
+            capnet::send("POST", &capnet::endpoint(base, "images/edits")?, &capnet::bearer(key), Some((&content_type, body)), 300)?;
+        if !response.ok() {
+            return Err(Error::http(response.status, &response.text(2000)));
+        }
+        parse_images(&response.json())
+    }
+
+    // MARK: OpenAI 兼容
+
+    fn openai_key(entry: &Value, secrets: &HashMap<String, String>) -> Option<String> {
+        secret_names(entry).first().and_then(|name| secret_value(secrets, name))
+    }
+
+    fn openai_perform(request: &Request, entry: &Value, secrets: &HashMap<String, String>) -> Done {
+        let base = option(entry, "baseURL", OPENAI_BASE);
+        let key = openai_key(entry, secrets);
+        let key = key.as_deref();
+        match request.kind.as_str() {
+            "vision" | "videoUnderstanding" => {
+                let vision = option(entry, "visionModel", "gpt-4o-mini");
+                let model = if request.kind == "vision" { vision } else { option(entry, "videoUnderstandingModel", &vision) };
+                Ok(Outcome::Text(describe(&base, key, &model, request, false)?))
+            }
+            "imageGeneration" => {
+                let model = option(entry, "imageModel", "gpt-image-1");
+                let count = request.image_count();
+                let size = capnet::parse_size(request.option("size"), 1024).map(|(width, height)| format!("{width}x{height}"));
+                let files = match request.inputs.first() {
+                    Some(reference) => edit_image(&base, key, &model, &request.prompt, reference, size, count)?,
+                    None => generate_image(&base, key, &model, &request.prompt, size, count, &json!({}))?,
+                };
+                let note = format!("已用 {model} 生成 {} 张图片。", files.len());
+                Ok(Outcome::Files(files, Some(note)))
+            }
+            "videoGeneration" => {
+                if !request.inputs.is_empty() {
+                    return Err(Error::new("这个提供方的图生视频尚未支持，请改用文生视频（不传 image），或换用百炼 / 火山方舟。"));
+                }
+                let model = option(entry, "videoModel", "sora-2");
+                let mut body = json!({ "model": model, "prompt": request.prompt });
+                if let Some(seconds) = request.option("duration").and_then(|value| value.trim().parse::<i64>().ok()) {
+                    body["seconds"] = json!(seconds.to_string());
+                }
+                if let Some((width, height)) = capnet::parse_size(request.option("size"), 1280) {
+                    body["size"] = json!(format!("{width}x{height}"));
+                }
+                let object = capnet::json("POST", &capnet::endpoint(&base, "videos")?, &capnet::bearer(key), Some(&body), 120)?;
+                let id = object["id"].as_str().ok_or_else(|| Error::malformed(&capnet::describe(&object)))?;
+                Ok(Outcome::Job(id.to_string(), None))
+            }
+            "transcription" => {
+                let input = request.inputs.first().ok_or("缺少参数 audio")?;
+                let model = option(entry, "transcriptionModel", "gpt-4o-mini-transcribe");
+                let clip = capnet::load_clip(input)?;
+                // audio/transcriptions 一次最多 25 MB：超过的解成 16 kHz 单声道、按 10 分钟切段
+                let parts: Vec<(Vec<u8>, String, String)> = if clip.data.len() > 24 * 1024 * 1024 {
+                    let pcm = capnet::decode(&clip, 16000)?;
+                    capnet::split(&pcm, 600.0)
+                        .iter()
+                        .map(|piece| (capnet::wav(piece), "wav".to_string(), "audio/wav".to_string()))
+                        .collect()
+                } else {
+                    vec![(
+                        clip.data.clone(),
+                        if clip.extension.is_empty() { "m4a".into() } else { clip.extension.clone() },
+                        clip.mime.clone(),
+                    )]
+                };
+                let language = capnet::language_code(request.option("language"));
+                let url = capnet::endpoint(&base, "audio/transcriptions")?;
+                let mut texts = Vec::new();
+                for (data, extension, mime) in parts {
+                    let mut fields = vec![("model", model.clone()), ("response_format", "json".to_string())];
+                    if let Some(language) = &language {
+                        fields.push(("language", language.clone()));
+                    }
+                    if let Some(prompt) = request.option("prompt") {
+                        fields.push(("prompt", prompt.to_string()));
+                    }
+                    let file_name = format!("audio.{extension}");
+                    let (content_type, body) = capnet::multipart(&fields, &[("file", &file_name, &mime, &data)]);
+                    let response = capnet::send("POST", &url, &capnet::bearer(key), Some((&content_type, body)), 300)?;
+                    if !response.ok() {
+                        return Err(Error::http(response.status, &response.text(2000)));
+                    }
+                    let object = response.json();
+                    texts.push(object["text"].as_str().ok_or_else(|| Error::malformed(&capnet::describe(&object)))?.to_string());
+                }
+                Ok(Outcome::Text(capnet::transcript(&texts)))
+            }
+            "speech" => {
+                if request.prompt.trim().is_empty() {
+                    return Err("缺少参数 text".into());
+                }
+                let model = option(entry, "speechModel", "gpt-4o-mini-tts");
+                let voice = request.option("voice").map(str::to_string).unwrap_or_else(|| option(entry, "speechVoice", "alloy"));
+                let wav = capnet::wants_wav(request.option("format"));
+                let url = capnet::endpoint(&base, "audio/speech")?;
+                let (mut mp3, mut pieces) = (Vec::new(), Vec::new());
+                for chunk in capnet::speech_chunks(&request.prompt, 4000) {
+                    let mut body =
+                        json!({ "model": model, "input": chunk, "voice": voice, "response_format": if wav { "wav" } else { "mp3" } });
+                    if let Some(style) = request.option("style") {
+                        body["instructions"] = json!(style);
+                    }
+                    if let Some(speed) = request
+                        .option("speed")
+                        .and_then(|value| value.parse::<f64>().ok())
+                        .filter(|speed| *speed > 0.0 && (speed - 1.0).abs() > 0.001)
+                    {
+                        body["speed"] = json!(speed.clamp(0.25, 4.0));
+                    }
+                    let response = capnet::send(
+                        "POST",
+                        &url,
+                        &capnet::bearer(key),
+                        Some(("application/json", serde_json::to_vec(&body).unwrap_or_default())),
+                        300,
+                    )?;
+                    if !response.ok() {
+                        return Err(Error::http(response.status, &response.text(2000)));
+                    }
+                    if response.mime().contains("json") {
+                        return Err(Error::malformed(&response.text(600)));
+                    }
+                    if wav {
+                        pieces.push(
+                            capnet::parse_wav(&response.body)
+                                .ok_or_else(|| Error::malformed(&format!("合成结果不是 WAV（{} 字节）", response.body.len())))?,
+                        );
+                    } else {
+                        mp3.extend(response.body);
+                    }
+                }
+                if wav {
+                    let merged = capnet::concat(&pieces, 0.15);
+                    let note = format!("已用 {model}（{voice}）合成 {:.1} 秒的语音。", merged.seconds());
+                    return Ok(Outcome::Files(vec![capnet::speech_output(&merged, request.option("format"))], Some(note)));
+                }
+                Ok(Outcome::Files(vec![ResultFile::encoded(mp3, "mp3")], Some(format!("已用 {model}（{voice}）合成语音。"))))
+            }
+            other => Err(Error::new(format!("{} 不支持{}", type_title("openAICompatible"), kind_title(other)))),
+        }
+    }
+
+    fn openai_poll(remote: &str, entry: &Value, secrets: &HashMap<String, String>) -> Result<Poll, Error> {
+        let base = option(entry, "baseURL", OPENAI_BASE);
+        let headers = capnet::bearer(openai_key(entry, secrets).as_deref());
+        let object = capnet::json("GET", &capnet::endpoint(&base, &format!("videos/{remote}"))?, &headers, None, 60)?;
+        let status = text_of(&object, "status").to_lowercase();
+        let progress = object["progress"].as_f64().map(|progress| format!("进度 {}%", progress as i64));
+        Ok(match status.as_str() {
+            "queued" => Poll::Pending(progress),
+            "in_progress" | "processing" => Poll::Running(progress),
+            "completed" | "succeeded" => {
+                let mut file = ResultFile::remote(&capnet::endpoint(&base, &format!("videos/{remote}/content"))?, "mp4");
+                file.headers = headers;
+                file.extension = "mp4".into();
+                file.mime = Some("video/mp4".into());
+                Poll::Succeeded(vec![file], None)
+            }
+            "failed" | "cancelled" | "error" => {
+                Poll::Failed(capnet::string_at(&object, "error.message").unwrap_or_else(|| format!("任务状态 {status}")))
+            }
+            _ => Poll::Running(Some(format!("状态 {status}"))),
+        })
+    }
+
+    // MARK: 阿里云百炼
+
+    /// 要的是根（…/compatible-mode/v1 这类去掉）；Token Plan 的密钥（sk-sp- 开头）用百炼公网地址时换成 Token Plan 的
+    fn dashscope_base(entry: &Value, secrets: &HashMap<String, String>) -> String {
+        let mut value = option(entry, "baseURL", DASHSCOPE_BASE).trim_end_matches('/').to_string();
+        for suffix in ["/compatible-mode/v1", "/apps/anthropic", "/api/v1"] {
+            if value.to_lowercase().ends_with(suffix) {
+                value.truncate(value.len() - suffix.len());
+                break;
+            }
+        }
+        let key = secret_value(secrets, &instance_secret(entry, "DASHSCOPE_API_KEY")).unwrap_or_default();
+        if key.trim().starts_with("sk-sp-") {
+            let host = value.split("://").nth(1).unwrap_or("").split('/').next().unwrap_or("").to_lowercase();
+            if ["dashscope.aliyuncs.com", "dashscope-intl.aliyuncs.com", "maas.qianwenaiapi.com"].contains(&host.as_str()) {
+                value = TOKEN_PLAN_BASE.into();
+            }
+        }
+        value
+    }
+
+    fn dashscope_headers(entry: &Value, secrets: &HashMap<String, String>, asynchronous: bool) -> Vec<(String, String)> {
+        let key = secret_value(secrets, &instance_secret(entry, "DASHSCOPE_API_KEY")).unwrap_or_default();
+        let mut headers = vec![("Authorization".to_string(), format!("Bearer {key}"))];
+        if asynchronous {
+            headers.push(("X-DashScope-Async".into(), "enable".into()));
+        }
+        headers
+    }
+
+    fn native_audio(model: &str) -> bool {
+        let name = model.to_lowercase();
+        name.starts_with("qwen-audio-") || name.starts_with("fun-asr") || name.starts_with("cosyvoice")
+    }
+
+    fn task_id(object: &Value) -> Result<String, Error> {
+        capnet::string_at(object, "output.task_id")
+            .ok_or_else(|| Error::malformed(&capnet::string_at(object, "message").unwrap_or_else(|| capnet::describe(object))))
+    }
+
+    fn dashscope_perform(request: &Request, entry: &Value, secrets: &HashMap<String, String>) -> Done {
+        let root = dashscope_base(entry, secrets);
+        let token_plan = root.contains("token-plan.");
+        let key = secret_value(secrets, &instance_secret(entry, "DASHSCOPE_API_KEY"));
+        match request.kind.as_str() {
+            "vision" | "videoUnderstanding" => {
+                let model = option(entry, if request.kind == "vision" { "visionModel" } else { "videoUnderstandingModel" }, "qwen-vl-max");
+                Ok(Outcome::Text(describe(&format!("{root}/compatible-mode/v1"), key.as_deref(), &model, request, true)?))
+            }
+            "imageGeneration" => {
+                let count = request.image_count();
+                let reference = !request.inputs.is_empty();
+                let model = if reference {
+                    option(entry, "imageEditModel", "qwen-image-edit")
+                } else {
+                    option(entry, "imageModel", if token_plan { "qwen-image-2.0" } else { "wan2.2-t2i-flash" })
+                };
+                if model.to_lowercase().starts_with("qwen-image") || reference {
+                    let mut content: Vec<Value> = Vec::new();
+                    for input in &request.inputs {
+                        content.push(json!({ "image": capnet::image_url(input, 2048)? }));
+                    }
+                    content.push(json!({ "text": request.prompt }));
+                    let mut parameters = json!({ "n": count, "prompt_extend": true, "watermark": false });
+                    if let Some((width, height)) = capnet::parse_size(request.option("size"), 1328) {
+                        parameters["size"] = json!(format!("{width}*{height}"));
+                    }
+                    if let Some(negative) = request.option("negative_prompt") {
+                        parameters["negative_prompt"] = json!(negative);
+                    }
+                    let body = json!({ "model": model, "input": { "messages": [{ "role": "user", "content": content }] }, "parameters": parameters });
+                    let object = capnet::json(
+                        "POST",
+                        &format!("{root}/api/v1/services/aigc/multimodal-generation/generation"),
+                        &dashscope_headers(entry, secrets, false),
+                        Some(&body),
+                        300,
+                    )?;
+                    let choices = capnet::at(&object, "output.choices").and_then(Value::as_array).ok_or_else(|| {
+                        Error::malformed(&capnet::string_at(&object, "message").unwrap_or_else(|| capnet::describe(&object)))
+                    })?;
+                    let files: Vec<ResultFile> = choices
+                        .iter()
+                        .flat_map(|choice| capnet::at(choice, "message.content").and_then(Value::as_array).cloned().unwrap_or_default())
+                        .filter_map(|part| part["image"].as_str().map(|url| ResultFile::remote(url, "png")))
+                        .collect();
+                    if files.is_empty() {
+                        return Err(Error::malformed(&format!("响应里没有图片：{}", capnet::describe(&object))));
+                    }
+                    let note = format!("已用 {model} 生成 {} 张图片。", files.len());
+                    return Ok(Outcome::Files(files, Some(note)));
+                }
+                let size = capnet::parse_size(request.option("size"), 1024)
+                    .map(|(width, height)| format!("{width}*{height}"))
+                    .unwrap_or_else(|| "1024*1024".into());
+                let mut input = json!({ "prompt": request.prompt });
+                if let Some(negative) = request.option("negative_prompt") {
+                    input["negative_prompt"] = json!(negative);
+                }
+                let body = json!({ "model": model, "input": input, "parameters": { "size": size, "n": count, "prompt_extend": true, "watermark": false } });
+                let object = capnet::json(
+                    "POST",
+                    &format!("{root}/api/v1/services/aigc/text2image/image-synthesis"),
+                    &dashscope_headers(entry, secrets, true),
+                    Some(&body),
+                    120,
+                )?;
+                Ok(Outcome::Job(task_id(&object)?, Some(format!("万相 {model} 正在生图。"))))
+            }
+            "videoGeneration" => {
+                let reference = request.inputs.first();
+                let model = if reference.is_some() {
+                    option(entry, "i2vModel", "wan2.2-i2v-plus")
+                } else {
+                    option(entry, "videoModel", "wan2.2-t2v-plus")
+                };
+                let mut input = json!({ "prompt": request.prompt });
+                if let Some(reference) = reference {
+                    input["img_url"] = json!(capnet::image_url(reference, 2048)?);
+                }
+                let mut parameters = json!({ "prompt_extend": true, "watermark": false });
+                if let Some((width, height)) = capnet::parse_size(request.option("size"), 1280) {
+                    parameters["size"] = json!(format!("{width}*{height}"));
+                }
+                if let Some(duration) = request.option("duration").and_then(|value| value.trim().parse::<i64>().ok()) {
+                    parameters["duration"] = json!(duration);
+                }
+                let body = json!({ "model": model, "input": input, "parameters": parameters });
+                let object = capnet::json(
+                    "POST",
+                    &format!("{root}/api/v1/services/aigc/video-generation/video-synthesis"),
+                    &dashscope_headers(entry, secrets, true),
+                    Some(&body),
+                    120,
+                )?;
+                Ok(Outcome::Job(task_id(&object)?, Some(format!("万相 {model} 正在生成视频。"))))
+            }
+            "transcription" => {
+                let input = request.inputs.first().ok_or("缺少参数 audio")?;
+                let model = option(entry, "transcriptionModel", if token_plan { "qwen-audio-3.0-asr-flash" } else { "qwen3-asr-flash" });
+                let native = native_audio(&model);
+                let clip = capnet::load_clip(input)?;
+                let mut split = clip.data.len() > 7 * 1024 * 1024;
+                let accepts = ["wav", "mp3", "opus", "ogg"].contains(&clip.extension.to_lowercase().as_str());
+                if native && !accepts && capnet::can_decode(&clip.extension) {
+                    split = true;
+                }
+                let mut pcm = None;
+                if !split
+                    && capnet::can_decode(&clip.extension)
+                    && let Ok(decoded) = capnet::decode(&clip, 16000)
+                {
+                    split = decoded.seconds() > 240.0;
+                    pcm = Some(decoded);
+                }
+                let parts: Vec<(Vec<u8>, String)> = if split {
+                    let pcm = match pcm {
+                        Some(pcm) => pcm,
+                        None => capnet::decode(&clip, 16000)?,
+                    };
+                    capnet::split(&pcm, 180.0).iter().map(|piece| (capnet::wav(piece), "audio/wav".to_string())).collect()
+                } else {
+                    vec![(clip.data.clone(), clip.mime.clone())]
+                };
+                let language = capnet::language_code(request.option("language"));
+                let mut texts = Vec::new();
+                for (data, mime) in parts {
+                    let audio = json!({ "type": "input_audio", "input_audio": { "data": capnet::data_url(&data, &mime) } });
+                    if native {
+                        let format = if mime == "audio/wav" { "wav".to_string() } else { clip.extension.to_lowercase() };
+                        let mut parameters = json!({ "format": format });
+                        if let Some(language) = &language {
+                            parameters["language_hints"] = json!([language]);
+                        }
+                        let body = json!({ "model": model, "input": { "messages": [{ "role": "user", "content": [audio] }] }, "parameters": parameters });
+                        let object = match capnet::json(
+                            "POST",
+                            &format!("{root}/api/v1/services/aigc/multimodal-generation/generation"),
+                            &dashscope_headers(entry, secrets, false),
+                            Some(&body),
+                            300,
+                        ) {
+                            Ok(object) => object,
+                            // 录音里没有人声时回 400 和一个空的 {}：当成这段没说话
+                            Err(error) if error.status == 400 && error.message.ends_with("：{}") => continue,
+                            Err(error) => return Err(error),
+                        };
+                        let text = capnet::string_at(&object, "output.text")
+                            .or_else(|| capnet::string_at(&object, "output.sentence.text"))
+                            .ok_or_else(|| {
+                                Error::malformed(&capnet::string_at(&object, "message").unwrap_or_else(|| capnet::describe(&object)))
+                            })?;
+                        texts.push(text.trim().to_string());
+                    } else {
+                        let mut options = json!({ "enable_itn": true });
+                        if let Some(language) = &language {
+                            options["language"] = json!(language);
+                        }
+                        let body = json!({ "model": model, "messages": [{ "role": "user", "content": [audio] }], "stream": false, "asr_options": options });
+                        let object = capnet::json(
+                            "POST",
+                            &format!("{root}/compatible-mode/v1/chat/completions"),
+                            &dashscope_headers(entry, secrets, false),
+                            Some(&body),
+                            300,
+                        )?;
+                        let text = capnet::string_at(&object, "choices.0.message.content").ok_or_else(|| {
+                            Error::malformed(&capnet::string_at(&object, "error.message").unwrap_or_else(|| capnet::describe(&object)))
+                        })?;
+                        texts.push(text.trim().to_string());
+                    }
+                }
+                Ok(Outcome::Text(capnet::transcript(&texts)))
+            }
+            "speech" => {
+                if request.prompt.trim().is_empty() {
+                    return Err("缺少参数 text".into());
+                }
+                let model = option(entry, "speechModel", if token_plan { "qwen-audio-3.0-tts-plus" } else { "qwen3-tts-flash" });
+                let native = native_audio(&model);
+                let voice = request
+                    .option("voice")
+                    .map(str::to_string)
+                    .unwrap_or_else(|| option(entry, "speechVoice", if native { "longanhuan_v3.6" } else { "Cherry" }));
+                let language = capnet::language_name(request.option("language")).unwrap_or_else(|| "Auto".into());
+                let code = capnet::language_code(request.option("language"));
+                let url = if native {
+                    format!("{root}/api/v1/services/audio/tts/SpeechSynthesizer")
+                } else {
+                    format!("{root}/api/v1/services/aigc/multimodal-generation/generation")
+                };
+                let mut pieces = Vec::new();
+                for chunk in capnet::speech_chunks(&request.prompt, 500) {
+                    let mut input = json!({ "text": chunk, "voice": voice });
+                    if native {
+                        input["format"] = json!("wav");
+                        input["sample_rate"] = json!(24000);
+                        if let Some(code) = &code {
+                            input["language_hints"] = json!([code]);
+                        }
+                        if let Some(speed) = request
+                            .option("speed")
+                            .and_then(|value| value.parse::<f64>().ok())
+                            .filter(|speed| *speed > 0.0 && (speed - 1.0).abs() > 0.001)
+                        {
+                            input["rate"] = json!(speed.clamp(0.5, 2.0));
+                        }
+                    } else {
+                        input["language_type"] = json!(language);
+                    }
+                    let object = capnet::json(
+                        "POST",
+                        &url,
+                        &dashscope_headers(entry, secrets, false),
+                        Some(&json!({ "model": model, "input": input })),
+                        300,
+                    )?;
+                    let audio = if let Some(inline) = capnet::string_at(&object, "output.audio.data").filter(|text| !text.is_empty()) {
+                        base64::engine::general_purpose::STANDARD
+                            .decode(inline)
+                            .map_err(|_| Error::malformed("合成结果的 base64 解不开"))?
+                    } else if let Some(address) = capnet::string_at(&object, "output.audio.url").filter(|text| !text.is_empty()) {
+                        let response = capnet::send("GET", &address, &[], None, 120)?;
+                        if !response.ok() {
+                            return Err(Error::http(response.status, "下载合成的语音失败"));
+                        }
+                        response.body
+                    } else {
+                        return Err(Error::malformed(&capnet::string_at(&object, "message").unwrap_or_else(|| capnet::describe(&object))));
+                    };
+                    pieces.push(
+                        capnet::parse_wav(&audio).ok_or_else(|| Error::malformed(&format!("合成结果不是 WAV（{} 字节）", audio.len())))?,
+                    );
+                }
+                let merged = capnet::concat(&pieces, 0.15);
+                let note = format!("已用 {model}（{voice}）合成 {:.1} 秒的语音。", merged.seconds());
+                Ok(Outcome::Files(vec![capnet::speech_output(&merged, request.option("format"))], Some(note)))
+            }
+            other => Err(Error::new(format!("{} 不支持{}", type_title("dashscope"), kind_title(other)))),
+        }
+    }
+
+    fn dashscope_poll(remote: &str, entry: &Value, secrets: &HashMap<String, String>) -> Result<Poll, Error> {
+        let root = dashscope_base(entry, secrets);
+        let object = capnet::json("GET", &format!("{root}/api/v1/tasks/{remote}"), &dashscope_headers(entry, secrets, false), None, 60)?;
+        let status = capnet::string_at(&object, "output.task_status").unwrap_or_default().to_uppercase();
+        Ok(match status.as_str() {
+            "PENDING" => Poll::Pending(None),
+            "RUNNING" => Poll::Running(None),
+            "SUCCEEDED" => {
+                let mut files: Vec<ResultFile> = capnet::at(&object, "output.results")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|item| item["url"].as_str().map(|url| ResultFile::remote(url, "png")))
+                    .collect();
+                if let Some(video) = capnet::string_at(&object, "output.video_url") {
+                    let mut file = ResultFile::remote(&video, "mp4");
+                    file.extension = "mp4".into();
+                    file.mime = Some("video/mp4".into());
+                    files.push(file);
+                }
+                if files.is_empty() {
+                    Poll::Failed(format!("任务成功但没有返回结果地址：{}", capnet::describe(&object)))
+                } else {
+                    Poll::Succeeded(files, None)
+                }
+            }
+            "FAILED" | "CANCELED" | "UNKNOWN" => {
+                let message = capnet::string_at(&object, "output.message")
+                    .or_else(|| capnet::string_at(&object, "message"))
+                    .unwrap_or(status.clone());
+                Poll::Failed(match capnet::string_at(&object, "output.code") {
+                    Some(code) => format!("{code}：{message}"),
+                    None => message,
+                })
+            }
+            _ => Poll::Running(Some(format!("状态 {status}"))),
+        })
+    }
+
+    // MARK: 火山方舟
+
+    fn ark_perform(request: &Request, entry: &Value, secrets: &HashMap<String, String>) -> Done {
+        let base = option(entry, "baseURL", ARK_BASE);
+        let key = secret_value(secrets, &instance_secret(entry, "ARK_API_KEY"));
+        let key = key.as_deref();
+        match request.kind.as_str() {
+            "vision" | "videoUnderstanding" => {
+                let model = option(
+                    entry,
+                    if request.kind == "vision" { "visionModel" } else { "videoUnderstandingModel" },
+                    "doubao-seed-1-6-250615",
+                );
+                Ok(Outcome::Text(describe(&base, key, &model, request, false)?))
+            }
+            "imageGeneration" => {
+                let model = option(entry, "imageModel", "doubao-seedream-4-0-250828");
+                let mut extra = json!({ "response_format": "url", "watermark": false });
+                if let Some(reference) = request.inputs.first() {
+                    extra["image"] = json!(capnet::image_url(reference, 2048)?);
+                }
+                let size = capnet::parse_size(request.option("size"), 2048)
+                    .map(|(width, height)| format!("{width}x{height}"))
+                    .unwrap_or_else(|| "2K".into());
+                let files = generate_image(&base, key, &model, &request.prompt, Some(size), 1, &extra)?;
+                let note = format!("已用 {model} 生成 {} 张图片。", files.len());
+                Ok(Outcome::Files(files, Some(note)))
+            }
+            "videoGeneration" => {
+                let model = option(entry, "videoModel", "doubao-seedance-1-0-pro-250528");
+                let mut prompt = request.prompt.clone();
+                if let Some(duration) = request.option("duration").and_then(|value| value.trim().parse::<i64>().ok()) {
+                    prompt.push_str(&format!(" --duration {duration}"));
+                }
+                if let Some((width, height)) = capnet::parse_size(request.option("size"), 1280) {
+                    prompt.push_str(&format!(
+                        " --ratio {} --resolution {}",
+                        if width >= height { "16:9" } else { "9:16" },
+                        if width.max(height) >= 1900 { "1080p" } else { "720p" }
+                    ));
+                }
+                let mut content = vec![json!({ "type": "text", "text": prompt })];
+                if let Some(reference) = request.inputs.first() {
+                    content.push(json!({ "type": "image_url", "image_url": { "url": capnet::image_url(reference, 2048)? } }));
+                }
+                let object = capnet::json(
+                    "POST",
+                    &capnet::endpoint(&base, "contents/generations/tasks")?,
+                    &capnet::bearer(key),
+                    Some(&json!({ "model": model, "content": content })),
+                    120,
+                )?;
+                let id = object["id"].as_str().ok_or_else(|| {
+                    Error::malformed(&capnet::string_at(&object, "error.message").unwrap_or_else(|| capnet::describe(&object)))
+                })?;
+                Ok(Outcome::Job(id.to_string(), Some(format!("Seedance {model} 正在生成视频。"))))
+            }
+            other => Err(Error::new(format!("{} 不支持{}", type_title("volcengineArk"), kind_title(other)))),
+        }
+    }
+
+    fn ark_poll(remote: &str, entry: &Value, secrets: &HashMap<String, String>) -> Result<Poll, Error> {
+        let base = option(entry, "baseURL", ARK_BASE);
+        let key = secret_value(secrets, &instance_secret(entry, "ARK_API_KEY"));
+        let object = capnet::json(
+            "GET",
+            &capnet::endpoint(&base, &format!("contents/generations/tasks/{remote}"))?,
+            &capnet::bearer(key.as_deref()),
+            None,
+            60,
+        )?;
+        let status = text_of(&object, "status").to_lowercase();
+        Ok(match status.as_str() {
+            "queued" => Poll::Pending(None),
+            "running" => Poll::Running(None),
+            "succeeded" => match capnet::string_at(&object, "content.video_url").filter(|url| !url.is_empty()) {
+                Some(url) => {
+                    let mut file = ResultFile::remote(&url, "mp4");
+                    file.extension = "mp4".into();
+                    file.mime = Some("video/mp4".into());
+                    Poll::Succeeded(vec![file], None)
+                }
+                None => Poll::Failed(format!("任务成功但没有 video_url：{}", capnet::describe(&object))),
+            },
+            "failed" | "cancelled" | "expired" => Poll::Failed(capnet::string_at(&object, "error.message").unwrap_or(status)),
+            _ => Poll::Running(Some(format!("状态 {status}"))),
+        })
+    }
+
+    // MARK: 豆包语音
+
+    fn doubao_headers(entry: &Value, secrets: &HashMap<String, String>, app_header: &str) -> Vec<(String, String)> {
+        let key = secret_value(secrets, &instance_secret(entry, "VOLC_SPEECH_KEY")).unwrap_or_default().trim().to_string();
+        let app = option(entry, "appID", "");
+        let mut headers = Vec::new();
+        if app.is_empty() {
+            headers.push(("X-Api-Key".to_string(), key));
+        } else {
+            headers.push((app_header.to_string(), app));
+            headers.push(("X-Api-Access-Key".to_string(), key));
+        }
+        headers.push(("X-Api-Request-Id".to_string(), uuid::Uuid::new_v4().to_string()));
+        headers
+    }
+
+    fn doubao_failure(response: &capnet::Response) -> String {
+        let code = response.header("X-Api-Status-Code").unwrap_or("").to_string();
+        let mut message = response.header("X-Api-Message").map(percent_decode).unwrap_or_default();
+        if message.is_empty() {
+            message = response.text(600);
+        }
+        if code == "45000151" {
+            message = format!("录音格式不对（只认 wav / mp3 / ogg opus）：{message}");
+        } else if code == "20000003" {
+            message = "录音里没有说话声".into();
+        } else if response.status == 401 || response.status == 403 || code == "45000010" {
+            message = format!(
+                "鉴权失败，检查 VOLC_SPEECH_KEY（新版控制台的 API Key；旧版要同时填 APP ID 和 Access Token），以及服务是否已开通：{message}"
+            );
+        }
+        if code.is_empty() { message } else { format!("{code}：{message}") }
+    }
+
+    fn percent_decode(text: &str) -> String {
+        let bytes = text.as_bytes();
+        let mut out = Vec::new();
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'%'
+                && index + 2 < bytes.len()
+                && let Ok(byte) = u8::from_str_radix(text.get(index + 1..index + 3).unwrap_or(""), 16)
+            {
+                out.push(byte);
+                index += 3;
+                continue;
+            }
+            out.push(bytes[index]);
+            index += 1;
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    fn doubao_resource(voice: &str) -> &'static str {
+        if voice.ends_with("_uranus_bigtts") || voice.starts_with("saturn_") {
+            "seed-tts-2.0"
+        } else if voice.starts_with("S_") {
+            "seed-icl-2.0"
+        } else {
+            "seed-tts-1.0"
+        }
+    }
+
+    fn doubao_perform(request: &Request, entry: &Value, secrets: &HashMap<String, String>) -> Done {
+        let base = option(entry, "baseURL", SPEECH_BASE).trim_end_matches('/').to_string();
+        match request.kind.as_str() {
+            "transcription" => {
+                let input = request.inputs.first().ok_or("缺少参数 audio")?;
+                let clip = capnet::load_clip(input)?;
+                let audio = if ["wav", "mp3", "ogg"].contains(&clip.extension.as_str()) {
+                    clip.data.clone()
+                } else {
+                    capnet::wav(&capnet::decode(&clip, 16000)?)
+                };
+                let mut req = json!({ "model_name": "bigmodel", "enable_itn": true, "enable_punc": true });
+                if let Some(language) = capnet::language_code(request.option("language")) {
+                    req["language"] = json!(match language.as_str() {
+                        "zh" => "zh-CN".to_string(),
+                        "en" => "en-US".to_string(),
+                        other => other.to_string(),
+                    });
+                }
+                let body = json!({ "user": { "uid": "friday" }, "audio": { "data": base64::engine::general_purpose::STANDARD.encode(&audio) }, "request": req });
+                let mut headers = doubao_headers(entry, secrets, "X-Api-App-Key");
+                headers.push(("X-Api-Resource-Id".into(), option(entry, "transcriptionResource", DOUBAO_ASR)));
+                headers.push(("X-Api-Sequence".into(), "-1".into()));
+                let response = capnet::send(
+                    "POST",
+                    &format!("{base}/api/v3/auc/bigmodel/recognize/flash"),
+                    &headers,
+                    Some(("application/json", serde_json::to_vec(&body).unwrap_or_default())),
+                    300,
+                )?;
+                let code = response.header("X-Api-Status-Code").unwrap_or("").to_string();
+                if code == "20000003" {
+                    return Ok(Outcome::Text(capnet::transcript(&[])));
+                }
+                if !response.ok() || (!code.is_empty() && code != "20000000") {
+                    return Err(Error {
+                        status: if response.status == 200 { 400 } else { response.status },
+                        message: doubao_failure(&response),
+                    });
+                }
+                let object = response.json();
+                let text = capnet::string_at(&object, "result.text").ok_or_else(|| Error::malformed(&capnet::describe(&object)))?;
+                Ok(Outcome::Text(capnet::transcript(&[text])))
+            }
+            "speech" => {
+                if request.prompt.trim().is_empty() {
+                    return Err("缺少参数 text".into());
+                }
+                let voice = request.option("voice").map(str::to_string).unwrap_or_else(|| option(entry, "speechVoice", DOUBAO_VOICE));
+                let resource = option(entry, "speechResource", doubao_resource(&voice));
+                let wav = capnet::wants_wav(request.option("format"));
+                let (mut encoded, mut pieces) = (Vec::new(), Vec::new());
+                for chunk in capnet::speech_chunks(&request.prompt, 300) {
+                    let mut audio_params = json!({ "format": if wav { "pcm" } else { "mp3" }, "sample_rate": 24000 });
+                    if let Some(speed) = request
+                        .option("speed")
+                        .and_then(|value| value.parse::<f64>().ok())
+                        .filter(|speed| *speed > 0.0 && (speed - 1.0).abs() > 0.001)
+                    {
+                        audio_params["speech_rate"] = json!(((speed - 1.0) * 100.0).clamp(-50.0, 100.0).round() as i64);
+                    }
+                    let mut additions = json!({ "disable_markdown_filter": false });
+                    if let Some(style) = request.option("style") {
+                        additions["context_texts"] = json!([style]);
+                    }
+                    let body = json!({ "user": { "uid": "friday" }, "req_params": { "text": chunk, "speaker": voice, "audio_params": audio_params, "additions": additions.to_string() } });
+                    let mut headers = doubao_headers(entry, secrets, "X-Api-App-Id");
+                    headers.push(("X-Api-Resource-Id".into(), resource.clone()));
+                    let response = capnet::send(
+                        "POST",
+                        &format!("{base}/api/v3/tts/unidirectional"),
+                        &headers,
+                        Some(("application/json", serde_json::to_vec(&body).unwrap_or_default())),
+                        300,
+                    )?;
+                    if !response.ok() {
+                        return Err(Error { status: response.status, message: doubao_failure(&response) });
+                    }
+                    // 一行一个 JSON：{"code":0,"data":"<base64>"} … 最后 {"code":20000000}
+                    let (mut audio, mut finished) = (Vec::new(), false);
+                    for line in String::from_utf8_lossy(&response.body).lines() {
+                        let Ok(object) = serde_json::from_str::<Value>(line.trim()) else { continue };
+                        match object["code"].as_i64().unwrap_or(-1) {
+                            0 => {
+                                if let Some(data) =
+                                    object["data"].as_str().and_then(|text| base64::engine::general_purpose::STANDARD.decode(text).ok())
+                                {
+                                    audio.extend(data);
+                                }
+                            }
+                            20000000 => finished = true,
+                            code => {
+                                let message = text_of(&object, "message");
+                                let hint = if code == 45000000 || message.contains("resource") {
+                                    format!("（音色 {voice} 要用资源 {resource}，确认已开通）")
+                                } else {
+                                    String::new()
+                                };
+                                return Err(Error { status: 400, message: format!("HTTP 400：{code}：{message}{hint}") });
+                            }
+                        }
+                    }
+                    if audio.is_empty() {
+                        return Err(Error::malformed(if finished { "合成结果是空的".into() } else { response.text(600) }.as_str()));
+                    }
+                    if wav {
+                        pieces.push(capnet::Pcm::from_bytes(&audio, 24000, 1));
+                    } else {
+                        encoded.extend(audio);
+                    }
+                }
+                if wav {
+                    let merged = capnet::concat(&pieces, 0.15);
+                    let note = format!("已用豆包语音（{voice}）合成 {:.1} 秒的语音。", merged.seconds());
+                    return Ok(Outcome::Files(vec![capnet::speech_output(&merged, request.option("format"))], Some(note)));
+                }
+                Ok(Outcome::Files(vec![ResultFile::encoded(encoded, "mp3")], Some(format!("已用豆包语音（{voice}）合成语音。"))))
+            }
+            other => Err(Error::new(format!("{} 不支持{}", type_title("volcengineSpeech"), kind_title(other)))),
+        }
+    }
+
+    // MARK: 脚本提供方
+
+    /// 跑一次脚本：(成没成, 标准输出, 说明)。stdin 是请求（带 settings、output_dir、working_directory）
+    fn run_script(
+        package: &Value,
+        entry: &Value,
+        secrets: &HashMap<String, String>,
+        timeout: u64,
+        output: Option<&Path>,
+        mut request: Value,
+        cwd: Option<&str>,
+    ) -> Result<(bool, String, String), String> {
+        let mut settings = Map::new();
+        for spec in option_specs(entry) {
+            let key = text_of(&spec, "key");
+            settings.insert(key.clone(), json!(option_with_default(entry, &key)));
+        }
+        request["settings"] = Value::Object(settings);
+        if let Some(output) = output {
+            request["output_dir"] = json!(output.to_string_lossy());
+        }
+        if let Some(cwd) = cwd {
+            request["working_directory"] = json!(cwd);
+        }
+        let directory = PathBuf::from(package["directory"].as_str().unwrap_or(""));
+        let work = directory.join("work");
+        let mut environment: Vec<(String, String)> = secrets.iter().map(|(key, value)| (key.clone(), value.clone())).collect();
+        environment.push(("FRIDAY_PROVIDER_DIR".into(), directory.to_string_lossy().into_owned()));
+        environment.push(("FRIDAY_WORK_DIR".into(), work.to_string_lossy().into_owned()));
+        if let Some(output) = output {
+            environment.push(("FRIDAY_OUTPUT_DIR".into(), output.to_string_lossy().into_owned()));
+        }
+        let manifest = &package["manifest"];
+        let language = manifest["language"].as_str().unwrap_or("python");
+        let entry_file = directory.join(friday_core::script_tools::file_name(language));
+        let run = crate::scripts::execute(
+            language,
+            &entry_file,
+            &work,
+            manifest["permission"].as_str().unwrap_or("execute"),
+            &serde_json::to_vec(&request).unwrap_or_default(),
+            environment,
+            Duration::from_secs(timeout),
+        )?;
+        let summary = friday_core::script_tools::run_summary(run.0, &run.1, &run.2, run.3, timeout as f64);
+        Ok((run.0 == 0 && !run.3, run.1, summary))
+    }
+
+    /// 这次运行的产出目录（work/out-xxxxxxxx）；顺手清掉一天前的
+    fn output_dir(package: &Value) -> PathBuf {
+        let work = PathBuf::from(package["directory"].as_str().unwrap_or("")).join("work");
+        for entry in std::fs::read_dir(&work).into_iter().flatten().flatten() {
+            let old = entry
+                .metadata()
+                .ok()
+                .and_then(|meta| meta.modified().ok())
+                .and_then(|time| time.elapsed().ok())
+                .is_some_and(|age| age > Duration::from_secs(86400));
+            if entry.file_name().to_string_lossy().starts_with("out-") && old {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+        let dir = work.join(format!("out-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// files / file / images / image / video / audio / media 里列出的文件（绝对路径，或相对产出目录），只要存在的
+    fn script_files(object: &Value, output: &Path) -> Vec<ResultFile> {
+        let mut paths = Vec::new();
+        for key in ["files", "file", "images", "image", "video", "audio", "media"] {
+            match &object[key] {
+                Value::String(path) => paths.push(path.clone()),
+                Value::Array(items) => paths.extend(items.iter().filter_map(Value::as_str).map(str::to_string)),
+                _ => {}
+            }
+        }
+        paths
+            .into_iter()
+            .map(|path| {
+                let expanded = crate::expand_tilde(&path);
+                if expanded.is_absolute() { expanded } else { output.join(expanded) }
+            })
+            .filter(|path| path.exists())
+            .map(|path| ResultFile {
+                extension: path.extension().map(|ext| ext.to_string_lossy().to_lowercase()).unwrap_or_default(),
+                path: Some(path),
+                ..Default::default()
             })
             .collect()
     }
 
-    fn save_user(entry_id: &str, change: impl FnOnce(&mut Map<String, Value>)) {
-        let path = settings_path();
-        let mut saved = crate::read_json_file(&path);
-        if !saved.is_object() {
-            saved = json!({});
-        }
-        if !saved["powerEntries"].is_object() {
-            saved["powerEntries"] = json!({});
-        }
-        let entries = saved["powerEntries"].as_object_mut().unwrap();
-        let entry = entries.entry(entry_id.to_string()).or_insert_with(|| json!({}));
-        if !entry.is_object() {
-            *entry = json!({});
-        }
-        change(entry.as_object_mut().unwrap());
-        let _ = crate::write_json_file(&path, &saved);
-        changed();
+    fn timeout_of(package: &Value) -> u64 {
+        package["manifest"]["timeout"].as_i64().unwrap_or(600).clamp(10, 3600) as u64
     }
 
-    /// 这一项能不能用、还缺什么
-    fn availability(entry: &Value, raw: &str) -> (bool, String) {
-        let power = entry["options"]["power"].as_str().unwrap_or("");
-        if !powers::is_installed(power) {
-            return (false, "还没安装（设置 › 能力）".into());
+    fn script_perform(request: &Request, entry: &Value, secrets: &HashMap<String, String>) -> Done {
+        let package = package_of(entry).ok_or_else(|| Error::new(format!("提供方包 Providers/{} 不见了", text_of(entry, "id"))))?;
+        let title = text_of(&package["manifest"], "title");
+        let output = output_dir(&package);
+        let stdin = json!({ "action": "run", "capability": request.kind, "arguments": request.arguments, "prompt": request.prompt,
+            "inputs": request.inputs, "options": request.options });
+        let (ok, stdout, summary) =
+            run_script(&package, entry, secrets, timeout_of(&package), Some(&output), stdin, request.cwd.as_deref())?;
+        if !ok {
+            return Err(Error::new(format!("{title}：{summary}")));
         }
-        if !powers::is_enabled(power) {
-            return (false, "被关掉了（设置 › 能力）".into());
+        let Ok(object) = serde_json::from_str::<Value>(stdout.trim())
+            .map_err(|_| ())
+            .and_then(|value| if value.is_object() { Ok(value) } else { Err(()) })
+        else {
+            return Ok(Outcome::Text(if stdout.trim().is_empty() { "（脚本没有输出）".into() } else { stdout }));
+        };
+        let text = object["text"].as_str().map(str::to_string);
+        if let Some(job) = object["job"].as_str() {
+            return Ok(Outcome::Job(job.to_string(), text));
         }
-        if raw == "imageGeneration" || raw == "videoGeneration" {
-            let what = if raw == "videoGeneration" { "video" } else { "image" };
-            let model = models::selected(what);
-            if model.is_empty() {
-                return (
-                    false,
-                    if what == "video" {
-                        "还没选本地生视频模型（模型库里类型选「生视频」，点「使用」）".into()
-                    } else {
-                        "还没选本地生图模型（模型库里类型选「生图」，点「使用」）".into()
-                    },
-                );
-            }
-            if models::diffusion_request(&model).is_none() {
-                return (false, format!("{model} 的文件还没下完（设置 › 能力里能看到进度）"));
-            }
+        let files = script_files(&object, &output);
+        if !files.is_empty() {
+            return Ok(Outcome::Files(files, text));
         }
-        (true, String::new())
+        if let Some(error) = object["error"].as_str() {
+            return Err(Error::new(format!("{title}：{error}")));
+        }
+        Ok(Outcome::Text(text.unwrap_or(stdout)))
     }
 
-    /// 这项能力现在用哪个提供方（开着、这项没关的第一个）
-    fn provider_for(raw: &str) -> Option<Value> {
-        entries().into_iter().find(|entry| {
-            entry["enabled"] == true
-                && entry["kinds"].as_array().is_some_and(|kinds| kinds.contains(&json!(raw)))
-                && !entry["disabledKinds"].as_array().is_some_and(|kinds| kinds.contains(&json!(raw)))
+    fn script_poll(remote: &str, kind: &str, entry: &Value, secrets: &HashMap<String, String>) -> Result<Poll, Error> {
+        let package = package_of(entry).ok_or_else(|| Error::new(format!("提供方包 Providers/{} 不见了", text_of(entry, "id"))))?;
+        let output = output_dir(&package);
+        let (ok, stdout, summary) = run_script(
+            &package,
+            entry,
+            secrets,
+            timeout_of(&package),
+            Some(&output),
+            json!({ "action": "poll", "capability": kind, "job": remote }),
+            None,
+        )?;
+        if !ok {
+            return Ok(Poll::Failed(summary));
+        }
+        let object: Value = serde_json::from_str(stdout.trim()).unwrap_or(json!({}));
+        let text = object["text"].as_str().map(str::to_string);
+        Ok(match text_of(&object, "status").to_lowercase().as_str() {
+            "succeeded" | "success" | "done" | "completed" => Poll::Succeeded(script_files(&object, &output), text),
+            "failed" | "error" => {
+                Poll::Failed(text.or_else(|| object["error"].as_str().map(str::to_string)).unwrap_or_else(|| "脚本报告任务失败".into()))
+            }
+            "running" => Poll::Running(text),
+            _ => Poll::Pending(text),
         })
     }
 
-    // MARK: 动作
-
-    fn property(description: &str, kind: &str) -> Value {
-        json!({ "type": kind, "description": description })
-    }
-
-    /// 常驻那份的动作（有提供方的才给）
-    pub fn actions() -> Vec<Value> {
-        let mut actions = Vec::new();
-        if provider_for("transcription").is_some() {
-            actions.push(json!({ "name": "transcribe_audio", "description": "听一段录音（语音消息、会议录音、视频里的声音）并转成文字。录音是本地路径，常见格式（wav、mp3、flac）都行。",
-                "parameters": { "type": "object", "properties": { "audio": property("录音的本地路径", "string"), "language": property("语言：zh、en、ja 等；不填自动判断", "string") }, "required": ["audio"] },
-                "readOnly": true, "timeoutSeconds": 300 }));
-        }
-        if provider_for("speech").is_some() {
-            actions.push(json!({ "name": "speak", "description": "把一段话说出来：合成语音，返回 wav 文件的路径。用户让你「说」「念」「读出来」「用语音回答」时用它。text 写成要说的原话，不要带 Markdown 符号、代码和表格。",
-                "parameters": { "type": "object", "properties": { "text": property("要说的话，原样朗读（中英文等皆可）", "string"), "voice": property("音色（本地语音的音色名）；不填用默认音色", "string"), "style": property("语气或情绪，一句话描述；不填为自然语气", "string") }, "required": ["text"] },
-                "timeoutSeconds": 300 }));
-        }
-        if provider_for("imageGeneration").is_some() {
-            actions.push(json!({ "name": "generate_image", "description": "按文字描述生成图片（在这台的显卡上用本地生图模型）。生成的图片会直接展示给用户并返回文件路径。提示词写具体：主体、风格、构图、光线。",
-                "parameters": { "type": "object", "properties": {
-                    "prompt": property("画面描述（中英文皆可）", "string"), "negative_prompt": property("不希望出现的内容", "string"),
-                    "size": property("尺寸，如 1024x1024、1280x720；不填用默认", "string"), "count": property("张数，默认 1，最多 4", "integer"),
-                    "reference_image": property("参考图路径（图生图 / 编辑）；不填则纯文生图", "string") }, "required": ["prompt"] },
-                "timeoutSeconds": 900 }));
-        }
-        if provider_for("videoGeneration").is_some() {
-            actions.push(json!({ "name": "generate_video", "description": "按文字（可附一张参考图）生成一段短视频（本地生视频模型）。这是异步任务：调用后立刻返回任务 ID，通常要等几分钟，之后用 check_job 查询并取回视频。",
-                "parameters": { "type": "object", "properties": {
-                    "prompt": property("画面与动作描述", "string"), "duration": property("时长（秒），默认 2，最多 10", "integer"),
-                    "size": property("分辨率，如 832x480；不填用默认", "string"), "image": property("首帧参考图的路径（图生视频）；不填则文生视频", "string") }, "required": ["prompt"] },
-                "timeoutSeconds": 120 }));
-            actions.push(json!({ "name": "check_job", "description": "查询 generate_video 等异步任务的进度。完成后会把结果文件取回来展示给用户并返回路径；未完成就告诉用户稍后再查（间隔至少 30 秒，不要连续轮询）。",
-                "parameters": { "type": "object", "properties": { "job_id": property("任务 ID", "string") }, "required": ["job_id"] }, "readOnly": true, "timeoutSeconds": 300 }));
-        }
-        actions
-    }
-
-    pub fn is_action(action: &str) -> bool {
-        matches!(action, "transcribe_audio" | "speak" | "generate_image" | "generate_video" | "check_job")
-    }
-
-    fn text<'a>(arguments: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
-        arguments.get(key).and_then(Value::as_str).map(str::trim).filter(|text| !text.is_empty())
-    }
-
-    /// 参数里的路径：相对的按会话的工作目录
-    fn path_of(value: &str, caller: Option<&str>) -> PathBuf {
-        let path = PathBuf::from(value.strip_prefix("file://").unwrap_or(value));
-        if path.is_absolute() {
-            return path;
-        }
-        if let Some(rest) = value.strip_prefix("~/") {
-            return crate::user_home().join(rest);
-        }
-        caller.map(PathBuf::from).unwrap_or_else(crate::user_home).join(path)
-    }
-
-    fn data_url(path: &std::path::Path) -> Result<String, String> {
-        let bytes = std::fs::read(path).map_err(|_| format!("读不了 {}", path.display()))?;
-        let lower = path.to_string_lossy().to_lowercase();
-        let mime = if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
-            "image/jpeg"
-        } else if lower.ends_with(".webp") {
-            "image/webp"
-        } else {
-            "image/png"
-        };
-        Ok(format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes)))
-    }
+    // MARK: 本机（Power）
 
     fn send(method: &str, url: &str, token: &str, body: Option<&Value>, timeout: u64) -> Result<(u16, Vec<u8>), String> {
-        let agent: ureq::Agent =
-            ureq::Agent::config_builder().http_status_as_error(false).timeout_global(Some(Duration::from_secs(timeout))).build().into();
-        let authorization = format!("Bearer {token}");
-        let response = match (method, body) {
-            ("GET", _) => agent.get(url).header("Authorization", &authorization).call(),
-            (_, Some(body)) => agent
-                .post(url)
-                .header("Authorization", &authorization)
-                .header("Content-Type", "application/json")
-                .send(&serde_json::to_vec(body).unwrap_or_default()[..]),
-            _ => agent.post(url).header("Authorization", &authorization).send_empty(),
-        };
-        let mut response = response.map_err(|error| error.to_string())?;
-        let status = response.status().as_u16();
-        let mut data = Vec::new();
-        response.body_mut().as_reader().read_to_end(&mut data).map_err(|error| error.to_string())?;
-        Ok((status, data))
+        let headers = vec![("Authorization".to_string(), format!("Bearer {token}"))];
+        let payload = body.map(|body| ("application/json", serde_json::to_vec(body).unwrap_or_default()));
+        let response = capnet::send(method, url, &headers, payload, timeout).map_err(|error| error.message)?;
+        Ok((response.status, response.body))
     }
 
     fn json_of(status: u16, data: &[u8], what: &str) -> Result<Value, String> {
@@ -14160,20 +18600,7 @@ mod caps {
         Ok(value)
     }
 
-    /// 结果存进 ~/.edith/friday/media/
-    fn keep(data: &[u8], extension: &str) -> Result<String, String> {
-        let dir = media_dir();
-        std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
-        let path = dir.join(format!(
-            "{}-{}.{extension}",
-            chrono::Local::now().format("%Y%m%d-%H%M%S"),
-            &uuid::Uuid::new_v4().simple().to_string()[..6]
-        ));
-        std::fs::write(&path, data).map_err(|error| format!("存不了结果：{error}"))?;
-        Ok(path.to_string_lossy().into_owned())
-    }
-
-    fn outputs(url: &str, token: &str, job: &Value) -> Result<Vec<String>, String> {
+    fn diffusion_outputs(url: &str, token: &str, job: &Value) -> Result<Vec<ResultFile>, String> {
         job["outputs"]
             .as_array()
             .into_iter()
@@ -14183,39 +18610,38 @@ mod caps {
                 if !(200..300).contains(&status) {
                     return Err(format!("取本地生成的结果失败：HTTP {status}"));
                 }
-                keep(&data, if output["mime"] == "video/webm" { "webm" } else { "png" })
+                let video = output["mime"] == "video/webm";
+                Ok(ResultFile {
+                    data: Some(data),
+                    extension: if video { "webm".into() } else { "png".into() },
+                    mime: Some(if video { "video/webm".into() } else { "image/png".into() }),
+                    ..Default::default()
+                })
             })
             .collect()
     }
 
-    fn diffusion_body(arguments: &Map<String, Value>, what: &str, caller: Option<&str>) -> Result<Value, String> {
+    fn diffusion_body(request: &Request, what: &str) -> Result<Value, String> {
         let model = models::selected(what);
         let files = models::diffusion_request(&model).ok_or_else(|| {
             if model.is_empty() {
-                format!(
-                    "还没选本地生{}模型：在模型库里类型选「生{}」，点「使用」",
-                    if what == "video" { "视频" } else { "图" },
-                    if what == "video" { "视频" } else { "图" }
-                )
+                format!("还没选本地生{0}模型：在模型库里类型选「生{0}」，点「使用」", if what == "video" { "视频" } else { "图" })
             } else {
                 format!("本地模型 {model} 的文件还没下完")
             }
         })?;
-        let mut body = json!({ "kind": what, "prompt": text(arguments, "prompt").unwrap_or(""), "x_friday": files });
-        if let Some(negative) = text(arguments, "negative_prompt") {
+        let mut body = json!({ "kind": what, "prompt": request.prompt, "x_friday": files });
+        if let Some(negative) = request.option("negative_prompt") {
             body["negative_prompt"] = json!(negative);
         }
-        if let Some((width, height)) = text(arguments, "size").and_then(|size| size.split_once(['x', 'X', '×'])) {
-            let number = |text: &str| text.trim().parse::<u32>().ok().map(|value| (value / 16 * 16).max(64));
-            if let (Some(width), Some(height)) = (number(width), number(height)) {
-                body["width"] = json!(width);
-                body["height"] = json!(height);
-            }
+        if let Some((width, height)) = capnet::parse_size(request.option("size"), if what == "video" { 832 } else { 1024 }) {
+            body["width"] = json!((width / 16 * 16).max(64));
+            body["height"] = json!((height / 16 * 16).max(64));
         }
         if what == "image" {
-            body["n"] = json!(arguments.get("count").and_then(Value::as_u64).unwrap_or(1).clamp(1, 4));
-            if let Some(reference) = text(arguments, "reference_image") {
-                let url = data_url(&path_of(reference, caller))?;
+            body["n"] = json!(request.image_count());
+            if let Some(reference) = request.inputs.first() {
+                let url = capnet::image_url(reference, 2048).map_err(|error| error.message)?;
                 if models::family_edits(&model) {
                     body["reference_images"] = json!([url]);
                 } else {
@@ -14224,105 +18650,89 @@ mod caps {
             }
         } else {
             // 时长（秒）→ 帧数：16 fps，帧数取 4k+1（Wan 的要求）
-            let seconds = arguments.get("duration").and_then(Value::as_u64).unwrap_or(2).clamp(1, 10);
+            let seconds = request.option("duration").and_then(|value| value.trim().parse::<u64>().ok()).unwrap_or(2).clamp(1, 10);
             body["fps"] = json!(16);
             body["frames"] = json!(seconds * 16 / 4 * 4 + 1);
-            if let Some(image) = text(arguments, "image") {
-                body["image"] = json!(data_url(&path_of(image, caller))?);
+            if let Some(image) = request.inputs.first() {
+                body["image"] = json!(capnet::image_url(image, 2048).map_err(|error| error.message)?);
             }
         }
         Ok(body)
     }
 
-    /// 做一个动作：(成没成, 给模型看的, 产出的文件)
-    pub fn act(action: &str, arguments: &Map<String, Value>, caller: Option<&str>) -> (bool, String, Vec<String>) {
-        match perform(action, arguments, caller) {
-            Ok((text, files)) => (true, text, files),
-            Err(error) => (false, error, Vec::new()),
-        }
-    }
-
-    fn perform(action: &str, arguments: &Map<String, Value>, caller: Option<&str>) -> Result<(String, Vec<String>), String> {
-        if action == "check_job" {
-            return check_job(text(arguments, "job_id").ok_or("要给 job_id")?);
-        }
-        let kind = kind(action).ok_or_else(|| format!("没有这个能力：{action}"))?;
-        let entry = provider_for(kind.raw).ok_or_else(|| format!("没有开着的「{}」提供方", kind.title))?;
-        let (ready, needs) = availability(&entry, kind.raw);
-        if !ready {
-            return Err(format!("「{}」现在用不了：{needs}", kind.title));
-        }
-        let power = entry["options"]["power"].as_str().unwrap_or("").to_string();
-        let (url, token) = powers::ensure_running(&power, Duration::from_secs(150))?;
-        match action {
-            "transcribe_audio" => {
-                let path = path_of(text(arguments, "audio").ok_or("要给 audio（录音的路径）")?, caller);
-                let data = std::fs::read(&path).map_err(|_| format!("读不了录音 {}", path.display()))?;
-                let boundary = format!("Friday-{}", uuid::Uuid::new_v4().simple());
-                let mut body: Vec<u8> = Vec::new();
-                let mut field = |key: &str, value: &str| {
-                    body.extend_from_slice(
-                        format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{key}\"\r\n\r\n{value}\r\n").as_bytes(),
-                    )
-                };
-                field("model", "sensevoice-small");
-                field("response_format", "json");
-                if let Some(language) = text(arguments, "language") {
-                    field("language", language);
+    fn power_perform(request: &Request, entry: &Value) -> Done {
+        let power = option(entry, "power", "");
+        let (url, token) = powers::ensure_running(&power, Duration::from_secs(150)).map_err(Error::new)?;
+        match request.kind.as_str() {
+            "transcription" => {
+                let input = request.inputs.first().ok_or("缺少参数 audio")?;
+                let clip = capnet::load_clip(input)?;
+                let mut fields = vec![("model", "sensevoice-small".to_string()), ("response_format", "json".to_string())];
+                if let Some(language) = capnet::language_code(request.option("language")) {
+                    fields.push(("language", language));
                 }
-                let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| "audio.wav".into());
-                body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\nContent-Type: application/octet-stream\r\n\r\n").as_bytes());
-                body.extend_from_slice(&data);
-                body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
-                let mut response = crate::http_agent()
-                    .post(&format!("{url}/v1/audio/transcriptions"))
-                    .header("Authorization", format!("Bearer {token}"))
-                    .header("Content-Type", format!("multipart/form-data; boundary={boundary}"))
-                    .send(&body[..])
-                    .map_err(|error| format!("听录音出错：{error}"))?;
-                let status = response.status().as_u16();
-                let mut reply = Vec::new();
-                let _ = response.body_mut().as_reader().read_to_end(&mut reply);
-                let value = json_of(status, &reply, "听录音")?;
-                let text = value["text"].as_str().unwrap_or("").trim().to_string();
-                Ok((if text.is_empty() { "（没听出字来）".into() } else { text }, Vec::new()))
+                if let Some(prompt) = request.option("prompt") {
+                    fields.push(("prompt", prompt.to_string()));
+                }
+                let name = format!("audio.{}", if clip.extension.is_empty() { "wav" } else { &clip.extension });
+                let (content_type, body) = capnet::multipart(&fields, &[("file", &name, &clip.mime, &clip.data)]);
+                let response = capnet::send(
+                    "POST",
+                    &format!("{url}/v1/audio/transcriptions"),
+                    &capnet::bearer(Some(&token)),
+                    Some((&content_type, body)),
+                    600,
+                )?;
+                let value = json_of(response.status, &response.body, "听录音").map_err(Error::new)?;
+                Ok(Outcome::Text(capnet::transcript(&[value["text"].as_str().unwrap_or("").to_string()])))
             }
-            "speak" => {
-                let input = text(arguments, "text").ok_or("要给 text（要说的话）")?;
-                let mut body = json!({ "model": "cosyvoice3", "input": input, "voice": text(arguments, "voice").unwrap_or("default"), "response_format": "wav" });
-                if let Some(style) = text(arguments, "style") {
+            "speech" => {
+                if request.prompt.trim().is_empty() {
+                    return Err("缺少参数 text".into());
+                }
+                let mut body = json!({ "model": "cosyvoice3", "input": request.prompt, "voice": request.option("voice").unwrap_or("default"), "response_format": "wav" });
+                if let Some(style) = request.option("style") {
                     body["instructions"] = json!(style);
                 }
-                let (status, data) = send("POST", &format!("{url}/v1/audio/speech"), &token, Some(&body), 280)?;
-                if !(200..300).contains(&status) {
-                    return Err(json_of(status, &data, "说话").err().unwrap_or_default());
+                if let Some(speed) = request
+                    .option("speed")
+                    .and_then(|value| value.parse::<f64>().ok())
+                    .filter(|speed| *speed > 0.0 && (speed - 1.0).abs() > 0.001)
+                {
+                    body["speed"] = json!(speed.clamp(0.5, 2.0));
                 }
-                let path = keep(&data, "wav")?;
-                Ok((format!("合成好了，语音文件：{path}"), vec![path]))
+                let (status, data) = send("POST", &format!("{url}/v1/audio/speech"), &token, Some(&body), 280).map_err(Error::new)?;
+                if !(200..300).contains(&status) {
+                    return Err(Error::new(json_of(status, &data, "说话").err().unwrap_or_default()));
+                }
+                let file = match capnet::parse_wav(&data) {
+                    Some(pcm) => capnet::speech_output(&pcm, request.option("format")),
+                    None => ResultFile::encoded(data, "wav"),
+                };
+                Ok(Outcome::Files(vec![file], Some("已用本机的本地语音合成语音。".into())))
             }
-            "generate_image" => {
-                let body = diffusion_body(arguments, "image", caller)?;
-                let (status, data) = send("POST", &format!("{url}/v1/jobs"), &token, Some(&body), 60)?;
-                let job = json_of(status, &data, "本地生图")?;
-                let id = job["id"].as_str().unwrap_or("").to_string();
+            "imageGeneration" => {
+                let body = diffusion_body(request, "image").map_err(Error::new)?;
+                let (status, data) = send("POST", &format!("{url}/v1/jobs"), &token, Some(&body), 60).map_err(Error::new)?;
+                let job = json_of(status, &data, "本地生图").map_err(Error::new)?;
+                let id = text_of(&job, "id");
                 let started = std::time::Instant::now();
                 loop {
-                    let (status, data) = send("GET", &format!("{url}/v1/jobs/{id}"), &token, None, 60)?;
-                    let state = json_of(status, &data, "本地生图")?;
+                    let (status, data) = send("GET", &format!("{url}/v1/jobs/{id}"), &token, None, 60).map_err(Error::new)?;
+                    let state = json_of(status, &data, "本地生图").map_err(Error::new)?;
                     match state["status"].as_str() {
                         Some("done") => {
-                            let files = outputs(&url, &token, &state)?;
-                            let text = format!(
-                                "已用本机的 {} 生成 {} 张图片（{:.1} 秒）：\n{}",
+                            let files = diffusion_outputs(&url, &token, &state).map_err(Error::new)?;
+                            let note = format!(
+                                "已用本机的 {} 生成 {} 张图片（{:.1} 秒）。",
                                 models::selected("image"),
                                 files.len(),
-                                state["elapsed_ms"].as_f64().unwrap_or(0.0) / 1000.0,
-                                files.join("\n")
+                                state["elapsed_ms"].as_f64().unwrap_or(0.0) / 1000.0
                             );
-                            return Ok((text, files));
+                            return Ok(Outcome::Files(files, Some(note)));
                         }
                         Some("failed" | "cancelled") => {
-                            return Err(state["error"]["message"].as_str().unwrap_or("本地生图失败").to_string());
+                            return Err(Error::new(state["error"]["message"].as_str().unwrap_or("本地生图失败")));
                         }
                         _ if started.elapsed() > Duration::from_secs(840) => {
                             let _ = send("POST", &format!("{url}/v1/jobs/{id}/cancel"), &token, None, 10);
@@ -14332,115 +18742,936 @@ mod caps {
                     }
                 }
             }
-            _ => {
-                // 生视频：提交任务，记进 jobs.json，check_job 取
-                let body = diffusion_body(arguments, "video", caller)?;
-                let (status, data) = send("POST", &format!("{url}/v1/jobs"), &token, Some(&body), 60)?;
-                let job = json_of(status, &data, "本地生视频")?;
-                let remote = job["id"].as_str().unwrap_or("").to_string();
-                let id = uuid::Uuid::new_v4().to_string().to_uppercase();
-                let record = json!({
-                    "id": id, "kind": "videoGeneration", "provider": entry["id"], "providerTitle": entry["title"], "remoteID": format!("diffusion:{remote}"),
-                    "status": "running", "prompt": text(arguments, "prompt").unwrap_or(""), "message": "本地生视频排队中",
-                    "createdAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true), "files": [],
-                });
-                with_jobs(|jobs| jobs.push(record));
-                Ok((
-                    format!(
-                        "本机的 {} 正在生成视频（{} 帧），任务 ID：{id}。通常要等几分钟，之后用 check_job 查询并取回视频。",
-                        models::selected("video"),
-                        body["frames"]
-                    ),
-                    Vec::new(),
+            "videoGeneration" => {
+                let body = diffusion_body(request, "video").map_err(Error::new)?;
+                let (status, data) = send("POST", &format!("{url}/v1/jobs"), &token, Some(&body), 60).map_err(Error::new)?;
+                let job = json_of(status, &data, "本地生视频").map_err(Error::new)?;
+                Ok(Outcome::Job(
+                    format!("diffusion:{}", text_of(&job, "id")),
+                    Some(format!("本机的 {} 正在生成视频（{} 帧）。", models::selected("video"), body["frames"])),
                 ))
             }
+            other => Err(Error::new(format!("本地能力不支持{}", kind_title(other)))),
         }
     }
 
-    static JOBS_LOCK: Mutex<()> = Mutex::new(());
-
-    fn with_jobs<T>(change: impl FnOnce(&mut Vec<Value>) -> T) -> T {
-        let _guard = JOBS_LOCK.lock().unwrap();
-        let mut jobs: Vec<Value> = crate::read_json_file(&jobs_path())["jobs"].as_array().cloned().unwrap_or_default();
-        let result = change(&mut jobs);
-        let _ = crate::write_json_file(&jobs_path(), &json!({ "jobs": jobs }));
-        drop(_guard);
-        changed();
-        result
-    }
-
-    fn check_job(id: &str) -> Result<(String, Vec<String>), String> {
-        let job = with_jobs(|jobs| jobs.iter().find(|job| job["id"].as_str().is_some_and(|other| other.eq_ignore_ascii_case(id))).cloned())
-            .ok_or_else(|| format!("没有任务 {id}"))?;
-        if job["status"] == "succeeded" {
-            let files: Vec<String> = job["files"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect();
-            return Ok((format!("已经做好了：\n{}", files.join("\n")), files));
-        }
-        if job["status"] == "failed" {
-            return Err(format!("任务没做成：{}", job["message"].as_str().unwrap_or("")));
-        }
-        let remote = job["remoteID"].as_str().and_then(|remote| remote.strip_prefix("diffusion:")).ok_or("不认识的本地任务")?.to_string();
-        let power = job["provider"].as_str().and_then(|provider| provider.strip_prefix("power-")).unwrap_or("diffusion").to_string();
-        let (url, token) = powers::ensure_running(&power, Duration::from_secs(150))?;
-        let (status, data) = send("GET", &format!("{url}/v1/jobs/{remote}"), &token, None, 60)?;
-        let update = |status: &str, message: &str, files: &[String]| {
-            let (id, status, message, files) = (job["id"].clone(), status.to_string(), message.to_string(), files.to_vec());
-            with_jobs(move |jobs| {
-                if let Some(item) = jobs.iter_mut().find(|item| item["id"] == id) {
-                    item["status"] = json!(status);
-                    item["message"] = json!(message);
-                    item["files"] = json!(files);
-                }
-            });
-        };
+    fn power_poll(remote: &str, entry: &Value) -> Result<Poll, Error> {
+        let remote = remote.strip_prefix("diffusion:").ok_or("不认识的本地任务")?;
+        let power = option(entry, "power", "diffusion");
+        let (url, token) = powers::ensure_running(&power, Duration::from_secs(150)).map_err(Error::new)?;
+        let (status, data) = send("GET", &format!("{url}/v1/jobs/{remote}"), &token, None, 60).map_err(Error::new)?;
         if status == 404 {
-            update("failed", "本地生视频的任务没了（friday-diffusion 重启过，任务不保留）", &[]);
-            return Err("本地生视频的任务没了（friday-diffusion 重启过，任务不保留）".into());
+            return Ok(Poll::Failed("本地生视频的任务没了（friday-diffusion 重启过，任务不保留）".into()));
         }
-        let state = json_of(status, &data, "本地生视频")?;
-        match state["status"].as_str() {
+        let state = json_of(status, &data, "本地生视频").map_err(Error::new)?;
+        Ok(match state["status"].as_str() {
             Some("done") => {
-                let files = outputs(&url, &token, &state)?;
+                let files = diffusion_outputs(&url, &token, &state).map_err(Error::new)?;
                 let _ = send("POST", &format!("{url}/v1/memory/release"), &token, None, 30);
-                update("succeeded", &format!("本机生成的视频（{:.0} 秒）", state["elapsed_ms"].as_f64().unwrap_or(0.0) / 1000.0), &files);
-                Ok((format!("视频做好了：\n{}", files.join("\n")), files))
+                Poll::Succeeded(files, Some(format!("本机生成的视频（{:.0} 秒）", state["elapsed_ms"].as_f64().unwrap_or(0.0) / 1000.0)))
             }
-            Some(failed @ ("failed" | "cancelled")) => {
-                let message = state["error"]["message"]
-                    .as_str()
-                    .unwrap_or(if failed == "cancelled" { "取消了" } else { "本地生视频失败" })
-                    .to_string();
-                update("failed", &message, &[]);
-                Err(message)
+            Some(failed @ ("failed" | "cancelled")) => Poll::Failed(
+                state["error"]["message"].as_str().unwrap_or(if failed == "cancelled" { "取消了" } else { "本地生视频失败" }).to_string(),
+            ),
+            Some("queued") => Poll::Pending(Some("本地生视频排队中".into())),
+            Some("loading") => Poll::Running(Some("本地生视频：正在加载模型".into())),
+            Some("encoding") => Poll::Running(Some("本地生视频：正在编码".into())),
+            _ => Poll::Running(Some(format!(
+                "本地生视频：{:.0}%（第 {} / {} 步）",
+                state["progress"].as_f64().unwrap_or(0.0) * 100.0,
+                state["step"],
+                state["steps"]
+            ))),
+        })
+    }
+
+    // MARK: 后端分派
+
+    fn perform(request: &Request, entry: &Value, secrets: &HashMap<String, String>) -> Done {
+        match kind_of(entry) {
+            "power" => power_perform(request, entry),
+            "openAICompatible" => openai_perform(request, entry, secrets),
+            "dashscope" => dashscope_perform(request, entry, secrets),
+            "volcengineArk" => ark_perform(request, entry, secrets),
+            "volcengineSpeech" => doubao_perform(request, entry, secrets),
+            "script" => script_perform(request, entry, secrets),
+            other => Err(Error::new(format!("后端 {other} 尚未加载"))),
+        }
+    }
+
+    fn poll(remote: &str, kind: &str, entry: &Value, secrets: &HashMap<String, String>) -> Result<Poll, Error> {
+        match kind_of(entry) {
+            "power" => power_poll(remote, entry),
+            "openAICompatible" => openai_poll(remote, entry, secrets),
+            "dashscope" => dashscope_poll(remote, entry, secrets),
+            "volcengineArk" => ark_poll(remote, entry, secrets),
+            "script" => script_poll(remote, kind, entry, secrets),
+            other => Err(Error::new(format!("{} 不支持异步任务", type_title(other)))),
+        }
+    }
+
+    // MARK: 选、跑
+
+    /// 这项能力为什么没法用、还能怎么办（给智能体的）
+    fn configure_hint(kind: &str) -> String {
+        let all = providers(kind, true);
+        if all.is_empty() && builtin(kind).is_none() {
+            return format!("还没有能做这件事的提供方。可以用 create_provider 写一个实现「{}」的脚本提供方。", kind_title(kind));
+        }
+        if all.is_empty() {
+            let mut lines = Vec::new();
+            for kind_type in ["dashscope", "openAICompatible", "volcengineArk", "volcengineSpeech"] {
+                let blank = json!({ "type": kind_type, "options": {} });
+                if !kinds_for(&blank).iter().any(|raw| raw == kind) {
+                    continue;
+                }
+                let needed = secret_names(&blank);
+                lines.push(format!(
+                    "- {}{}",
+                    type_title(kind_type),
+                    if needed.is_empty() { String::new() } else { format!("：需要密钥 {}", needed.join("、")) }
+                ));
             }
-            other => {
-                let message = match other {
-                    Some("queued") => "本地生视频排队中".to_string(),
-                    Some("loading") => "本地生视频：正在加载模型".to_string(),
-                    Some("encoding") => "本地生视频：正在编码".to_string(),
-                    _ => format!(
-                        "本地生视频：{:.0}%（第 {} / {} 步）",
-                        state["progress"].as_f64().unwrap_or(0.0) * 100.0,
-                        state["step"],
-                        state["steps"]
+            return format!(
+                "还没有任何能做这件事的提供方。可以接入的在线服务：\n{}\n请用户到 设置 › 服务与密钥 里添加。",
+                lines.join("\n")
+            );
+        }
+        let names: Vec<String> = all.iter().map(|entry| format!("{}（id: {}）", text_of(entry, "title"), text_of(entry, "id"))).collect();
+        format!(
+            "能做这件事的提供方 {} 都被用户关掉了（停用了提供方，或单独关掉了这项能力）；请用户到 设置 › 工具 里打开。",
+            names.join("、")
+        )
+    }
+
+    /// 用哪个：智能体指定的优先；否则本机优先，逐个看能不能用，取第一个能用的
+    fn resolved(kind: &str, preferred: Option<&str>) -> Result<(Value, HashMap<String, String>), Error> {
+        let title = kind_title(kind);
+        if let Some(preferred) = preferred {
+            let Some(chosen) = entry(preferred) else {
+                let known: Vec<String> = providers(kind, false)
+                    .iter()
+                    .map(|entry| format!("{}（id: {}）", text_of(entry, "title"), text_of(entry, "id")))
+                    .collect();
+                return Err(Error::new(format!(
+                    "没有 id 为 {preferred} 的提供方。可选：{}",
+                    if known.is_empty() { "无".into() } else { known.join("、") }
+                )));
+            };
+            let name = text_of(&chosen, "title");
+            if !enabled(&chosen) {
+                return Err(Error::new(format!("「{title}」的提供方「{name}」当前不可用：用户停用了这个提供方（设置 › 工具）")));
+            }
+            if !allows(&chosen, kind) {
+                return Err(Error::new(format!("「{title}」的提供方「{name}」当前不可用：用户关掉了它的{title}（设置 › 工具）")));
+            }
+            let (ready, needs) = availability(&chosen, kind);
+            if !ready {
+                return Err(Error::new(format!("「{title}」的提供方「{name}」当前不可用：{needs}")));
+            }
+            let secrets = secrets_of(&chosen);
+            return Ok((chosen, secrets));
+        }
+        let allowed = providers(kind, false);
+        if allowed.is_empty() {
+            if !providers(kind, true).is_empty() {
+                return Err(Error::new(format!(
+                    "能做「{title}」的提供方都被用户在 设置 › 工具 里关掉了，不要绕过；如果确实需要，请告诉用户去打开。"
+                )));
+            }
+            return Err(Error::new(format!("「{title}」能力当前没有可用的提供方。{}", configure_hint(kind))));
+        }
+        let mut reasons = Vec::new();
+        for candidate in allowed {
+            let (ready, needs) = availability(&candidate, kind);
+            if ready {
+                let secrets = secrets_of(&candidate);
+                return Ok((candidate, secrets));
+            }
+            reasons.push(format!("{}：{needs}", text_of(&candidate, "title")));
+        }
+        Err(Error::new(format!("「{title}」能力当前没有可用的提供方。允许的提供方当前都不可用：{}", reasons.join("；"))))
+    }
+
+    /// 这次报错说明这个提供方用不了（余额不足、欠费、密钥不对、没有权限——等也没用）：原因
+    fn unusable(error: &Error) -> Option<String> {
+        if error.status == 0 {
+            return None;
+        }
+        let lower = error.message.to_lowercase();
+        if error.status == 402
+            || ["余额", "欠费", "insufficient", "balance", "arrearage", "quota exceeded", "billing"].iter().any(|word| lower.contains(word))
+        {
+            return Some(format!("余额不足或欠费（HTTP {}）", error.status));
+        }
+        match error.status {
+            401 => Some("密钥不对或已失效（HTTP 401）".into()),
+            403 => Some("没有权限（HTTP 403）".into()),
+            _ => None,
+        }
+    }
+
+    fn media_json(path: &str) -> Value {
+        let path_buf = Path::new(path);
+        let name = path_buf.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+        let extension = path_buf.extension().map(|ext| ext.to_string_lossy().to_lowercase()).unwrap_or_default();
+        let (kind, mime) = match extension.as_str() {
+            "png" => ("image", "image/png"),
+            "jpg" | "jpeg" => ("image", "image/jpeg"),
+            "webp" => ("image", "image/webp"),
+            "gif" => ("image", "image/gif"),
+            "mp4" => ("video", "video/mp4"),
+            "webm" => ("video", "video/webm"),
+            "mov" => ("video", "video/quicktime"),
+            "wav" => ("audio", "audio/wav"),
+            "mp3" => ("audio", "audio/mpeg"),
+            "m4a" => ("audio", "audio/mp4"),
+            _ => ("file", "application/octet-stream"),
+        };
+        let size = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+        json!({ "id": crate::stable_uuid(&["media", path]), "kind": kind, "relativePath": path, "path": path, "fileName": name, "mimeType": mime, "byteCount": size })
+    }
+
+    /// 结果存进 ~/.edith/friday/media/：文件名按能力和提示词起（「图片 一只猫 1.png」）
+    fn download(files: &[ResultFile], request: &Request) -> Result<Vec<String>, Error> {
+        let dir = media_dir();
+        std::fs::create_dir_all(&dir).map_err(|error| Error::new(error.to_string()))?;
+        let prefix = match request.kind.as_str() {
+            "videoGeneration" => "视频".to_string(),
+            "speech" => "语音".to_string(),
+            "vision" | "imageGeneration" | "videoUnderstanding" | "transcription" => "图片".to_string(),
+            other => kind_title(other),
+        };
+        let words: String =
+            request.prompt.chars().filter(|c| !"/\\:*?\"<>|\n\r\t".contains(*c)).take(20).collect::<String>().trim().to_string();
+        let stamp = chrono::Local::now().format("%m%d-%H%M%S").to_string();
+        let mut saved = Vec::new();
+        for (index, file) in files.iter().enumerate() {
+            let extension = if file.extension.is_empty() { "bin".to_string() } else { file.extension.clone() };
+            let number = if files.len() > 1 { format!(" {}", index + 1) } else { String::new() };
+            let base = if words.is_empty() { format!("{prefix} {stamp}{number}") } else { format!("{prefix} {words} {stamp}{number}") };
+            let target = dir.join(format!("{base}.{extension}"));
+            let data = if let Some(data) = &file.data {
+                data.clone()
+            } else if let Some(path) = &file.path {
+                std::fs::read(path).map_err(|_| Error::new(format!("文件不存在：{}", path.display())))?
+            } else if let Some(url) = &file.url {
+                let response = capnet::send("GET", url, &file.headers, None, 300)?;
+                if !response.ok() {
+                    return Err(Error::http(response.status, &format!("下载结果失败：{url}")));
+                }
+                response.body
+            } else {
+                continue;
+            };
+            std::fs::write(&target, data).map_err(|error| Error::new(format!("存不了结果：{error}")))?;
+            saved.push(target.to_string_lossy().into_owned());
+        }
+        Ok(saved)
+    }
+
+    fn short_job_id() -> String {
+        let chars: Vec<char> = "abcdefghjkmnpqrstuvwxyz23456789".chars().collect();
+        let random = uuid::Uuid::new_v4();
+        let bytes = random.as_bytes();
+        format!("job-{}", (0..6).map(|index| chars[bytes[index] as usize % chars.len()]).collect::<String>())
+    }
+
+    fn now() -> String {
+        chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+    }
+
+    /// 跑一次：(成没成, 给模型看的, 产出的文件)
+    fn run(request: Request) -> (bool, String, Vec<String>) {
+        let (chosen, secrets) = match resolved(&request.kind, request.provider.as_deref()) {
+            Ok(found) => found,
+            Err(error) => return (false, error.message, Vec::new()),
+        };
+        let title = text_of(&chosen, "title");
+        let outcome = match perform(&request, &chosen, &secrets) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // 用不了的提供方（余额不足、密钥不对）：直接停用并说明，免得一次次再试
+                if let Some(reason) = unusable(&error) {
+                    let id = text_of(&chosen, "id");
+                    update_entry(&id, |entry| entry["enabled"] = json!(false));
+                    crate::serve_log("caps", &format!("已停用提供方「{title}」：{reason}（{}）", error.message));
+                    return (
+                        false,
+                        format!(
+                            "「{}」的提供方「{title}」当前不可用：{reason}。已经停用了这个提供方（设置 › 工具），不要再试，也不要换个参数重试（有别的提供方的话，再调用会自动改用）；告诉用户：充值或换好密钥后，到 设置 › 工具 里重新打开它。",
+                            kind_title(&request.kind)
+                        ),
+                        Vec::new(),
+                    );
+                }
+                return (false, error.message, Vec::new());
+            }
+        };
+        match outcome {
+            Outcome::Text(text) => (true, text, Vec::new()),
+            Outcome::Files(files, note) => match download(&files, &request) {
+                Ok(saved) => {
+                    let note = note.unwrap_or_else(|| format!("已生成 {} 个文件。", saved.len()));
+                    (true, format!("{note}（提供方：{title}）\n{}", saved.join("\n")), saved)
+                }
+                Err(error) => (false, error.message, Vec::new()),
+            },
+            Outcome::Job(remote, note) => {
+                let id = short_job_id();
+                let mut job = json!({ "id": id, "remoteID": remote, "providerID": chosen["id"], "kind": request.kind, "prompt": request.prompt,
+                    "createdAt": now(), "status": "pending", "media": [] });
+                if !request.session.is_empty() {
+                    job["conversationID"] = json!(crate::upper(&request.session));
+                }
+                if let Some(note) = &note {
+                    job["message"] = json!(note);
+                }
+                with(|registry| {
+                    registry.jobs.insert(0, job);
+                    save_jobs(registry);
+                });
+                changed();
+                // 生图一般一分钟内出结果：等一等，省得模型再查一次
+                if request.kind == "imageGeneration" {
+                    let started = std::time::Instant::now();
+                    while started.elapsed() < Duration::from_secs(120) {
+                        std::thread::sleep(Duration::from_secs(3));
+                        let result = check_job(&id);
+                        let finished = with(|registry| {
+                            registry
+                                .jobs
+                                .iter()
+                                .any(|job| job["id"] == json!(id) && matches!(job["status"].as_str(), Some("succeeded" | "failed")))
+                        });
+                        if finished {
+                            return result;
+                        }
+                    }
+                }
+                (
+                    true,
+                    format!(
+                        "任务已提交（{title}），任务 ID：{id}。{}通常需要 1–5 分钟，请告诉用户正在生成，稍后用 check_job 查询；不要连续轮询。",
+                        note.unwrap_or_default()
                     ),
-                };
-                update("running", &message, &[]);
-                Ok((format!("还没做完：{message}。过一会儿（至少 30 秒）再查。"), Vec::new()))
+                    Vec::new(),
+                )
             }
         }
     }
 
-    // MARK: 设置页
+    fn update_job(id: &str, status: &str, message: Option<String>, media: Option<Vec<Value>>) {
+        with(|registry| {
+            if let Some(job) = registry.jobs.iter_mut().find(|job| job["id"] == id) {
+                job["status"] = json!(status);
+                match message {
+                    Some(message) => job["message"] = json!(message),
+                    None => {
+                        if let Some(object) = job.as_object_mut() {
+                            object.remove("message");
+                        }
+                    }
+                }
+                if let Some(media) = media {
+                    job["media"] = json!(media);
+                }
+            }
+            save_jobs(registry);
+        });
+        changed();
+    }
 
-    /// 上次推出去的（设置页的状态、动作名）：没变不推
+    fn check_job(id: &str) -> (bool, String, Vec<String>) {
+        let found = with(|registry| {
+            registry
+                .jobs
+                .iter()
+                .find(|job| {
+                    job["id"] == id || job["remoteID"] == id || job["id"].as_str().is_some_and(|other| other.eq_ignore_ascii_case(id))
+                })
+                .cloned()
+        });
+        let Some(job) = found else {
+            let recent: Vec<String> = with(|registry| {
+                registry
+                    .jobs
+                    .iter()
+                    .take(5)
+                    .map(|job| format!("{}（{}，{}）", text_of(job, "id"), kind_title(&text_of(job, "kind")), text_of(job, "status")))
+                    .collect()
+            });
+            return (
+                false,
+                format!("没有 ID 为 {id} 的任务。最近的任务：{}", if recent.is_empty() { "无".into() } else { recent.join("、") }),
+                Vec::new(),
+            );
+        };
+        let job_id = text_of(&job, "id");
+        let media: Vec<String> = job["media"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item["path"].as_str().or_else(|| item["relativePath"].as_str()))
+            .map(str::to_string)
+            .collect();
+        match job["status"].as_str() {
+            Some("succeeded") => return (true, format!("任务 {job_id} 已完成。\n{}", media.join("\n")), media),
+            Some("failed") => return (false, format!("任务 {job_id} 失败：{}", text_of(&job, "message")), Vec::new()),
+            _ => {}
+        }
+        let Some(provider) = entry(&text_of(&job, "providerID")) else {
+            return (false, format!("任务 {job_id} 的提供方 {} 已被移除", text_of(&job, "providerID")), Vec::new());
+        };
+        let kind = text_of(&job, "kind");
+        let secrets = secrets_of(&provider);
+        match poll(&text_of(&job, "remoteID"), &kind, &provider, &secrets) {
+            Err(error) => (false, error.message, Vec::new()),
+            Ok(Poll::Pending(message)) => {
+                let suffix = message.as_ref().map(|message| format!("：{message}")).unwrap_or_default();
+                update_job(&job_id, "pending", message, None);
+                (true, format!("任务 {job_id} 排队中{suffix}。请稍后再查。"), Vec::new())
+            }
+            Ok(Poll::Running(message)) => {
+                let suffix = message.as_ref().map(|message| format!("：{message}")).unwrap_or_default();
+                update_job(&job_id, "running", message, None);
+                (true, format!("任务 {job_id} 生成中{suffix}。请稍后再查（间隔至少 30 秒）。"), Vec::new())
+            }
+            Ok(Poll::Failed(reason)) => {
+                update_job(&job_id, "failed", Some(reason.clone()), None);
+                (false, format!("任务 {job_id} 失败：{reason}"), Vec::new())
+            }
+            Ok(Poll::Succeeded(files, note)) => {
+                let request = Request {
+                    kind: kind.clone(),
+                    prompt: text_of(&job, "prompt"),
+                    inputs: Vec::new(),
+                    options: HashMap::new(),
+                    provider: None,
+                    session: String::new(),
+                    arguments: Map::new(),
+                    cwd: None,
+                };
+                match download(&files, &request) {
+                    Ok(saved) => {
+                        update_job(&job_id, "succeeded", note.clone(), Some(saved.iter().map(|path| media_json(path)).collect()));
+                        (
+                            true,
+                            format!(
+                                "{}\n{}",
+                                note.unwrap_or_else(|| format!("任务 {job_id} 已完成，生成了 {} 个文件。", saved.len())),
+                                saved.join("\n")
+                            ),
+                            saved,
+                        )
+                    }
+                    Err(error) => (false, error.message, Vec::new()),
+                }
+            }
+        }
+    }
+
+    // MARK: 智能体的工具（常驻那份的动作）
+
+    fn prompt(key: &str) -> String {
+        let text = friday_core::prompts::text(key, &Default::default(), None);
+        if text.starts_with("【缺提示词") { String::new() } else { text }
+    }
+
+    fn property(tool: &str, name: &str, kind: &str) -> Value {
+        json!({ "type": kind, "description": prompt(&format!("tool.{tool}.{name}")) })
+    }
+
+    /// 内置能力的参数（同 Friday 的 CapabilityRegistry::descriptor）
+    fn builtin_parameters(raw: &str) -> Vec<(&'static str, &'static str, bool)> {
+        match raw {
+            "vision" => vec![("image", "string", true), ("question", "string", true)],
+            "videoUnderstanding" => vec![("video", "string", true), ("question", "string", true)],
+            "imageGeneration" => vec![
+                ("prompt", "string", true),
+                ("size", "string", false),
+                ("count", "integer", false),
+                ("reference_image", "string", false),
+                ("negative_prompt", "string", false),
+            ],
+            "videoGeneration" => {
+                vec![("prompt", "string", true), ("image", "string", false), ("duration", "integer", false), ("size", "string", false)]
+            }
+            "transcription" => vec![("audio", "string", true), ("language", "string", false)],
+            "speech" => {
+                vec![("text", "string", true), ("voice", "string", false), ("language", "string", false), ("style", "string", false)]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// 可选的提供方（写进工具说明，智能体自己挑）
+    fn choices_text(kind: &str) -> String {
+        let options: Vec<String> = providers(kind, false)
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{}（id {}，{}）",
+                    text_of(entry, "title"),
+                    text_of(entry, "id"),
+                    if is_local(entry) { "本机、免费" } else { "在线服务、按量计费" }
+                )
+            })
+            .collect();
+        format!("\n可选的提供方（provider 参数，不填自动选：本机优先）：{}", options.join("、"))
+    }
+
+    /// 常驻那份的动作：有允许的提供方的能力才给工具；check_job 在有生视频能力、有脚本提供方或有没做完的任务时给；
+    /// 写 / 看脚本提供方的 create_provider、read_provider 一直给
+    pub fn actions() -> Vec<Value> {
+        let mut actions = Vec::new();
+        let provider_description = {
+            let text = prompt("tool-part.provider");
+            if text.is_empty() {
+                "用哪个提供方；不填自动选：本地优先，本地不可用再用在线".to_string()
+            } else {
+                text
+            }
+        };
+        for raw in all_kinds() {
+            if !usable(&raw) {
+                continue;
+            }
+            let tool = kind_tool(&raw);
+            let (description, parameters) = match builtin(&raw) {
+                Some(kind) => {
+                    let mut properties = Map::new();
+                    let mut required = Vec::new();
+                    for (name, kind_name, needed) in builtin_parameters(&raw) {
+                        properties.insert(name.into(), property(&tool, name, kind_name));
+                        if needed {
+                            required.push(name);
+                        }
+                    }
+                    properties.insert("provider".into(), json!({ "type": "string", "description": provider_description }));
+                    let description = prompt(&format!("tool.{tool}"));
+                    (
+                        if description.is_empty() { kind.detail.to_string() } else { description },
+                        json!({ "type": "object", "properties": properties, "required": required }),
+                    )
+                }
+                None => {
+                    let definition = definition(&raw).unwrap_or_default();
+                    let mut schema = definition["parameters"].clone();
+                    if !schema.is_object() {
+                        schema = json!({ "type": "object", "properties": {} });
+                    }
+                    if !schema["properties"].is_object() {
+                        schema["properties"] = json!({});
+                    }
+                    schema["properties"]["provider"] = json!({ "type": "string", "description": provider_description });
+                    let description = [text_of(&definition, "description"), text_of(&definition, "detail"), kind_title(&raw)]
+                        .into_iter()
+                        .find(|text| !text.is_empty())
+                        .unwrap_or_default();
+                    (description, schema)
+                }
+            };
+            let read_only = matches!(raw.as_str(), "vision" | "videoUnderstanding" | "transcription");
+            actions.push(json!({ "name": tool, "description": format!("{description}{}", choices_text(&raw)), "parameters": parameters,
+                "readOnly": read_only, "timeoutSeconds": if raw == "imageGeneration" { 900 } else { 600 } }));
+        }
+        let has_active_job =
+            with(|registry| registry.jobs.iter().any(|job| !matches!(job["status"].as_str(), Some("succeeded" | "failed"))));
+        let has_packages = with(|registry| !registry.packages.is_empty());
+        if usable("videoGeneration") || has_packages || has_active_job {
+            actions.push(json!({ "name": "check_job", "description": prompt("tool.check_job"),
+                "parameters": { "type": "object", "properties": { "job_id": property("check_job", "job_id", "string") }, "required": ["job_id"] }, "readOnly": true, "timeoutSeconds": 300 }));
+        }
+        let field = |name: &str, kind: &str| (name.to_string(), property("create_provider", name, kind));
+        let properties: Map<String, Value> = [
+            field("id", "string"),
+            field("title", "string"),
+            field("detail", "string"),
+            field("language", "string"),
+            field("capabilities", "array"),
+            field("definitions", "array"),
+            field("options", "array"),
+            field("permission", "string"),
+            field("online", "boolean"),
+            field("secrets", "array"),
+            field("check", "boolean"),
+            field("timeout", "integer"),
+            field("test", "object"),
+            field("code", "string"),
+        ]
+        .into_iter()
+        .map(|(name, mut value)| {
+            if value["type"] == "array" {
+                value["items"] =
+                    if name == "capabilities" || name == "secrets" { json!({ "type": "string" }) } else { json!({ "type": "object" }) };
+            }
+            (name, value)
+        })
+        .collect();
+        actions.push(json!({ "name": "create_provider", "description": prompt("tool.create_provider"),
+            "parameters": { "type": "object", "properties": properties, "required": ["id", "capabilities", "code"] }, "timeoutSeconds": 900 }));
+        actions.push(json!({ "name": "read_provider", "description": prompt("tool.read_provider"),
+            "parameters": { "type": "object", "properties": { "id": property("read_provider", "id", "string") }, "required": ["id"] }, "readOnly": true, "timeoutSeconds": 30 }));
+        actions
+    }
+
+    pub fn is_action(action: &str) -> bool {
+        action == "check_job" || action == "create_provider" || action == "read_provider" || kind_for_tool(action).is_some()
+    }
+
+    fn argument(arguments: &Map<String, Value>, key: &str) -> Option<String> {
+        match arguments.get(key)? {
+            Value::String(text) => Some(text.trim().to_string()).filter(|text| !text.is_empty()),
+            Value::Number(number) => Some(number.to_string()),
+            Value::Bool(flag) => Some(flag.to_string()),
+            _ => None,
+        }
+    }
+
+    /// 工具参数整理成请求：内置能力解析出提示词、输入文件和选项；新能力只带原始参数
+    fn build_request(kind: &str, arguments: &Map<String, Value>, caller: Option<&str>, session: &str) -> Result<Request, String> {
+        let mut request = Request {
+            kind: kind.to_string(),
+            prompt: String::new(),
+            inputs: Vec::new(),
+            options: HashMap::new(),
+            provider: argument(arguments, "provider"),
+            session: session.to_string(),
+            arguments: arguments
+                .iter()
+                .filter(|(key, _)| key.as_str() != "provider")
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+            cwd: caller.map(str::to_string),
+        };
+        let input = |key: &str| -> Result<Option<String>, String> {
+            argument(arguments, key).map(|raw| capnet::resolve_input(&raw, caller).map_err(|error| error.message)).transpose()
+        };
+        let copy = |request: &mut Request, keys: &[&str]| {
+            for key in keys {
+                if let Some(value) = argument(arguments, key) {
+                    request.options.insert((*key).to_string(), value);
+                }
+            }
+        };
+        match kind {
+            "vision" => {
+                request.inputs = input("image")?.into_iter().collect();
+                if request.inputs.is_empty() {
+                    return Err("缺少参数 image".into());
+                }
+                request.prompt = argument(arguments, "question").unwrap_or_else(|| "详细描述这张图片。".into());
+            }
+            "videoUnderstanding" => {
+                request.inputs = input("video")?.into_iter().collect();
+                if request.inputs.is_empty() {
+                    return Err("缺少参数 video".into());
+                }
+                request.prompt = argument(arguments, "question").unwrap_or_else(|| "概括这段视频的内容。".into());
+            }
+            "imageGeneration" => {
+                request.prompt = argument(arguments, "prompt").ok_or("缺少参数 prompt")?;
+                copy(&mut request, &["size", "count", "negative_prompt"]);
+                request.inputs = input("reference_image")?.into_iter().collect();
+            }
+            "videoGeneration" => {
+                request.prompt = argument(arguments, "prompt").ok_or("缺少参数 prompt")?;
+                copy(&mut request, &["size", "duration"]);
+                request.inputs = input("image")?.into_iter().collect();
+            }
+            "transcription" => {
+                request.inputs = input("audio")?.into_iter().collect();
+                if request.inputs.is_empty() {
+                    return Err("缺少参数 audio".into());
+                }
+                copy(&mut request, &["language", "prompt"]);
+            }
+            "speech" => {
+                request.prompt = argument(arguments, "text").ok_or("缺少参数 text")?;
+                copy(&mut request, &["voice", "language", "style", "speed", "format"]);
+            }
+            _ => {}
+        }
+        Ok(request)
+    }
+
+    /// 做一个动作：(成没成, 给模型看的, 产出的文件)
+    pub fn act(action: &str, arguments: &Map<String, Value>, caller: Option<&str>, session: &str) -> (bool, String, Vec<String>) {
+        match action {
+            "check_job" => match argument(arguments, "job_id") {
+                Some(id) => check_job(&id),
+                None => (false, "缺少参数 job_id".into(), Vec::new()),
+            },
+            "create_provider" => create_provider(arguments),
+            "read_provider" => read_provider(argument(arguments, "id").unwrap_or_default().as_str()),
+            tool => {
+                let Some(kind) = kind_for_tool(tool) else { return (false, format!("没有这个能力：{tool}"), Vec::new()) };
+                match build_request(&kind, arguments, caller, session) {
+                    Ok(request) => run(request),
+                    Err(error) => (false, error, Vec::new()),
+                }
+            }
+        }
+    }
+
+    /// 自测（清单里写了 test 才测）：结果记进清单，通过就启用、没过就停用。回 (过没过, 输出)
+    fn test_provider(id: &str) -> Result<Option<(bool, String)>, String> {
+        let package = package(id).ok_or_else(|| format!("没有 id 为 {id} 的脚本提供方"))?;
+        let provider = entry(id).ok_or_else(|| format!("没有 id 为 {id} 的脚本提供方"))?;
+        let Some(test) = package["manifest"]["test"].as_object().cloned() else { return Ok(None) };
+        let capability = test.get("capability").and_then(Value::as_str).unwrap_or("").to_string();
+        let result: Result<String, String> = (|| {
+            if !kinds_for(&provider).contains(&capability) {
+                return Err(format!("自测的能力 {capability} 不在 capabilities 里"));
+            }
+            let arguments = test.get("arguments").and_then(Value::as_object).cloned().unwrap_or_default();
+            let request = build_request(&capability, &arguments, Some(&crate::user_home().to_string_lossy()), "")?;
+            let secrets = secrets_of(&provider);
+            match script_perform(&request, &provider, &secrets).map_err(|error| error.message)? {
+                Outcome::Text(text) => Ok(text),
+                Outcome::Files(files, note) => Ok(format!(
+                    "{}产出 {} 个文件：{}",
+                    note.map(|note| format!("{note}\n")).unwrap_or_default(),
+                    files.len(),
+                    files
+                        .iter()
+                        .filter_map(|file| file
+                            .path
+                            .as_ref()
+                            .and_then(|path| path.file_name())
+                            .map(|name| name.to_string_lossy().into_owned()))
+                        .collect::<Vec<_>>()
+                        .join("、")
+                )),
+                Outcome::Job(remote, note) => {
+                    Ok(format!("{}提交了异步任务 {remote}", note.map(|note| format!("{note}\n")).unwrap_or_default()))
+                }
+            }
+        })();
+        let (passed, output) = match result {
+            Ok(output) => (true, output.chars().take(4000).collect::<String>()),
+            Err(error) => (false, error),
+        };
+        let mut manifest = package["manifest"].as_object().cloned().unwrap_or_default();
+        manifest.insert("lastTest".into(), json!({ "passed": passed, "output": output, "date": now() }));
+        let _ = friday_core::provider_store::update_manifest(&providers_root(), &manifest);
+        reload_packages();
+        update_entry(id, |entry| entry["enabled"] = json!(passed));
+        Ok(Some((passed, output)))
+    }
+
+    fn create_provider(arguments: &Map<String, Value>) -> (bool, String, Vec<String>) {
+        let mut manifest = arguments.clone();
+        let code = manifest.remove("code").and_then(|code| code.as_str().map(str::to_string)).unwrap_or_default();
+        if code.trim().is_empty() {
+            return (false, "缺少参数 code（脚本的源码）".into(), Vec::new());
+        }
+        manifest.insert("createdBy".into(), json!("agent"));
+        let normalized = match friday_core::provider_store::normalize(&manifest) {
+            Ok(normalized) => normalized,
+            Err(problem) => return (false, problem, Vec::new()),
+        };
+        let builtins = builtin_ids();
+        let catalog: Vec<String> = all_kinds().into_iter().filter(|raw| !builtins.contains(raw)).collect();
+        if let Some(problem) = friday_core::provider_store::problem(&normalized, &builtins, &catalog) {
+            return (false, problem, Vec::new());
+        }
+        let id = normalized.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+        if entry(&id).is_some_and(|existing| existing["type"] != "script") {
+            return (false, format!("id {id} 和内置提供方重名，换个 id"), Vec::new());
+        }
+        let previous = package(&id).map(|package| text_of(&package["manifest"], "title"));
+        if let Err(error) = friday_core::provider_store::save(&providers_root(), &normalized, &code) {
+            return (false, error, Vec::new());
+        }
+        reload_packages();
+        // 用户没改过名的，跟着清单里的新名字走
+        if let (Some(previous), Some(current)) = (previous, entry(&id)) {
+            let title = normalized.get("title").and_then(Value::as_str).unwrap_or(&id).to_string();
+            if text_of(&current, "title") == previous && previous != title {
+                update_entry(&id, |entry| entry["title"] = json!(title));
+            }
+        }
+        let saved = package(&id);
+        let version = saved.as_ref().and_then(|package| package["manifest"]["version"].as_i64()).unwrap_or(1);
+        crate::serve_update_actions();
+        match test_provider(&id) {
+            Ok(None) => (true, format!("脚本提供方 {id} 存好了（v{version}，没写自测）：它的能力已经能用了。"), Vec::new()),
+            Ok(Some((true, output))) => (true, format!("脚本提供方 {id} 存好了（v{version}），自测通过：\n{output}"), Vec::new()),
+            Ok(Some((false, output))) => (
+                false,
+                format!("脚本提供方 {id} 存好了（v{version}），但自测没过，先停用了：\n{output}\n改好再用 create_provider 存一次。"),
+                Vec::new(),
+            ),
+            Err(error) => (false, error, Vec::new()),
+        }
+    }
+
+    fn read_provider(id: &str) -> (bool, String, Vec<String>) {
+        match package(id) {
+            None => {
+                let known: Vec<String> =
+                    with(|registry| registry.packages.iter().map(|package| text_of(&package["manifest"], "id")).collect());
+                (
+                    false,
+                    format!("没有 id 为 {id} 的脚本提供方（有的：{}）", if known.is_empty() { "无".into() } else { known.join("、") }),
+                    Vec::new(),
+                )
+            }
+            Some(package) => {
+                let manifest = friday_core::provider_store::export_manifest(package["manifest"].as_object().unwrap_or(&Map::new()));
+                (
+                    true,
+                    format!(
+                        "Providers/{id}（{}）\nprovider.json：\n{manifest}\n\n{}：\n{}",
+                        text_of(&package, "directory"),
+                        friday_core::script_tools::file_name(package["manifest"]["language"].as_str().unwrap_or("python")),
+                        text_of(&package, "code")
+                    ),
+                    Vec::new(),
+                )
+            }
+        }
+    }
+
+    // MARK: 设置页（设置 › 工具 › 能力提供方）
+
+    fn entry_json(entry: &Value) -> Value {
+        let mut value = entry.clone();
+        let kind = kind_of(entry).to_string();
+        value["typeTitle"] = json!(type_title(&kind));
+        value["typeDetail"] = json!(type_detail(&kind));
+        if !value["options"].is_object() {
+            value["options"] = json!({});
+        }
+        value["enabled"] = json!(enabled(entry));
+        value["disabledKinds"] = json!(entry["disabledKinds"].as_array().cloned().unwrap_or_default());
+        let kinds = kinds_for(entry);
+        value["kinds"] = json!(kinds);
+        value["kindInfos"] = json!(kinds.iter().map(|raw| json!({
+            "raw": raw, "title": kind_title(raw), "symbol": kind_symbol(raw), "toolName": kind_tool(raw), "detail": kind_detail(raw),
+            "description": definition(raw).map(|definition| text_of(&definition, "description")).unwrap_or_default(),
+            "isBuiltin": builtin(raw).is_some(), "allowed": allows(entry, raw),
+        })).collect::<Vec<_>>());
+        value["secretNames"] = json!(secret_names(entry));
+        value["active"] = json!(is_active(entry));
+        value["isLocal"] = json!(is_local(entry));
+        value["isScript"] = json!(kind == "script");
+        let package = package_of(entry);
+        value["createdByAgent"] = json!(package.as_ref().is_some_and(|package| package["manifest"]["createdBy"] == "agent"));
+        value["symbol"] =
+            json!(package.as_ref().map(|package| text_of(&package["manifest"], "symbol")).unwrap_or_else(|| if is_local(entry) {
+                "cpu".into()
+            } else {
+                "cloud".into()
+            }));
+        value
+    }
+
+    fn package_json(package: &Value) -> Value {
+        let manifest = &package["manifest"];
+        let permission = manifest["permission"].as_str().unwrap_or("execute");
+        let (permission_title, permission_detail) = match permission {
+            "readOnly" => ("只读", "只读文件，不联网、不写文件"),
+            "network" => ("联网", "可以联网，不能写文件（临时目录、自己的工作目录除外）"),
+            "writeFiles" => ("写文件", "可以写文件，不能联网"),
+            _ => ("运行程序", "不加限制：能联网、写文件、运行别的程序"),
+        };
+        let language = manifest["language"].as_str().unwrap_or("python");
+        json!({
+            "id": manifest["id"], "title": manifest["title"], "detail": manifest["detail"], "symbol": manifest["symbol"], "version": manifest["version"],
+            "languageTitle": match language { "bash" => "Bash", "node" => "JavaScript (Node)", _ => "Python" },
+            "permission": permission, "permissionTitle": permission_title, "permissionDetail": permission_detail, "permissionNeedsApproval": permission != "readOnly",
+            "online": manifest["online"], "createdByAgent": manifest["createdBy"] == "agent", "source": manifest["source"].as_str().unwrap_or(""),
+            "directory": package["directory"], "entry": format!("{}/{}", text_of(package, "directory"), friday_core::script_tools::file_name(language)),
+            "updatedAt": manifest["updatedAt"], "hasTest": manifest["test"].is_object(), "hasLastTest": manifest["lastTest"].is_object(),
+            "lastTest": manifest["lastTest"].clone(), "definitionTitles": manifest["definitions"].as_array().into_iter().flatten().map(|definition| text_of(definition, "title")).collect::<Vec<_>>(),
+        })
+    }
+
+    fn job_json(job: &Value) -> Value {
+        let mut value = job.clone();
+        let kind = text_of(job, "kind");
+        let status = text_of(job, "status");
+        value["kindTitle"] = json!(kind_title(&kind));
+        value["kindSymbol"] = json!(kind_symbol(&kind));
+        value["statusTitle"] = json!(match status.as_str() {
+            "running" => "生成中",
+            "succeeded" => "已完成",
+            "failed" => "失败",
+            _ => "排队中",
+        });
+        value["isFinished"] = json!(matches!(status.as_str(), "succeeded" | "failed"));
+        if !value["message"].is_string() {
+            value["message"] = json!("");
+        }
+        if !value["conversationID"].is_string() {
+            value["conversationID"] = json!("");
+        }
+        value
+    }
+
+    /// 设置页的（同 Friday 的 ConfigState::capabilities）
+    pub fn state() -> Value {
+        let all = entries();
+        let mut option_specs_map = Map::new();
+        let mut package_for = Map::new();
+        for entry in &all {
+            let id = text_of(entry, "id");
+            option_specs_map.insert(id.clone(), json!(option_specs(entry)));
+            if let Some(package) = package_of(entry) {
+                package_for.insert(id, package_json(&package));
+            }
+        }
+        let (jobs, packages, problems, mut ready_map) =
+            with(|registry| (registry.jobs.clone(), registry.packages.clone(), registry.problems.clone(), registry.availability.clone()));
+        // 本机、在线的只是看文件和密钥：当场算；要跑 check 的脚本提供方用后台算好的
+        for entry in &all {
+            let slow = kind_of(entry) == "script" && package_of(entry).is_some_and(|package| package["manifest"]["check"] == true);
+            if slow {
+                continue;
+            }
+            for kind in kinds_for(entry) {
+                let (ready, needs) = availability(entry, &kind);
+                ready_map.insert(format!("{}|{kind}", text_of(entry, "id")), json!({ "ready": ready, "needs": needs }));
+            }
+        }
+        json!({
+            "entries": all.iter().map(entry_json).collect::<Vec<_>>(),
+            "packages": packages.iter().map(package_json).collect::<Vec<_>>(),
+            "problems": problems,
+            "jobs": jobs.iter().map(job_json).collect::<Vec<_>>(),
+            "availability": ready_map,
+            "optionSpecs": option_specs_map,
+            "packageFor": package_for,
+            "providersDirectory": providers_root().to_string_lossy(),
+        })
+    }
+
+    /// 全部提供方 × 能力的可用性重查一遍（脚本提供方可能要跑 check：放到后台）
+    fn refresh_availability() {
+        std::thread::spawn(|| {
+            let mut result = Map::new();
+            for entry in entries() {
+                for kind in kinds_for(&entry) {
+                    let (ready, needs) = availability(&entry, &kind);
+                    result.insert(format!("{}|{kind}", text_of(&entry, "id")), json!({ "ready": ready, "needs": needs }));
+                }
+            }
+            with(|registry| registry.availability = result);
+            changed();
+        });
+    }
+
+    /// 上次推出去的（设置页的状态、动作）：没变不推
     static LAST: LazyLock<Mutex<(String, String)>> = LazyLock::new(|| Mutex::new((String::new(), String::new())));
 
-    /// 提供方、动作变了：设置页重列，大脑的动作换一份（本地能力下载时每 80 毫秒一次，只在真变了时推）
+    /// 提供方、任务变了：设置页重列，大脑的动作换一份（本地能力下载时每 80 毫秒一次，只在真变了时推）
     fn changed() {
         let page = state().to_string();
-        let names = serde_json::to_string(&actions().iter().map(|action| action["name"].clone()).collect::<Vec<_>>()).unwrap_or_default();
-        let (page_changed, names_changed) = {
+        let names = serde_json::to_string(&actions()).unwrap_or_default();
+        let (page_changed, actions_changed) = {
             let mut last = LAST.lock().unwrap();
             let changed = (last.0 != page, last.1 != names);
             *last = (page, names);
@@ -14449,119 +19680,204 @@ mod caps {
         if page_changed {
             crate::notify_all_clients("capabilities", json!({}));
         }
-        if names_changed {
+        if actions_changed {
             crate::serve_update_actions();
         }
     }
 
-    /// 本地能力变了（装了、关了、模型选了）：提供方跟着
+    /// 本地能力装好、卸掉、开关了
     pub fn powers_changed() {
+        sync_powers();
         changed();
     }
 
-    /// CapabilitiesState
-    pub fn state() -> Value {
-        let mut available = Map::new();
-        let entries: Vec<Value> = entries()
-            .into_iter()
-            .map(|entry| {
-                let disabled: Vec<String> = entry["disabledKinds"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect();
-                let kinds: Vec<&str> = entry["kinds"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
-                let infos: Vec<Value> = kinds
-                    .iter()
-                    .filter_map(|raw| kind(raw))
-                    .map(|kind| {
-                        let (ready, needs) = availability(&entry, kind.raw);
-                        available.insert(format!("{}|{}", entry["id"].as_str().unwrap_or(""), kind.raw), json!({ "ready": ready, "needs": needs }));
-                        json!({ "raw": kind.raw, "title": kind.title, "symbol": kind.symbol, "toolName": kind.tool, "detail": kind.detail, "description": kind.detail,
-                            "isBuiltin": true, "allowed": !disabled.iter().any(|item| item == kind.raw) })
-                    })
-                    .collect();
-                let mut provider = entry.clone();
-                if let Some(object) = provider.as_object_mut() {
-                    object.remove("powerEnabled");
-                }
-                provider["kindInfos"] = json!(infos);
-                provider["secretNames"] = json!([]);
-                provider["active"] = json!(entry["enabled"] == true && entry["powerEnabled"] == true);
-                provider["isLocal"] = json!(true);
-                provider["isScript"] = json!(false);
-                provider["createdByAgent"] = json!(false);
-                provider["symbol"] = json!("cpu");
-                provider
-            })
-            .collect();
-        let jobs: Vec<Value> = crate::read_json_file(&jobs_path())["jobs"].as_array().cloned().unwrap_or_default();
-        json!({ "entries": entries, "packages": [], "problems": [], "jobs": jobs, "availability": available, "optionSpecs": {}, "packageFor": {},
-            "providersDirectory": crate::serve_dir().join("providers").to_string_lossy() })
+    /// 常驻那份起来时：读一遍包、跟上装好的本地能力
+    pub fn start() {
+        reload_packages();
+        sync_powers();
+        refresh_availability();
     }
 
     /// capabilities.*（设置 › 工具 › 能力提供方看着这台时）
     pub fn request(method: &str, params: &Value) -> crate::Reply {
         let id = || params["id"].as_str().filter(|id| !id.is_empty()).map(str::to_string).ok_or((-32602, "缺少参数 id".to_string()));
-        let known = |id: &str| entries().iter().any(|entry| entry["id"] == json!(id));
+        let missing = |id: &str| (crate::NOT_FOUND, format!("没有提供方 {id}"));
         match method {
-            "capabilities.state" | "capabilities.refreshAvailability" => {
-                if method == "capabilities.refreshAvailability" {
-                    changed();
-                }
-                return Ok(state());
-            }
+            "capabilities.state" => {}
+            "capabilities.refreshAvailability" => refresh_availability(),
             "capabilities.setEnabled" => {
                 let id = id()?;
-                if !known(&id) {
-                    return Err((crate::NOT_FOUND, format!("没有提供方 {id}")));
-                }
-                let enabled = params["enabled"].as_bool().unwrap_or(true);
-                save_user(&id, |entry| {
-                    entry.insert("enabled".into(), json!(enabled));
+                let on = params["enabled"].as_bool().unwrap_or(true);
+                let found = update_entry(&id, |entry| {
+                    entry["enabled"] = json!(on);
+                    // 打开时能力全被单独关掉了：一并打开，免得开了也没用
+                    if on
+                        && kinds_for(entry).iter().all(|kind| !allows(entry, kind))
+                        && let Some(object) = entry.as_object_mut()
+                    {
+                        object.remove("disabledKinds");
+                    }
                 });
+                if !found {
+                    return Err(missing(&id));
+                }
             }
             "capabilities.setKindAllowed" => {
                 let id = id()?;
                 let raw = params["kind"].as_str().unwrap_or("").to_string();
-                if !known(&id) || kind(&raw).is_none() {
-                    return Err((crate::NOT_FOUND, format!("没有提供方 {id} 的这项能力")));
-                }
                 let allowed = params["allowed"].as_bool().unwrap_or(true);
-                save_user(&id, |entry| {
-                    let mut disabled: Vec<Value> = entry.get("disabledKinds").and_then(Value::as_array).cloned().unwrap_or_default();
+                let found = update_entry(&id, |entry| {
+                    let mut disabled: Vec<Value> = entry["disabledKinds"].as_array().cloned().unwrap_or_default();
                     disabled.retain(|item| *item != json!(raw));
                     if !allowed {
                         disabled.push(json!(raw));
                     }
-                    entry.insert("disabledKinds".into(), json!(disabled));
+                    disabled.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+                    if disabled.is_empty() {
+                        if let Some(object) = entry.as_object_mut() {
+                            object.remove("disabledKinds");
+                        }
+                    } else {
+                        entry["disabledKinds"] = json!(disabled);
+                    }
                 });
+                if !found {
+                    return Err(missing(&id));
+                }
+            }
+            "capabilities.setOption" => {
+                let id = id()?;
+                let key = params["key"].as_str().unwrap_or("").to_string();
+                let value = params["value"].as_str().unwrap_or("").trim().to_string();
+                let found = update_entry(&id, |entry| {
+                    if !entry["options"].is_object() {
+                        entry["options"] = json!({});
+                    }
+                    let options = entry["options"].as_object_mut().unwrap();
+                    if value.is_empty() {
+                        options.remove(&key);
+                    } else {
+                        options.insert(key.clone(), json!(value));
+                    }
+                });
+                if !found {
+                    return Err(missing(&id));
+                }
             }
             "capabilities.setTitle" => {
                 let id = id()?;
                 let title = params["title"].as_str().unwrap_or("").trim().to_string();
-                save_user(&id, |entry| {
-                    if title.is_empty() {
-                        entry.remove("title");
-                    } else {
-                        entry.insert("title".into(), json!(title));
-                    }
-                });
+                if !title.is_empty() && !update_entry(&id, |entry| entry["title"] = json!(title)) {
+                    return Err(missing(&id));
+                }
             }
             "capabilities.deleteJob" => {
                 let id = id()?;
-                with_jobs(|jobs| jobs.retain(|job| job["id"] != json!(id)));
+                with(|registry| {
+                    registry.jobs.retain(|job| job["id"] != json!(id));
+                    save_jobs(registry);
+                });
+                changed();
             }
-            // 本机的提供方没有选项；提供方包（脚本提供方）这台的 EDITH 还不支持
-            "capabilities.setOption" => {}
-            "capabilities.retest" | "capabilities.import" | "capabilities.export" | "capabilities.deletePackage" => {
+            "capabilities.deletePackage" => {
+                let id = id()?;
+                if package(&id).is_none() {
+                    return Ok(json!({ "error": format!("没有 id 为 {id} 的脚本提供方") }));
+                }
+                let error = crate::move_to_trash(&providers_root().join(&id)).err().unwrap_or_default();
+                reload_packages();
+                return Ok(json!({ "error": error }));
+            }
+            "capabilities.retest" => {
+                let id = id()?;
+                return Ok(json!({ "error": test_provider(&id).err().unwrap_or_default() }));
+            }
+            "capabilities.import" => {
+                // 客户端读好的包（.fridayprovider / .zip；导入文件夹时客户端先打成 zip）
+                let name = std::path::Path::new(params["name"].as_str().unwrap_or("provider.fridayprovider"))
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "provider.fridayprovider".into());
+                let data = base64::engine::general_purpose::STANDARD
+                    .decode(params["data"].as_str().unwrap_or(""))
+                    .map_err(|_| (-32602, "data 不是 base64".to_string()))?;
+                return Ok(import_package(&name, &data));
+            }
+            "capabilities.export" => {
+                let id = id()?;
+                let package = package(&id).ok_or((crate::NOT_FOUND, format!("没有 id 为 {id} 的脚本提供方")))?;
+                let directory = PathBuf::from(text_of(&package, "directory"));
+                let language = package["manifest"]["language"].as_str().unwrap_or("python");
+                let mut files = vec![(
+                    format!("{id}/provider.json"),
+                    friday_core::provider_store::export_manifest(package["manifest"].as_object().unwrap_or(&Map::new())).into_bytes(),
+                )];
+                for item in std::fs::read_dir(&directory).into_iter().flatten().flatten() {
+                    let name = item.file_name().to_string_lossy().into_owned();
+                    if name == "provider.json" || name == "work" || name.starts_with('.') || !item.path().is_file() {
+                        continue;
+                    }
+                    if let Ok(data) = std::fs::read(item.path()) {
+                        files.push((format!("{id}/{name}"), data));
+                    }
+                }
+                let _ = language;
+                let data = capnet::zip_stored(&files);
                 return Ok(
-                    json!({ "ok": false, "error": "这台的 EDITH 还不支持提供方包（脚本提供方）：本机的提供方跟着设置 › 能力里装的本地能力走" }),
+                    json!({ "name": format!("{id}.fridayprovider"), "data": base64::engine::general_purpose::STANDARD.encode(data) }),
                 );
             }
             other => return Err((-32601, format!("没有这个方法：{other}"))),
         }
-        Ok(json!({}))
+        Ok(state())
+    }
+
+    /// 导入提供方包：{ok, id, title, version, replaced, permissionTitle, permissionDetail} 或 {ok: false, error}
+    fn import_package(name: &str, data: &[u8]) -> Value {
+        let staging = crate::serve_dir().join("staging").join(uuid::Uuid::new_v4().simple().to_string());
+        let archive = staging.join(name);
+        let unpacked = staging.join("unpacked");
+        let result = (|| -> Result<Value, String> {
+            std::fs::create_dir_all(&staging).map_err(|error| error.to_string())?;
+            std::fs::write(&archive, data).map_err(|error| error.to_string())?;
+            crate::plugins::unzip(&archive, &unpacked)?;
+            let folder = friday_core::provider_store::locate(&unpacked, name)?;
+            let builtins = builtin_ids();
+            let catalog: Vec<String> = all_kinds().into_iter().filter(|raw| !builtins.contains(raw)).collect();
+            let installed = friday_core::provider_store::install(&providers_root(), &folder, name, &builtins, &catalog)?;
+            Ok(installed)
+        })();
+        let _ = std::fs::remove_dir_all(&staging);
+        match result {
+            Ok(installed) => {
+                reload_packages();
+                let manifest = &installed["package"]["manifest"];
+                let info = package_json(&installed["package"]);
+                json!({ "ok": true, "id": manifest["id"], "title": manifest["title"], "version": manifest["version"], "replaced": installed["replaced"],
+                    "permissionTitle": info["permissionTitle"], "permissionDetail": info["permissionDetail"] })
+            }
+            Err(error) => json!({ "ok": false, "error": error }),
+        }
+    }
+
+    /// 生图、生视频要花钱（在线提供方）：PreToolUse 说一声（规则按工具名）；本机的、看图听录音这些不用
+    pub fn need(action: &str, arguments: &Map<String, Value>) -> Value {
+        let Some(kind) = kind_for_tool(action) else { return json!(false) };
+        if !kind_paid(&kind) {
+            return json!(false);
+        }
+        let chosen = match argument(arguments, "provider") {
+            Some(id) => entry(&id),
+            None => providers(&kind, false).into_iter().find(|entry| availability(entry, &kind).0),
+        };
+        match chosen {
+            Some(chosen) if !is_local(&chosen) => {
+                json!({ "target": text_of(&chosen, "title"), "summary": format!("用在线服务「{}」{}（按量计费）", text_of(&chosen, "title"), kind_title(&kind)), "rule": format!("friday__{action}") })
+            }
+            _ => json!(false),
+        }
     }
 }
-
-// MARK: - 内置终端（伪终端：macOS / Linux 的 posix_openpt，Windows 的 ConPTY）
 
 mod pty {
     //! 内置终端（Friday 的 term.*，Friday 仓库的 qt/docs/TERMINAL.md）：大脑开伪终端跑 shell，客户端断了照常跑，连上来的接着看
