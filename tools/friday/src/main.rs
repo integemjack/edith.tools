@@ -28277,7 +28277,7 @@ mod calls {
     //! - 远程工作通道（callType work）这里不做，回 error。没打开 calls 特性编的：渠道不声明能打电话，这些都不做。
 
     use std::collections::{HashMap, HashSet, VecDeque};
-    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
     use std::sync::mpsc::{self, Receiver, Sender};
     use std::sync::{Arc, LazyLock, Mutex};
     use std::time::{Duration, Instant};
@@ -28686,6 +28686,8 @@ mod calls {
     /// 对方的声音（48 kHz），节拍线程每 20 毫秒取走
     static HEARD: LazyLock<Mutex<Vec<i16>>> = LazyLock::new(|| Mutex::new(Vec::new()));
     static MEDIA_ON: AtomicBool = AtomicBool::new(false);
+    /// 每次接通、挂断加一：接通时另起线程接过语音，起好时对不上（已经挂了）就收掉
+    static MEDIA_GENERATION: AtomicU64 = AtomicU64::new(0);
 
     /// 要念的（48 kHz）；ducked：用户开口了，压低着
     struct Playback {
@@ -29166,7 +29168,6 @@ mod calls {
                     if state == call_engine::CONNECTED && !self.current.connected {
                         self.current.connected = true;
                         self.current.connected_at = Some(Instant::now());
-                        self.start_media(engine);
                         // 先开口：打进来的应一声，打出去的说为什么打
                         let greeting = if self.current.incoming {
                             "我在，你说。".to_string()
@@ -29175,7 +29176,7 @@ mod calls {
                         } else {
                             self.current.reason.clone()
                         };
-                        crate::voice::say(&greeting);
+                        self.start_media(engine, greeting);
                     }
                     if state == call_engine::ENDED || state == call_engine::IDLE {
                         self.ended();
@@ -29184,7 +29185,7 @@ mod calls {
             }
         }
 
-        fn start_media(&mut self, engine: &'static call_engine::Call) {
+        fn start_media(&mut self, engine: &'static call_engine::Call, greeting: String) {
             HEARD.lock().unwrap().clear();
             {
                 let mut playback = PLAYBACK.lock().unwrap();
@@ -29192,9 +29193,14 @@ mod calls {
                 playback.ducked = false;
                 playback.level = 0.0;
             }
-            if let Err(error) = crate::voice::start_call(&self.current.channel, &self.peer_name()) {
-                self.note(&format!("通话里听不了、说不了：{error}"));
-            }
+            // 接过实时语音那一路（本地语音没起着时要等它起来）：另起线程，不卡信令；起好了先开口，这时电话已经挂了就收掉
+            let media = MEDIA_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
+            let (channel, name) = (self.current.channel.clone(), self.peer_name());
+            std::thread::spawn(move || match crate::voice::start_call(&channel, &name) {
+                Ok(()) if MEDIA_GENERATION.load(Ordering::Relaxed) == media => crate::voice::say(&greeting),
+                Ok(()) => crate::voice::stop_call(),
+                Err(error) => crate::assistant::note(&format!("通话里听不了、说不了：{error}"), &source_for(&channel)),
+            });
             MEDIA_ON.store(true, Ordering::Relaxed);
             let video = self.current.video;
             if video {
@@ -29206,6 +29212,7 @@ mod calls {
         }
 
         fn stop_media(&mut self) {
+            MEDIA_GENERATION.fetch_add(1, Ordering::Relaxed);
             if let Some(stop) = self.media.take() {
                 stop.store(true, Ordering::Relaxed);
             }
