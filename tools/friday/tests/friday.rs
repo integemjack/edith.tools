@@ -226,6 +226,7 @@ fn friday_client_through_gateway() {
     assert_eq!(hello["protocol"], 1);
     assert_eq!(hello["server"]["version"], "0.0.0", "不让客户端自动升级");
     assert!(hello["server"]["features"].as_array().unwrap().contains(&json!("mkdir")));
+    assert!(hello["server"]["features"].as_array().unwrap().contains(&json!("teamModePerConversation")), "任务模式跟随会话");
     assert!(has(&hello["state"]["runner"]["generating"], SESSION), "{}", hello["state"]["runner"]);
     let summaries = hello["state"]["summaries"].as_array().unwrap();
     assert_eq!(summaries.len(), 1);
@@ -912,7 +913,14 @@ fn models_secrets_and_turn_settings() {
     let id = client.send("engines.remove", json!({ "id": "edith" }));
     assert_eq!(client.reply(id)["error"]["code"], 4);
 
-    // 会话上选的权限模式、模型、思考档位随话交给大脑；附件里的图片单独列出（模型能看图时给它）
+    // 任务模式：EDITH 上只有原来的和工作流，「不派」按原来的记；不认识的回 -32602
+    client.request("runner.setTeamMode", json!({ "conversationID": SESSION, "mode": "solo" }));
+    assert_eq!(client.request("settings.get", json!({}))["teamMode"], "delegatesHeavy");
+    let id = client.send("runner.setTeamMode", json!({ "conversationID": SESSION, "mode": "nope" }));
+    assert_eq!(client.reply(id)["error"]["code"], -32602);
+    client.request("runner.setTeamMode", json!({ "conversationID": SESSION, "mode": "ultra" }));
+    assert_eq!(client.request("settings.get", json!({}))["teamMode"], "ultra", "同时记成新对话的默认");
+    // 会话上选的权限模式、模型、思考档位、任务模式随话交给大脑；附件里的图片单独列出（模型能看图时给它）
     client.request("runner.setPermissionMode", json!({ "conversationID": SESSION, "mode": "full" }));
     client.request("runner.setEngine", json!({ "conversationID": SESSION, "engineID": "second" }));
     client.request("runner.setThinking", json!({ "conversationID": SESSION, "level": "high" }));
@@ -925,8 +933,8 @@ fn models_secrets_and_turn_settings() {
     let sense = link.wait_for(10, |message| message["method"] == "sense").unwrap();
     let params = &sense["params"];
     assert_eq!(
-        (params["mode"].as_str(), params["engine"].as_str(), params["thinking"].as_str()),
-        (Some("full"), Some("second"), Some("high"))
+        (params["mode"].as_str(), params["engine"].as_str(), params["thinking"].as_str(), params["team"].as_str()),
+        (Some("full"), Some("second"), Some("high"), Some("workflow"))
     );
     assert_eq!(params["images"], json!([shot]));
     reply(&mut link, &sense, json!({ "disposition": "started", "turn": "t1" }));

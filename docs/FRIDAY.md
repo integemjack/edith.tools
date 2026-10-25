@@ -38,7 +38,10 @@ Friday 客户端 ──SSH──▶ edith-friday --attach（一条连接一个�
   消息 id 不变。改一条重发：这段整个存成 EDITH 里藏起来的一支（`sessions.fork` 带 `hidden`，记在 `#branch` 名下），主干截到那条之前；
   分出去的各支按每条消息连同前面历史的指纹接进消息树（共同的开头不重复，同一处几支按分出来的先后排），切分支就是两支对换（`sessions.copy`）。
   从某条消息分叉成新会话用 `sessions.fork`（标题加「（fork）」）。
-- **会话上选的**：权限模式、思考档位、模型随每句话交给大脑（`sense` 的 `mode` / `thinking` / `engine`），附件里的图片单独列出（`images`，模型能看图时给它）。
+- **会话上选的**：权限模式、思考档位、模型、任务模式随每句话交给大脑（`sense` 的 `mode` / `thinking` / `engine` / `team`），附件里的图片单独列出（`images`，模型能看图时给它）。
+  任务模式在 EDITH 上只有两种：**原来的**（`delegatesHeavy`，主智能体需要时自己派子智能体）和**工作流**（`ultra` → `team: "workflow"`：主智能体直接有
+  `run_workflow`，先定完整流程交给子智能体并联 / 串联做，回来验收、打回）；客户端选「不派子智能体」（还有旧的「只派」）按原来的记。
+  按会话记（`runner.setTeamMode`，特性 `teamModePerConversation`），同时记成新对话的默认。
   模型列表读 EDITH 的 `config.json`（顶层那个是 `edith`，`engines` 里的照原样），设置里加改删模型、存删密钥写回 `config.json` / `secrets.json`。
 - **设置页、记忆**：设置 › 智能体（系统提示、要不要批准、新对话的权限模式和模型、默认工作目录）、设置 › 工具（工具开关、技能、MCP 服务）改的是
   EDITH 的 `config.json`、`mcp.json`；工具清单问默认工作目录的大脑（`tools.list`）。设置 › 记忆直接读写 EDITH 的 `memory.json`（模型用 save_memory / search_memory）。
@@ -98,6 +101,7 @@ Friday 客户端 ──SSH──▶ edith-friday --attach（一条连接一个�
   - 内置钩子（`hooks.state` 的 `builtin` / `builtinModels`、`hooks.setBuiltin`，默认都开）：「会话第一条消息」附上记忆库和技能的目录（UserPromptSubmit 补的上下文，
     界面上不显示）；「一轮结束」这段会话全部做完后，用选的模型（自动：快的）整理——记下 / 改掉 / 忘掉 EDITH 的记忆（`memory.json`，`source: auto:turn`）、
     记经验、建 / 改技能（`~/.edith/skills/<名字>/`，标 `source: auto`、`status: 试用`），没整理成的试 3 次。
+  - 整理、判定、评测、改进「自动」挑模型时不挑本机的大模型（`power://`，后台活不该把它拉起来占内存），要用它在设置里选。
   - 判定：一段对话交付后 12 小时没再说话判一次——几件事、追问几次（就是各提示词版本的一次交付率、追问率），用过的记忆、技能记成败，对不上的改掉、忘掉，
     试用的技能帮上了转正、带偏了移到回收站，写了「怎样算做好」的收成评测题；判完开着自动回滚、现在的提示词比上一版明显差时回滚（friday-core 的规则）。
     自动学的记忆、技能追问比平时多或 90 天没用上的归档 / 移到回收站。
@@ -151,7 +155,7 @@ cp edith ~/.friday-server/bin/                            # 或者 edith 在 PAT
 | 选工作目录（没发过话的）、列目录、新建文件夹、最近的目录 | `runner.setWorkingDirectory`、`fs.list`、`fs.mkdir`（特性 `mkdir`）、`directories.*` |
 | 发话：闲着开始一轮，忙时补充进这一轮，或排到下一轮；拿掉排着的 | `runner.submit`（`whenBusy: "queue"` 排队，特性 `submitFrom`）、`runner.removeQueued` |
 | 改一条重发、切分支、出错了重试 | `runner.submit` 带 `replacing`、`runner.selectBranch`、`runner.retry`（`runtime` 的 `failedMessageID` / `canRetry`） |
-| 权限模式、思考档位、模型 | `runner.setPermissionMode` / `setThinking` / `setEngine`；`engines.update` / `remove`、`secrets.set` / `remove` |
+| 权限模式、思考档位、模型、任务模式（特性 `teamModePerConversation`） | `runner.setPermissionMode` / `setThinking` / `setEngine` / `setTeamMode`；`engines.update` / `remove`、`secrets.set` / `remove` |
 | 附件、文件卡片预览 | `file.upload`（一块块传，回这台上的路径）、`fs.read` |
 | 流式看回复、速度和用量、上下文进度环 | `message` / `conversation` / `runtime` / `runner` 事件 |
 | 批准（主智能体的、子智能体的；几个客户端都问，先答的算） | `runner.resolveApproval` |
@@ -180,7 +184,7 @@ cp edith ~/.friday-server/bin/                            # 或者 edith 在 PAT
 还不行的（回 `-32601` 没有，或错误 `4` 说明原因；`server.features` 不报，客户端就不显示）：
 
 - 助手（`assistant.*` 的对话、渠道、通话）：EDITH 是大脑，助手开在客户端那台上；实时语音对着这台专门的「语音」会话说。
-- 任务模式（工作方式）只记下，EDITH 一律需要时派子智能体。
+- 任务模式「不派子智能体」：EDITH 上没有这一档，按原来的（需要时派）做。
 - 要批准的事：没有客户端连着时大脑等能批准的连上来（最多 10 分钟，过了就不做）；要无人值守就选「完全」权限模式，
   或在 `~/.edith/config.json` 的 `permissions.allow` 里放开、用 `edith --auto`。
 

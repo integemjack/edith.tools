@@ -1978,6 +1978,9 @@ fn summary(session: &Stored, state: &State) -> Value {
     if let Some(thinking) = META.setting(&session.id, "thinking") {
         value["thinking"] = json!(thinking);
     }
+    if let Some(mode) = META.setting(&session.id, "teamMode") {
+        value["teamMode"] = json!(team_mode(&mode).unwrap_or("delegatesHeavy"));
+    }
     value
 }
 
@@ -2630,7 +2633,7 @@ fn settings_state() -> Value {
         "defaultPermissionMode": default_permission_mode(),
         "defaultEngineID": default_engine_id(&all),
         "workingDirectory": default_directory(),
-        "teamMode": META.value()["teamMode"].as_str().unwrap_or("delegatesHeavy"),
+        "teamMode": default_team_mode(),
         "userStops": [],
         "lightEngineID": "follow",
         "quotaFallback": "wait",
@@ -2882,6 +2885,7 @@ fn settings_request(method: &str, params: &Value) -> Reply {
                 META.update(|value| value["workingDirectory"] = json!(directory));
             }
             if let Some(mode) = params["teamMode"].as_str() {
+                let mode = team_mode(mode).ok_or((-32602, format!("不认识的任务模式：{mode}")))?;
                 META.update(|value| value["teamMode"] = json!(mode));
             }
             if engines_changed {
@@ -3733,7 +3737,18 @@ fn server_info() -> Value {
 
 /// 做了的（客户端只用报了的）；本地能力、本地模型、用户音色在常驻的那份里
 fn features() -> Vec<&'static str> {
-    let mut list = vec!["mkdir", "submitFrom", "activity", "assistant", "config", "memory", "memorySearch", "commands", "storage"];
+    let mut list = vec![
+        "mkdir",
+        "submitFrom",
+        "activity",
+        "assistant",
+        "config",
+        "memory",
+        "memorySearch",
+        "commands",
+        "storage",
+        "teamModePerConversation",
+    ];
     if serve_mode() != "off" {
         list.extend([
             "powers",
@@ -3819,8 +3834,26 @@ fn materialize(session: &Stored) -> Result<(Arc<Brain>, Stored), (i64, String)> 
 }
 
 /// 交给大脑的这段话按什么来：界面上选的权限模式、思考档位、模型（EDITH 照着审批、发请求），附件里的图片（模型能看图时一起给它）
+/// 任务模式（Friday 的 teamMode）：EDITH 上只有两种——原来的（delegatesHeavy：需要时自己派子智能体）和工作流（ultra）；
+/// 「不派」「只派」这些旧的、别处来的都按原来的记。不认识的是 None
+fn team_mode(raw: &str) -> Option<&'static str> {
+    match raw {
+        "ultra" | "workflow" => Some("ultra"),
+        "solo" | "delegatesHeavy" | "delegatesOnly" | "delegatesWhenNeeded" | "default" => Some("delegatesHeavy"),
+        _ => None,
+    }
+}
+
+/// 新对话（没单独选过的会话）的任务模式：最后选的
+fn default_team_mode() -> &'static str {
+    META.value()["teamMode"].as_str().and_then(team_mode).unwrap_or("delegatesHeavy")
+}
+
 fn with_prefs(request: &mut Value, session: &str, attachments: &[&str]) {
     request["mode"] = json!(permission_mode(session));
+    // 工作方式：工作流，或 EDITH 原来的
+    let team = META.setting(session, "teamMode").and_then(|mode| team_mode(&mode)).unwrap_or_else(default_team_mode);
+    request["team"] = json!(if team == "ultra" { "workflow" } else { "default" });
     if let Some(thinking) = META.setting(session, "thinking") {
         request["thinking"] = json!(thinking);
     }
@@ -4156,6 +4189,7 @@ fn handle(method: &str, params: &Value) -> Reply {
             META.push_recent(&directory);
             for key in ["permissionMode", "thinking", "engineID", "teamMode"] {
                 if let Some(value) = params[key].as_str() {
+                    let value = if key == "teamMode" { team_mode(value).unwrap_or("delegatesHeavy") } else { value };
                     META.set_setting(&id, key, value);
                 }
             }
@@ -4366,13 +4400,19 @@ fn handle(method: &str, params: &Value) -> Reply {
             event("directories", directories_state());
             Ok(json!({}))
         }
-        // 记在这段会话上，下一句交给大脑时带上（权限模式、思考档位、模型；任务模式只记下）
+        // 记在这段会话上，下一句交给大脑时带上（权限模式、思考档位、模型、任务模式）
         "runner.setPermissionMode" | "runner.setThinking" | "runner.setEngine" | "runner.setTeamMode" => {
             let id = lower(&text_param(params, "conversationID")?);
             let (key, value) = match method {
                 "runner.setPermissionMode" => ("permissionMode", params["mode"].as_str()),
                 "runner.setThinking" => ("thinking", params["level"].as_str()),
-                "runner.setTeamMode" => ("teamMode", params["mode"].as_str()),
+                "runner.setTeamMode" => {
+                    let raw = params["mode"].as_str().unwrap_or("");
+                    let mode = team_mode(raw).ok_or((-32602, format!("不认识的任务模式：{raw}")))?;
+                    // 同时记成新对话的默认（同 Friday）
+                    META.update(|value| value["teamMode"] = json!(mode));
+                    ("teamMode", Some(mode))
+                }
                 _ => ("engineID", params["engineID"].as_str()),
             };
             if let Some(value) = value {
@@ -21402,25 +21442,30 @@ mod learn {
                 }
                 candidate.is_chat = model_traits::is_chat_model(&model);
                 candidate.usable = !disallowed.contains(&candidate.id);
+                candidate.power = text(&engine, "baseURL").starts_with("power://");
                 (engine, candidate)
             })
             .collect()
     }
 
-    /// 用哪个模型：chosen（设置里选的，还在的）→ 自动（strong：强的一档；不然快的）→ 默认的
+    /// 用哪个模型：chosen（设置里选的，还在的）→ 自动（strong：强的一档；不然快的）→ 默认的。
+    /// 自动的不挑本机的大模型（power://）：后台的整理、判定不该把本地大模型拉起来占着内存，要用它就在设置里选
     fn engine(chosen: &str, strong: bool) -> Option<Value> {
         let pool = pool();
         if let Some((engine, _)) = pool.iter().find(|(engine, _)| !chosen.is_empty() && engine["id"] == json!(chosen)) {
             return Some(engine.clone());
         }
-        let candidates: Vec<chooser::Candidate> = pool.iter().map(|(_, candidate)| candidate.clone()).collect();
+        let candidates: Vec<chooser::Candidate> = pool
+            .iter()
+            .map(|(_, candidate)| chooser::Candidate { usable: candidate.usable && !candidate.power, ..candidate.clone() })
+            .collect();
         let index = if strong { chooser::pick(&candidates, "strong", None, false) } else { chooser::pick_light(&candidates) };
         if let Some(index) = index {
             return Some(pool[index].0.clone());
         }
         let engines = crate::engines();
         let default = crate::default_engine_id(&engines);
-        engines.into_iter().find(|engine| engine["id"] == json!(default))
+        engines.into_iter().find(|engine| engine["id"] == json!(default) && !text(engine, "baseURL").starts_with("power://"))
     }
 
     /// 问一次（不带工具、不流式）：回复的文字
