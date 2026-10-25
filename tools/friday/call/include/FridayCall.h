@@ -95,6 +95,11 @@ typedef struct {
     void (*on_channel_open)(void* ctx);
     void (*on_channel_closed)(void* ctx);
     void (*on_message)(void* ctx, const uint8_t* data, int length);
+    /// edith-friday 加的：别的通道（friday_text_accept_extra 给了前缀的、friday_text_open_extra 开的）开了、来消息、关了、积压发完了
+    void (*on_extra_open)(void* ctx, const char* label);
+    void (*on_extra_message)(void* ctx, const char* label, const uint8_t* data, int length);
+    void (*on_extra_closed)(void* ctx, const char* label);
+    void (*on_extra_drained)(void* ctx, const char* label);
 } friday_text_callbacks;
 
 /// 建连接（ICE 服务器同 friday_call_set_ice_servers 的写法，接在内置的 STUN 后面）；建不了返回 NULL
@@ -117,6 +122,14 @@ friday_text_peer* friday_text_create_labeled(const friday_text_callbacks* callba
 int friday_text_send_binary(friday_text_peer* peer, const uint8_t* data, int length);
 /// 通道上还积着多少字节没发出去
 uint64_t friday_text_buffered(friday_text_peer* peer);
+/// 同一个连接上对方建的别的通道也收下（label 以 prefixes 里任一个开头，逗号分开；客户端设备的 friday-serial:、friday-tcp:）
+void friday_text_accept_extra(friday_text_peer* peer, const char* prefixes);
+/// 这边建一条别的通道（带内协商，不用重新 offer）；建不了返回非 0
+int friday_text_open_extra(friday_text_peer* peer, const char* label);
+/// 在别的通道上发一段二进制：返回还积着多少字节没发出去，通道没了 / 发不出去返回 -1
+int64_t friday_text_extra_send(friday_text_peer* peer, const char* label, const uint8_t* data, int length);
+/// 关掉一条别的通道（之后不再报它）
+void friday_text_extra_close(friday_text_peer* peer, const char* label);
 
 // ---- 测试用：主叫那端（建通道、出 offer），在自检里扮手机开 P2P 文字 ----
 

@@ -8,8 +8,9 @@
   视频的 90 kHz 时间戳按真实时间算；`setVideoEncoding(码率, 帧率, 线程数)`；编码器用 `SEncParamExt` 初始化、多线程按条带并行编；
   视频轨道加了 `RtcpNackResponder`（丢包重传）和 `PacingHandler`（匀着发）。不用 Qt。
 - `include/FridayCall.h`、`src/FridayCall.cpp`：C 接口（同 Friday 仓库 `Friday/Vendor/FridayCall`），edith-friday 的 `call_engine` 模块经 FFI 调。
-  这里多了三个：`friday_text_create_labeled`（认别的 label 的通道：远程工作通道 `friday-work`）、`friday_text_send_binary`（二进制消息：工作通道的分片）、
-  `friday_text_buffered`（通道上积着多少没发出去）。
+  这里多了几个：`friday_text_create_labeled`（认别的 label 的通道：远程工作通道 `friday-work`）、`friday_text_send_binary`（二进制消息：工作通道的分片）、
+  `friday_text_buffered`（通道上积着多少没发出去）；同一个连接上的别的通道（客户端设备的 `friday-serial:` / `friday-tcp:`）：`friday_text_accept_extra`、
+  `friday_text_open_extra`、`friday_text_extra_send`、`friday_text_extra_close`，回调表多了 `on_extra_open` / `message` / `closed` / `drained`。
 - `cmake/FridayCallDeps.cmake`：依赖，第一次配置时用 FetchContent 从 GitHub 拉源码——
   libdatachannel v0.24.5（MPL-2.0）、Mbed TLS 3.6.7（Apache-2.0）、Opus v1.5.2（BSD-3）、openh264 v2.6.0（BSD-2），各自按各自的许可证；
   这个目录里的其余代码随 edith.tools 一起公开。

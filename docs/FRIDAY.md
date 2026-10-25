@@ -159,6 +159,18 @@ Friday 客户端 ──SSH──▶ edith-friday --attach（一条连接一个�
     `plugins.install` / `update`、`hooks.saveGlobal` / `trust`、`sync.*`、`assistant.export.*` / `import.*`）。一条 JSON-RPC 消息大于 200 KB 时切成 ≤ 128 KB 的
     二进制片（`'F''W''1'` + 8 字节大端 sid + 4 字节 seq + 4 字节 total + 分片，同 Friday 的 WorkFramer，单条上限 64 MB，协议错就断开）；通道上积着 4 MB 以上时先攒着。
     对端 hangup、通道关了、ICE 断了、30 秒没连上、网关退出都收尾（发 hangup，关网关）。
+- **客户端设备**（同 Friday 的 ClientDevices，Friday 仓库 qt/docs/REMOTE.md §6「客户端设备」；`server.features` 报 `clientDevices`，`server.clientDevices.power`
+  说 devices 能力装好开着没有）：硬件插在客户端那台电脑上（ESP / Arduino / STM32 开发板的串口、摄像头、安卓 / iOS 手机、局域网设备）。
+  - 客户端在 hello 的 `features` 里声明 `clientDevices`（`clientDevices.kinds`）：它的网关登记给常驻那份；之后这边能反过来向它发 `device.*` 请求——网关编 id
+    `"s:N"` 发给客户端，回复、超时（错误 `23`）、客户端断开（`21`）各回一次；客户端发来的 `device.*` 通知转过去。SSH 进来的也行（没有专用通道）。
+  - 工作通道上串口会话、TCP 隧道各走同一个连接上的一条专用通道（客户端建的 `friday-serial:<id>` / `friday-tcp:<id>`，带内协商），字节原样转；
+    别的 label 不认（关掉）。
+  - 业务都在 devices 能力（Friday.Powers，设置 › 能力里装，清单声明 `clientDevices`，不用显卡的 `<系统>-<架构>` 包）：有登记的客户端时拉起它，经
+    `/v1/bridge`（WebSocket：文本帧 JSON——`hello`、`clients`、`notify`、`channel.open` / `closed` / `pause` / `resume`、`response`，它发 `request`、
+    `channel.close`；二进制帧是通道数据 `[1 字节头长 H][H 字节「客户端\nlabel」][数据]`）中转。它的 MCP 服务（`/mcp`）以名字 `client` 写进 `~/.edith/mcp.json`
+    （带 `fridayDevices` 标记、`autoApprove`：动硬件前客户端那头会问拿着设备的人），智能体用 `client__…` 的工具；能力重启换了地址、令牌就换上新的
+    （EDITH 已连着的 MCP 服务配置改了，调用时按新配置重连）。通道积压过 4 MB 叫它先别读那头，发完了再接着；桥连着时不让它当闲着停掉。
+    客户端都走了 1 分钟后断桥、去掉 MCP 服务；桥断了 3 秒后重连，起不来 30 秒后再试。
   - 日志在 `~/.edith/friday/assistant/journal/<日期>.jsonl`（只追加，同一个 id 后写的算），设置在 `settings.json`；`assistant.history` 按页取，`assistant.clear`
     清空并换一段新的助手会话。开着助手时常驻那份不闲退；`activity.subscribe` 的快照报 `assistant: true`（客户端的助手对这台的会话只上状态板）。
 
@@ -233,13 +245,15 @@ cp edith ~/.friday-server/bin/                            # 或者 edith 在 PAT
 | 助手（特性 `assistant`） | `assistant.status` / `subscribe` / `unsubscribe` / `history` / `say` / `stop` / `settings.update` / `presence` / `resolveApproval` / `clear` / `memory.list`、`assistant.entry` / `board` / `state` / `push` / `reset` 事件 |
 | 助手的聊天工具 | `assistant.channels.list` / `add` / `update` / `remove` / `removeOwner` / `removeGroup` / `bindCode`、`assistant.channels` 事件 |
 | 助手的通话（SChat 渠道的语音 / 视频电话、P2P 文字、远程工作通道） | 渠道列表的 `calls` / `callsReady`、`options.calls`；设置的 `answerCalls` / `callPolicy` / `quietStart` / `quietEnd` |
+| 客户端设备（特性 `clientDevices`） | hello 的 `features` / `clientDevices.kinds`、`device.*` 反向请求（id `"s:N"`）和通知、工作通道上的 `friday-serial:` / `friday-tcp:` 通道 |
 | 只听你的声音（声纹） | `settings.update` 的 `voiceOnlyEnrolled` / `voiceprintStrictness` / `voicePatience`、`assistant.voice.confirm`、`voice.state` 的 `filtering` |
 
 还不行的（回 `-32601` 没有，或错误 `4` 说明原因；`server.features` 不报，客户端就不显示）：
 
 - 渠道里批准工具调用（`approveFromChannels`）、流式回复（SChat streams、Telegram 草稿）、发文件和语音回复、问题卡片还没有；
-  助手回答会话的 `ask_user` 问题、附件读取还没有。工作通道上的客户端设备（`friday-serial:` / `friday-tcp:` 通道、`device.*` 反向请求）没有；
-  不带 `calls` 特性的包（Linux 的 x86、armv7、armv6、riscv64、loong64、ppc64le、s390x）不能打电话、不能连工作通道（渠道列表 `calls: false`）。
+  助手回答会话的 `ask_user` 问题、附件读取还没有。
+  不带 `calls` 特性的包（Linux 的 x86、armv7、armv6、riscv64、loong64、ppc64le、s390x）不能打电话、不能连工作通道（渠道列表 `calls: false`；
+  客户端设备只有 SSH 进来的反向请求）。
 - 任务模式「不派子智能体」：EDITH 上没有这一档，按原来的（需要时派）做。
 - 要批准的事：没有客户端连着时大脑等能批准的连上来（最多 10 分钟，过了就不做）；要无人值守就选「完全」权限模式，
   或在 `~/.edith/config.json` 的 `permissions.allow` 里放开、用 `edith --auto`。
@@ -278,4 +292,6 @@ cd tools/friday && cargo test
 通话（假的 SChat 服务器转信令，假手机 `edith-friday __call-phone <ws 地址> <用户 token>` 是另一部通话内核、媒体真走本机 WebRTC；假的本地语音按音量断句、
 合成回一段音调，带 speaker 时按音高给一个假声纹）的通话连接、不是主人直接拒、打进来自动接和先应一声、说一句交给助手、回复念回去、视频通话收到光环画面、
 视频里说的话带上摄像头的画面（模型收到图）、挂断记时长、电话里登记声纹、不像你的不交和「是我说的」、设置关掉过滤、call_user 打给主人、
-关掉主动打电话不打、P2P 文字收发和媒体回一句、工作通道（非创建者拒、通道上 hello、只认 SSH 的回 4、400 KB 回复和 300 KB 请求分片）。
+关掉主动打电话不打、P2P 文字收发和媒体回一句、工作通道（非创建者拒、通道上 hello、只认 SSH 的回 4、400 KB 回复和 300 KB 请求分片）；
+客户端设备（假的 devices 能力：/v1/bridge + /mcp）的登记、反向请求经「s:N」到客户端和回来、超时 23、断开 21、通知、专用通道的字节进出桥、不认识的通道不转、
+mcp.json 的 client、智能体调 client__devices 一路到客户端、SSH 进来的客户端接反向请求、能力重启后大脑重连 MCP、都走了断桥去掉 MCP 服务。

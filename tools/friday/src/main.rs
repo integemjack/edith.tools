@@ -15,7 +15,7 @@
 //!   客户端关了也不要紧：一直开着的大脑等能批准的连上来再问。
 //!
 //! - **常驻的那份**（`edith-friday serve`，整台机器一个，像 edith-connect）：Friday 专有、要一直在的——终端、浏览器、智能体的浏览器工具、
-//!   本地能力（Friday.Powers）和本地模型、定时任务、脚本工具、钩子、插件、能力提供方、助手（渠道、通话）……
+//!   本地能力（Friday.Powers）和本地模型、定时任务、脚本工具、钩子、插件、能力提供方、助手（渠道、通话）、客户端设备……
 //!   它连着这台每个大脑（在那里是能力「friday」，网关是「friday-client」），大脑只给它开模型地址和钩子两个口子；网关第一次要用时拉起它，
 //!   终端、浏览器的请求转给它。见「常驻的那份」一节。
 //!
@@ -3749,7 +3749,8 @@ fn server_info() -> Value {
         "pid": std::process::id(),
         "startedAt": *STARTED,
         "host": "server",
-        "clientDevices": { "power": false },
+        // 客户端设备：devices 能力装好开着没有（客户端的「设备」窗口据此提示去装）
+        "clientDevices": { "power": devices_power() },
         // 选目录时新建文件夹；runner.submit 认 whenBusy；会话的动静（客户端的助手看这台）、助手开没开
         "features": features(),
         // EDITH 只有原来的（需要时派、能往下派）和工作流：客户端（2.82 起）的任务模式菜单、/mode 只列这两项，选着「不派」的显示成需要时派
@@ -3786,9 +3787,70 @@ fn features() -> Vec<&'static str> {
             "voice",
             "improve",
             "builtinHooks",
+            // 接得住客户端在 hello 里声明的 clientDevices（device.* 反向请求、工作通道上的 friday-serial / friday-tcp 专用通道）
+            "clientDevices",
         ]);
     }
     list
+}
+
+// MARK: - 客户端设备（反向请求，常驻那份的 devices 中转给 devices 能力）
+
+/// 客户端设备的能力装好开着没有
+fn devices_power() -> bool {
+    serve_mode() != "off"
+        && hub()
+            .ok()
+            .and_then(|hub| hub.request("devices.status", json!({}), Duration::from_secs(5)).ok())
+            .is_some_and(|reply| reply["power"] == json!(true))
+}
+
+/// 发给客户端的反向请求：「s:N」→ 常驻那份编的号
+static REVERSE: LazyLock<Mutex<HashMap<String, u64>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static NEXT_REVERSE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 常驻那份要向这个客户端发 device.* 请求（devices.request）：编号「s:N」发出去，到点没回就替它回超时
+fn reverse_request(params: &Value) {
+    let number = params["id"].as_u64().unwrap_or(0);
+    let id = format!("s:{}", NEXT_REVERSE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1);
+    REVERSE.lock().unwrap().insert(id.clone(), number);
+    send(&json!({ "jsonrpc": "2.0", "id": id, "method": params["method"], "params": params["params"] }));
+    let timeout = params["timeoutMs"].as_u64().unwrap_or(60_000);
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(timeout));
+        if REVERSE.lock().unwrap().remove(&id).is_some() {
+            let _ = hub_forward("devices.response", &json!({ "id": number, "error": { "code": 23, "message": "客户端处理超时" } }));
+        }
+    });
+}
+
+/// 客户端发来的是反向请求的回复（id 是「s:N」、没有 method）或 device.* 通知：转给常驻那份，回 true
+fn devices_message(message: &Value) -> bool {
+    let method = message["method"].as_str().unwrap_or("");
+    if method.is_empty()
+        && let Some(id) = message["id"].as_str()
+        && (message.get("result").is_some() || message.get("error").is_some())
+    {
+        if let Some(number) = REVERSE.lock().unwrap().remove(id) {
+            let reply = if message.get("error").is_some_and(|error| !error.is_null()) {
+                json!({ "id": number, "error": message["error"] })
+            } else {
+                json!({ "id": number, "result": message["result"] })
+            };
+            std::thread::spawn(move || {
+                let _ = hub_forward("devices.response", &reply);
+            });
+        }
+        return true;
+    }
+    if message.get("id").is_none_or(Value::is_null) && method.starts_with("device.") {
+        let notify = json!({ "method": method, "params": message["params"] });
+        std::thread::spawn(move || {
+            let _ = hub_forward("devices.notify", &notify);
+        });
+        return true;
+    }
+    false
 }
 
 fn directories_state() -> Value {
@@ -3816,6 +3878,26 @@ fn hello(params: &Value) -> Reply {
         log(&error);
     }
     attach_all();
+    // 客户端设备：声明了 clientDevices 的能接 device.* 反向请求，登记给常驻那份（工作通道进来的带上那条的 requestId：专用通道在它的连接上）
+    if serve_mode() != "off"
+        && params["features"].as_array().is_some_and(|features| features.iter().any(|feature| feature == "clientDevices"))
+    {
+        let client = &params["client"];
+        let name = format!(
+            "{} {}（{}）",
+            client["name"].as_str().unwrap_or("客户端"),
+            client["version"].as_str().unwrap_or(""),
+            client["platform"].as_str().unwrap_or("")
+        );
+        let register = json!({
+            "name": name,
+            "kinds": params["clientDevices"]["kinds"].as_array().cloned().unwrap_or_default(),
+            "work": std::env::var("EDITH_FRIDAY_WORK_ID").unwrap_or_default(),
+        });
+        if let Err((_, error)) = hub_forward("devices.addClient", &register) {
+            log(&format!("客户端设备登记不上：{error}"));
+        }
+    }
     let mut state = STATE.lock().unwrap();
     state.greeted = true;
     Ok(json!({
@@ -5211,6 +5293,7 @@ fn serve_request(client: &str, method: &str, params: &Value) -> Reply {
         method if method.starts_with("storage.") => storage::handle(method, params),
         method if method.starts_with("services.") => services::request(method, params),
         method if method.starts_with("voice.") => voice::request(client, method, params),
+        method if method.starts_with("devices.") => devices::request(client, method, params),
         method if method.starts_with("improve.") => learn::improve::request(method, params),
         method if method.starts_with("assistant.") => assistant::request(client, method, params),
         // 网关报的信号（改了重发、重试）：记在这段会话最近一次开口的那轮
@@ -5333,6 +5416,7 @@ fn serve_client(stream: TcpStream, token: &str) {
     browser::forget(&name);
     voice::forget(&name);
     assistant::forget(&name);
+    devices::forget(&name);
 }
 
 /// 起来就一直开着（同一台只一份：拿不到锁的直接退）
@@ -5428,6 +5512,7 @@ fn serve() -> Result<(), String> {
     calls::hangup();
     std::thread::sleep(Duration::from_millis(300));
     channels::stop_all();
+    devices::stop();
     pty::close_all();
     browser::stop();
     powers::stop_all();
@@ -5547,6 +5632,8 @@ fn on_hub_message(hub: &Arc<Brain>, message: Value) {
         // 助手：订了的客户端收；开关变了告诉看会话动静的（它的助手按这决定这台的会话报给谁）
         Some(method) if method.starts_with("assistant.") && STATE.lock().unwrap().assistant => event(method, message["params"].clone()),
         Some("activity.assistant") if STATE.lock().unwrap().activity => event("activity.assistant", message["params"].clone()),
+        // 客户端设备：devices 能力要向这个客户端发 device.* 请求
+        Some("devices.request") => reverse_request(&message["params"]),
         // 脚本工具、能力提供方变了：设置页重列（另起线程：重列要问常驻那份，回话得靠这个线程读）
         Some("scripts") => {
             std::thread::spawn(|| config_changed(&["tools"]));
@@ -7097,6 +7184,13 @@ mod powers {
 
     pub fn is_installed(id: &str) -> bool {
         MANAGER.lock().unwrap().installed.contains_key(id)
+    }
+
+    /// 有人在用（客户端设备的桥连着）：别当闲着停掉
+    pub fn touch(id: &str) {
+        if let Some(running) = MANAGER.lock().unwrap().running.get_mut(id) {
+            running.last_used = Instant::now();
+        }
     }
 
     pub fn is_enabled(id: &str) -> bool {
@@ -28291,6 +28385,464 @@ mod channels {
     }
 }
 
+mod devices {
+    //! 客户端设备（同 Friday 的 ClientDevices，Friday 仓库 qt/docs/REMOTE.md §6「客户端设备」，桥的协议见 Friday.Powers 的 docs/devices-protocol.md）：
+    //! 硬件插在客户端那台电脑上（ESP / Arduino / STM32 开发板的串口、摄像头、安卓 / iOS 手机、局域网里的树莓派）。
+    //! - 客户端在 hello 里声明了 clientDevices（features 里有、`clientDevices.kinds`）：它的网关登记过来（devices.addClient）；之后这边可以
+    //!   反过来向它发 device.* 请求——经它的网关（devices.request 事件，网关编 id「s:N」发给客户端，回复 / 超时 / 断开各回一次 devices.response）；
+    //!   它发来的 device.* 通知（devices.notify）转过去。
+    //! - 工作通道（calls）上串口会话、TCP 隧道各走同一个连接上的一条专用通道（客户端建的 friday-serial:<id> / friday-tcp:<id>），字节原样转；
+    //!   SSH 进来的客户端没有通道，只能用不要通道的（烧录、拍照、跑工具）。
+    //! - 这里只中转，业务都在 devices 能力（Friday.Powers，设置 › 能力里装，清单里声明 clientDevices）：有登记的客户端、devices 装好开着时拉起它，
+    //!   经 /v1/bridge（WebSocket：文本帧 JSON；二进制帧是通道数据 `[1 字节头长 H][H 字节「客户端\nlabel」][数据]`）交给它客户端表、反向请求、
+    //!   通知、通道的开关和字节；它在本机开端口（rfc2217 给 esptool、ADB_SERVER_SOCKET 给 adb……）、以 MCP 服务给智能体一组工具——
+    //!   这边把 `/mcp` 以名字 client 写进 `~/.edith/mcp.json`（带 fridayDevices 标记、autoApprove：动硬件前客户端那头会问拿着设备的人），
+    //!   大脑用到时连。通道积压过 4 MB 叫它先别读那头（channel.pause），发完了再接着（channel.resume）。
+    //! - 最后一个客户端走了一分钟后断桥、去掉 MCP 服务（EDITH_FRIDAY_DEVICES_LINGER 秒，测试用）；桥断了 3 秒后重连，起不来 30 秒后再试。
+
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+    use std::time::{Duration, Instant};
+
+    use serde_json::{Map, Value, json};
+
+    use crate::wsclient::{self, Message};
+
+    /// 写进 mcp.json 的服务名（工具是 client__serial_open 这样）
+    const MCP_SERVER: &str = "client";
+    /// 通道里积压超过这么多就叫能力先别读那头
+    const PAUSE_BYTES: u64 = 4 * 1024 * 1024;
+    /// 专用通道的 label 前缀
+    pub const CHANNEL_PREFIXES: [&str; 2] = ["friday-serial:", "friday-tcp:"];
+
+    struct Client {
+        name: String,
+        kinds: Vec<String>,
+        /// 经工作通道连进来的：那条的 requestId（专用通道在它的连接上）
+        work: String,
+    }
+
+    #[derive(Default)]
+    struct State {
+        /// 网关（连接名）→ 客户端
+        clients: HashMap<String, Client>,
+        bridge: Option<wsclient::Writer>,
+        /// 正在拉起 / 连桥
+        connecting: bool,
+        generation: u64,
+        last_left: Option<Instant>,
+        /// 反向请求：这边编的号 → (桥上的 id, 客户端)
+        pending: HashMap<u64, (Value, String)>,
+        next: u64,
+        /// 专用通道：(客户端, label) → (工作通道的 requestId, 压着没读)
+        channels: HashMap<(String, String), (String, bool)>,
+    }
+
+    static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| Mutex::new(State::default()));
+
+    fn text<'a>(value: &'a Value, key: &str) -> &'a str {
+        value[key].as_str().unwrap_or("")
+    }
+
+    /// 装好、开着、声明了 clientDevices 的能力（Friday.Powers 的 devices）
+    fn power_id() -> Option<String> {
+        let state = crate::powers::state();
+        state["powers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|power| power["installedVersion"].as_str().is_some_and(|version| !version.is_empty()))
+            .filter(|power| power["capabilities"].as_array().is_some_and(|list| list.iter().any(|item| item == "clientDevices")))
+            .filter_map(|power| power["id"].as_str().map(str::to_string))
+            .find(|id| crate::powers::is_enabled(id))
+    }
+
+    pub fn power_available() -> bool {
+        power_id().is_some()
+    }
+
+    fn send_text(state: &State, message: Value) {
+        if let Some(bridge) = &state.bridge {
+            bridge.text(&message.to_string());
+        }
+    }
+
+    fn send_clients(state: &State) {
+        let clients: Vec<Value> =
+            state.clients.iter().map(|(id, client)| json!({ "id": id, "name": client.name, "kinds": client.kinds })).collect();
+        send_text(state, json!({ "type": "clients", "clients": clients }));
+    }
+
+    /// mcp.json 里的 client：桥连着时写上（地址、令牌每次拉起都可能变），断了去掉
+    fn write_mcp(server: Option<(String, String)>) {
+        let path = crate::mcp_path();
+        let mut config = crate::read_json_file(&path);
+        if !config.is_object() {
+            config = json!({});
+        }
+        let mut servers: Map<String, Value> = config["mcpServers"].as_object().cloned().unwrap_or_default();
+        let before = servers.clone();
+        servers.retain(|_, server| server.get("fridayDevices").is_none());
+        if let Some((url, token)) = server {
+            let mut entry = json!({ "type": "http", "url": url, "autoApprove": true, "fridayDevices": true });
+            if !token.is_empty() {
+                entry["headers"] = json!({ "Authorization": format!("Bearer {token}") });
+            }
+            servers.insert(MCP_SERVER.into(), entry);
+        }
+        if servers != before {
+            config["mcpServers"] = Value::Object(servers);
+            let _ = crate::write_json_file(&path, &config);
+        }
+    }
+
+    /// 有客户端、devices 能用、还没连：拉起它、连上桥（拉起要等，另起线程）
+    fn ensure_bridge() {
+        let generation = {
+            let mut state = STATE.lock().unwrap();
+            if state.bridge.is_some() || state.connecting || state.clients.is_empty() {
+                return;
+            }
+            state.connecting = true;
+            state.generation += 1;
+            state.generation
+        };
+        std::thread::spawn(move || {
+            let outcome = power_id().ok_or_else(|| "没装或关着 devices 能力".to_string()).and_then(|id| {
+                let (url, token) = crate::powers::ensure_running(&id, Duration::from_secs(150))?;
+                let host = url.trim_start_matches("http://").trim_end_matches('/').to_string();
+                let (writer, reader) = wsclient::connect(&format!("ws://{host}/v1/bridge?token={token}"))?;
+                Ok((id, url.trim_end_matches('/').to_string(), token, writer, reader))
+            });
+            match outcome {
+                Ok((id, url, token, writer, reader)) => {
+                    {
+                        let mut state = STATE.lock().unwrap();
+                        if state.generation != generation || state.clients.is_empty() {
+                            state.connecting = false;
+                            writer.close();
+                            return;
+                        }
+                        state.connecting = false;
+                        state.bridge = Some(writer);
+                        send_text(&state, json!({ "type": "hello" }));
+                        send_clients(&state);
+                    }
+                    crate::serve_log("devices", "接上 devices");
+                    write_mcp(Some((format!("{url}/mcp"), token)));
+                    std::thread::spawn(move || read_bridge(reader, generation));
+                    // 桥连着：别让它当闲着停掉
+                    std::thread::spawn(move || {
+                        loop {
+                            let alive = {
+                                let state = STATE.lock().unwrap();
+                                state.generation == generation && state.bridge.is_some()
+                            };
+                            if !alive {
+                                return;
+                            }
+                            crate::powers::touch(&id);
+                            std::thread::sleep(Duration::from_secs(60));
+                        }
+                    });
+                }
+                Err(error) => {
+                    crate::serve_log("devices", &format!("接不上 devices：{error}"));
+                    STATE.lock().unwrap().connecting = false;
+                    // 起不来（没装、坏包）：别每几秒拉一次
+                    retry(generation, Duration::from_secs(30));
+                }
+            }
+        });
+    }
+
+    fn retry(generation: u64, after: Duration) {
+        std::thread::spawn(move || {
+            std::thread::sleep(after);
+            if STATE.lock().unwrap().generation == generation {
+                ensure_bridge();
+            }
+        });
+    }
+
+    /// 断桥：专用通道没人接，全关；去掉 MCP 服务
+    fn close_bridge() {
+        let (bridge, channels) = {
+            let mut state = STATE.lock().unwrap();
+            state.generation += 1;
+            state.connecting = false;
+            state.pending.clear();
+            (state.bridge.take(), std::mem::take(&mut state.channels))
+        };
+        let had = bridge.is_some();
+        if let Some(bridge) = bridge {
+            bridge.close();
+        }
+        for ((_, label), (work, _)) in channels {
+            crate::calls::work_extra_close(&work, &label);
+        }
+        if had {
+            crate::serve_log("devices", "断开 devices");
+            write_mcp(None);
+        }
+    }
+
+    fn read_bridge(mut reader: wsclient::Reader, generation: u64) {
+        while let Some(message) = reader.next() {
+            if STATE.lock().unwrap().generation != generation {
+                return;
+            }
+            match message {
+                Message::Text(text) => on_text(&text),
+                Message::Binary(frame) => on_binary(&frame),
+            }
+        }
+        // 断了（devices 崩了 / 换版本）：还有客户端就 3 秒后重连
+        if STATE.lock().unwrap().generation != generation {
+            return;
+        }
+        close_bridge();
+        let generation = STATE.lock().unwrap().generation;
+        retry(generation, Duration::from_secs(3));
+    }
+
+    fn on_text(text_frame: &str) {
+        let Ok(message) = serde_json::from_str::<Value>(text_frame) else { return };
+        let client = text(&message, "client").to_string();
+        match text(&message, "type") {
+            "request" => {
+                let id = message["id"].clone();
+                let method = text(&message, "method").to_string();
+                let mut state = STATE.lock().unwrap();
+                let respond = |state: &State, code: i64, words: &str| {
+                    send_text(state, json!({ "type": "response", "id": id, "error": { "code": code, "message": words } }));
+                };
+                if !state.clients.contains_key(&client) {
+                    return respond(&state, 21, "这个客户端已经断开了");
+                }
+                if !method.starts_with("device.") {
+                    return respond(&state, -32601, "只能转 device.* 请求");
+                }
+                state.next += 1;
+                let number = state.next;
+                state.pending.insert(number, (id, client.clone()));
+                drop(state);
+                let timeout = message["timeoutMs"].as_u64().unwrap_or(60_000).clamp(1000, 30 * 60 * 1000);
+                crate::notify_clients(
+                    &[client],
+                    "devices.request",
+                    json!({ "id": number, "method": method, "params": message["params"], "timeoutMs": timeout }),
+                );
+            }
+            "channel.close" => {
+                let label = text(&message, "label").to_string();
+                let found = STATE.lock().unwrap().channels.remove(&(client, label.clone()));
+                if let Some((work, _)) = found {
+                    crate::calls::work_extra_close(&work, &label);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn on_binary(frame: &[u8]) {
+        let Some(&size) = frame.first() else { return };
+        let size = size as usize;
+        if frame.len() < 1 + size {
+            return;
+        }
+        let key = String::from_utf8_lossy(&frame[1..1 + size]).into_owned();
+        let Some((client, label)) = key.split_once('\n') else { return };
+        let work = STATE.lock().unwrap().channels.get(&(client.to_string(), label.to_string())).map(|(work, _)| work.clone());
+        if let Some(work) = work {
+            crate::calls::work_extra_send(&work, label, frame[1 + size..].to_vec());
+        }
+    }
+
+    // MARK: - 网关转来的（devices.*）
+
+    pub fn request(client: &str, method: &str, params: &Value) -> crate::Reply {
+        match method {
+            "devices.status" => Ok(json!({ "power": power_available() })),
+            "devices.addClient" => {
+                let kinds = params["kinds"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect();
+                {
+                    let mut state = STATE.lock().unwrap();
+                    state.clients.insert(
+                        client.to_string(),
+                        Client { name: text(params, "name").to_string(), kinds, work: text(params, "work").to_string() },
+                    );
+                    state.last_left = None;
+                    send_clients(&state);
+                }
+                ensure_bridge();
+                Ok(json!({ "power": power_available() }))
+            }
+            "devices.response" => {
+                let number = params["id"].as_u64().unwrap_or(0);
+                let state = STATE.lock().unwrap();
+                let found = state.pending.get(&number).filter(|(_, owner)| owner == client).cloned();
+                drop(state);
+                if let Some((id, _)) = found {
+                    let mut state = STATE.lock().unwrap();
+                    state.pending.remove(&number);
+                    let mut response = json!({ "type": "response", "id": id });
+                    if params.get("error").is_some_and(|error| !error.is_null()) {
+                        response["error"] = params["error"].clone();
+                    } else {
+                        response["result"] = params["result"].clone();
+                    }
+                    send_text(&state, response);
+                }
+                Ok(json!({}))
+            }
+            "devices.notify" => {
+                let state = STATE.lock().unwrap();
+                if state.clients.contains_key(client) {
+                    send_text(
+                        &state,
+                        json!({ "type": "notify", "client": client, "method": params["method"], "params": params["params"] }),
+                    );
+                }
+                Ok(json!({}))
+            }
+            other => Err((-32601, format!("没有这个方法：{other}"))),
+        }
+    }
+
+    /// 网关断了：还没回的反向请求按「断开了」回；它的专用通道关掉；最后一个走了一会儿后断桥
+    pub fn forget(client: &str) {
+        let channels = {
+            let mut state = STATE.lock().unwrap();
+            if state.clients.remove(client).is_none() {
+                return;
+            }
+            let numbers: Vec<u64> = state.pending.iter().filter(|(_, (_, owner))| owner == client).map(|(number, _)| *number).collect();
+            for number in numbers {
+                if let Some((id, _)) = state.pending.remove(&number) {
+                    send_text(&state, json!({ "type": "response", "id": id, "error": { "code": 21, "message": "客户端断开了" } }));
+                }
+            }
+            let keys: Vec<(String, String)> = state.channels.keys().filter(|(owner, _)| owner == client).cloned().collect();
+            let mut channels = Vec::new();
+            for key in keys {
+                if let Some((work, _)) = state.channels.remove(&key) {
+                    send_text(&state, json!({ "type": "channel.closed", "client": client, "label": key.1 }));
+                    channels.push((work, key.1));
+                }
+            }
+            send_clients(&state);
+            if state.clients.is_empty() {
+                state.last_left = Some(Instant::now());
+            }
+            channels
+        };
+        for (work, label) in channels {
+            crate::calls::work_extra_close(&work, &label);
+        }
+        let linger =
+            Duration::from_secs(std::env::var("EDITH_FRIDAY_DEVICES_LINGER").ok().and_then(|seconds| seconds.parse().ok()).unwrap_or(60));
+        std::thread::spawn(move || {
+            std::thread::sleep(linger);
+            let state = STATE.lock().unwrap();
+            let idle = state.clients.is_empty()
+                && state.last_left.is_some_and(|at| at.elapsed() >= linger.saturating_sub(Duration::from_millis(500)));
+            drop(state);
+            if idle {
+                close_bridge();
+            }
+        });
+    }
+
+    // MARK: - 工作通道上的专用通道（calls 的通话线程上调）
+
+    fn owner_of(state: &State, work: &str) -> Option<String> {
+        state.clients.iter().find(|(_, client)| !work.is_empty() && client.work == work).map(|(id, _)| id.clone())
+    }
+
+    /// 客户端建了一条专用通道：没登记的客户端、没桥时回 false（关掉它）
+    pub fn channel_opened(work: &str, label: &str) -> bool {
+        let mut state = STATE.lock().unwrap();
+        let Some(client) = owner_of(&state, work).filter(|_| state.bridge.is_some()) else { return false };
+        state.channels.insert((client.clone(), label.to_string()), (work.to_string(), false));
+        send_text(&state, json!({ "type": "channel.open", "client": client, "label": label }));
+        true
+    }
+
+    pub fn channel_data(work: &str, label: &str, data: &[u8]) {
+        let state = STATE.lock().unwrap();
+        let Some(client) = owner_of(&state, work).filter(|client| state.channels.contains_key(&(client.clone(), label.to_string()))) else {
+            return;
+        };
+        let header = format!("{client}\n{label}");
+        if header.len() > 255 {
+            return;
+        }
+        let mut frame = Vec::with_capacity(1 + header.len() + data.len());
+        frame.push(header.len() as u8);
+        frame.extend_from_slice(header.as_bytes());
+        frame.extend_from_slice(data);
+        if let Some(bridge) = &state.bridge {
+            bridge.binary(&frame);
+        }
+    }
+
+    pub fn channel_closed(work: &str, label: &str) {
+        let mut state = STATE.lock().unwrap();
+        let Some(client) = owner_of(&state, work) else { return };
+        if state.channels.remove(&(client.clone(), label.to_string())).is_some() {
+            send_text(&state, json!({ "type": "channel.closed", "client": client, "label": label }));
+        }
+    }
+
+    /// 往通道里写完还积着多少：太多就叫能力先别读那头
+    pub fn channel_backlog(work: &str, label: &str, buffered: u64) {
+        let mut state = STATE.lock().unwrap();
+        let Some(client) = owner_of(&state, work) else { return };
+        let paused = match state.channels.get_mut(&(client.clone(), label.to_string())) {
+            Some((_, paused)) if !*paused && buffered > PAUSE_BYTES => {
+                *paused = true;
+                true
+            }
+            _ => false,
+        };
+        if paused {
+            send_text(&state, json!({ "type": "channel.pause", "client": client, "label": label }));
+        }
+    }
+
+    pub fn channel_drained(work: &str, label: &str) {
+        let mut state = STATE.lock().unwrap();
+        let Some(client) = owner_of(&state, work) else { return };
+        let resumed = match state.channels.get_mut(&(client.clone(), label.to_string())) {
+            Some((_, paused)) if *paused => {
+                *paused = false;
+                true
+            }
+            _ => false,
+        };
+        if resumed {
+            send_text(&state, json!({ "type": "channel.resume", "client": client, "label": label }));
+        }
+    }
+
+    /// 工作通道收尾：它上面的专用通道都算关了
+    pub fn work_ended(work: &str) {
+        let mut state = STATE.lock().unwrap();
+        let keys: Vec<(String, String)> =
+            state.channels.iter().filter(|(_, (owner, _))| owner == work).map(|(key, _)| key.clone()).collect();
+        for key in keys {
+            state.channels.remove(&key);
+            send_text(&state, json!({ "type": "channel.closed", "client": key.0, "label": key.1 }));
+        }
+    }
+
+    /// 常驻那份退出：断桥、去掉 MCP 服务
+    pub fn stop() {
+        close_bridge();
+    }
+}
+
 mod call_engine {
     //! 通话内核（call/：Secret-Chat 桌面端的 P2PCallManager + DcMediaEngine，libdatachannel / Mbed TLS / Opus / openh264；
     //! calls 特性打开时 build.rs 用 CMake 编好静态链进来，C 接口见 call/include/FridayCall.h）的 Rust 封装。
@@ -28357,6 +28909,11 @@ mod call_engine {
         Open,
         Closed,
         Message(Vec<u8>),
+        /// 别的通道（客户端设备的 friday-serial:<id> / friday-tcp:<id>）开了、来消息、关了、积压发完了
+        ExtraOpen(String),
+        ExtraMessage(String, Vec<u8>),
+        ExtraClosed(String),
+        ExtraDrained(String),
     }
 
     #[cfg(feature = "calls")]
@@ -28397,6 +28954,10 @@ mod call_engine {
             on_channel_open: Option<unsafe extern "C" fn(Ctx)>,
             on_channel_closed: Option<unsafe extern "C" fn(Ctx)>,
             on_message: Option<unsafe extern "C" fn(Ctx, *const u8, c_int)>,
+            on_extra_open: Option<unsafe extern "C" fn(Ctx, *const c_char)>,
+            on_extra_message: Option<unsafe extern "C" fn(Ctx, *const c_char, *const u8, c_int)>,
+            on_extra_closed: Option<unsafe extern "C" fn(Ctx, *const c_char)>,
+            on_extra_drained: Option<unsafe extern "C" fn(Ctx, *const c_char)>,
         }
 
         unsafe extern "C" {
@@ -28453,6 +29014,10 @@ mod call_engine {
             ) -> Ctx;
             fn friday_text_send_binary(peer: Ctx, data: *const u8, length: c_int) -> c_int;
             fn friday_text_buffered(peer: Ctx) -> u64;
+            fn friday_text_accept_extra(peer: Ctx, prefixes: *const c_char);
+            fn friday_text_open_extra(peer: Ctx, label: *const c_char) -> c_int;
+            fn friday_text_extra_send(peer: Ctx, label: *const c_char, data: *const u8, length: c_int) -> i64;
+            fn friday_text_extra_close(peer: Ctx, label: *const c_char);
             fn friday_text_set_answer(peer: Ctx, sdp: *const c_char) -> c_int;
         }
 
@@ -28704,6 +29269,21 @@ mod call_engine {
         unsafe extern "C" fn on_closed(ctx: Ctx) {
             text_push(ctx, TextEvent::Closed);
         }
+        fn bytes(data: *const u8, length: c_int) -> Vec<u8> {
+            if data.is_null() || length <= 0 { Vec::new() } else { unsafe { std::slice::from_raw_parts(data, length as usize) }.to_vec() }
+        }
+        unsafe extern "C" fn on_extra_open(ctx: Ctx, label: *const c_char) {
+            text_push(ctx, TextEvent::ExtraOpen(string(label)));
+        }
+        unsafe extern "C" fn on_extra_message(ctx: Ctx, label: *const c_char, data: *const u8, length: c_int) {
+            text_push(ctx, TextEvent::ExtraMessage(string(label), bytes(data, length)));
+        }
+        unsafe extern "C" fn on_extra_closed(ctx: Ctx, label: *const c_char) {
+            text_push(ctx, TextEvent::ExtraClosed(string(label)));
+        }
+        unsafe extern "C" fn on_extra_drained(ctx: Ctx, label: *const c_char) {
+            text_push(ctx, TextEvent::ExtraDrained(string(label)));
+        }
         unsafe extern "C" fn on_message(ctx: Ctx, data: *const u8, length: c_int) {
             let bytes = if data.is_null() || length <= 0 {
                 Vec::new()
@@ -28735,6 +29315,10 @@ mod call_engine {
                         on_channel_open: Some(on_open),
                         on_channel_closed: Some(on_closed),
                         on_message: Some(on_message),
+                        on_extra_open: Some(on_extra_open),
+                        on_extra_message: Some(on_extra_message),
+                        on_extra_closed: Some(on_extra_closed),
+                        on_extra_drained: Some(on_extra_drained),
                     },
                     context,
                 )
@@ -28782,6 +29366,26 @@ mod call_engine {
             /// 通道上还积着多少字节没发出去
             pub fn buffered(&self) -> u64 {
                 unsafe { friday_text_buffered(self.raw) }
+            }
+
+            /// 同一个连接上对方建的别的通道也收下（label 以这些前缀开头的）
+            pub fn accept_extra(&self, prefixes: &[&str]) {
+                unsafe { friday_text_accept_extra(self.raw, c(&prefixes.join(",")).as_ptr()) }
+            }
+
+            /// 这边建一条别的通道（测试里扮客户端）
+            pub fn open_extra(&self, label: &str) -> bool {
+                unsafe { friday_text_open_extra(self.raw, c(label).as_ptr()) == 0 }
+            }
+
+            /// 在别的通道上发：回还积着多少字节，通道没了回 None
+            pub fn extra_send(&self, label: &str, data: &[u8]) -> Option<u64> {
+                let left = unsafe { friday_text_extra_send(self.raw, c(label).as_ptr(), data.as_ptr(), data.len() as c_int) };
+                (left >= 0).then_some(left as u64)
+            }
+
+            pub fn extra_close(&self, label: &str) {
+                unsafe { friday_text_extra_close(self.raw, c(label).as_ptr()) }
             }
 
             /// 主叫那端（测试里扮手机）：只连本机，建通道（label）、出 offer
@@ -28883,6 +29487,14 @@ mod call_engine {
             pub fn buffered(&self) -> u64 {
                 0
             }
+            pub fn accept_extra(&self, _prefixes: &[&str]) {}
+            pub fn open_extra(&self, _label: &str) -> bool {
+                false
+            }
+            pub fn extra_send(&self, _label: &str, _data: &[u8]) -> Option<u64> {
+                None
+            }
+            pub fn extra_close(&self, _label: &str) {}
             pub fn drain(&self) -> Vec<TextEvent> {
                 Vec::new()
             }
@@ -29247,6 +29859,16 @@ mod calls {
             request: String,
             serial: u64,
         },
+        /// 客户端设备的专用通道：往里写（devices 的桥来的字节）、关掉
+        WorkExtraSend {
+            request: String,
+            label: String,
+            data: Vec<u8>,
+        },
+        WorkExtraClose {
+            request: String,
+            label: String,
+        },
     }
 
     static COMMANDS: LazyLock<Mutex<Option<Sender<Command>>>> = LazyLock::new(|| Mutex::new(None));
@@ -29289,6 +29911,19 @@ mod calls {
     pub fn text_reply(source: &str, words: &str) {
         if compiled() {
             send(Command::TextReply { source: source.into(), words: words.into() });
+        }
+    }
+
+    /// 客户端设备：往工作通道上的一条专用通道写（devices 的桥来的字节）
+    pub fn work_extra_send(request: &str, label: &str, data: Vec<u8>) {
+        if compiled() {
+            send(Command::WorkExtraSend { request: request.into(), label: label.into(), data });
+        }
+    }
+
+    pub fn work_extra_close(request: &str, label: &str) {
+        if compiled() {
+            send(Command::WorkExtraClose { request: request.into(), label: label.into() });
         }
     }
 
@@ -29654,6 +30289,19 @@ mod calls {
                     if self.work.get(&request).is_some_and(|work| work.serial == serial) {
                         self.work_end(&request, true, "网关退出了");
                     }
+                }
+                Command::WorkExtraSend { request, label, data } => {
+                    let Some(connection) = self.work.get(&request).and_then(|work| work.connection.as_ref()) else { return };
+                    match connection.extra_send(&label, &data) {
+                        Some(buffered) => crate::devices::channel_backlog(&request, &label, buffered),
+                        None => crate::devices::channel_closed(&request, &label),
+                    }
+                }
+                Command::WorkExtraClose { request, label } => {
+                    if let Some(connection) = self.work.get(&request).and_then(|work| work.connection.as_ref()) {
+                        connection.extra_close(&label);
+                    }
+                    crate::devices::channel_closed(&request, &label);
                 }
                 Command::WorkFlush { request, serial } => {
                     if let Some(work) = self.work.get_mut(&request).filter(|work| work.serial == serial) {
@@ -30115,6 +30763,8 @@ mod calls {
                         Command::TextTimer { serial: self.text.serial, reopen: self.text.reopen },
                     );
                 }
+                // P2P 文字的连接上没有别的通道
+                TextEvent::ExtraOpen(_) | TextEvent::ExtraMessage(..) | TextEvent::ExtraClosed(_) | TextEvent::ExtraDrained(_) => {}
                 TextEvent::Message(frame) => {
                     let Ok(message) = serde_json::from_slice::<Value>(&frame) else { return };
                     let kind = text(&message, "type");
@@ -30449,6 +31099,8 @@ mod calls {
                 );
                 return self.work_end(request, false, "建不了连接");
             };
+            // 客户端设备的专用通道（客户端在同一个连接上建）也收下
+            connection.accept_extra(&crate::devices::CHANNEL_PREFIXES);
             work.connection = Some(connection);
             let (channel, peer) = (work.channel.clone(), work.peer);
             let offer = std::mem::take(&mut work.remote_offer);
@@ -30515,6 +31167,17 @@ mod calls {
                         self.work_end(request, true, "起不了网关");
                     }
                 }
+                TextEvent::ExtraOpen(label) => {
+                    if !crate::devices::channel_opened(request, &label)
+                        && let Some(connection) = self.work.get(request).and_then(|work| work.connection.as_ref())
+                    {
+                        // 没声明客户端设备、devices 没接上：没人接这条通道，关掉（客户端那头会说服务端关了通道）
+                        connection.extra_close(&label);
+                    }
+                }
+                TextEvent::ExtraMessage(label, data) => crate::devices::channel_data(request, &label, &data),
+                TextEvent::ExtraClosed(label) => crate::devices::channel_closed(request, &label),
+                TextEvent::ExtraDrained(label) => crate::devices::channel_drained(request, &label),
                 TextEvent::Message(frame) => {
                     let Some(work) = self.work.get_mut(request) else { return };
                     match work.framer.feed(&frame) {
@@ -30549,6 +31212,7 @@ mod calls {
             let mut child = std::process::Command::new(executable)
                 .arg("--attach")
                 .env("EDITH_FRIDAY_CHANNEL", "work")
+                .env("EDITH_FRIDAY_WORK_ID", request)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
@@ -30618,6 +31282,7 @@ mod calls {
             }
             let Some(mut work) = self.work.remove(request) else { return };
             crate::serve_log("calls", &format!("工作通道结束（{request}）：{why}"));
+            crate::devices::work_ended(request);
             work.connection.take();
             // 关了标准输入网关自己退；一会儿还在就杀掉
             work.stdin.take();
@@ -30695,10 +31360,12 @@ mod call_phone {
     //! 打给机器人 / 接机器人打来的、开 P2P 文字，媒体真的走本机的 WebRTC。标准输入一行一个命令，标准输出一行一个事件（都是 JSON）：
     //! - 命令：{"cmd":"call","to":机器人 id,"video":false}、{"cmd":"talk","seconds":1.2,"freq":220}（送这个音高的声音，默认 220 Hz）、{"cmd":"hangup"}、
     //!   {"cmd":"text","to":机器人 id}（开 P2P 文字）、{"cmd":"say","text":"…"}（通道上发一条）、{"cmd":"raw","e":"p2p_request","d":{…}}、{"cmd":"quit"}、
-    //!   {"cmd":"work","to":机器人 id}（开远程工作通道）、{"cmd":"work-send","message":{…}}（通道上发一条 JSON-RPC，大的分片）、{"cmd":"work-hangup"}
+    //!   {"cmd":"work","to":机器人 id}（开远程工作通道）、{"cmd":"work-send","message":{…}}（通道上发一条 JSON-RPC，大的分片）、{"cmd":"work-hangup"}、
+    //!   {"cmd":"extra-open","label":"friday-serial:1"}（同一个连接上建一条客户端设备的专用通道）、{"cmd":"extra-send","label":…,"text":"…"}
+    //! - 工作通道上收到 device.* 反向请求（id「s:N」）自动回：device.list 回一块假开发板，device.slow 不回（测超时），别的回 {ok, method, params}
     //! - 事件：ready {id}、frame {e,d}（机器人发来的信令原样）、state {state}、incoming {video}、rejected {reason}、
     //!   loud {samples}（听到的大声采样数，变了就报）、pictures {count, width, height}（解出来的画面）、text-open、text {text}、
-    //!   work-open、work {message}（工作通道上收到的一条，拼好的）、work-closed
+    //!   work-open、work {message}（工作通道上收到的一条，拼好的）、work-closed、extra-open {label}、extra {label, text}、extra-closed {label}
 
     use std::io::BufRead;
     use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
@@ -30912,6 +31579,16 @@ mod call_phone {
                             }
                         }
                     }
+                    "extra-open" => {
+                        if let Some(peer) = &work_peer {
+                            peer.open_extra(command["label"].as_str().unwrap_or(""));
+                        }
+                    }
+                    "extra-send" => {
+                        if let Some(peer) = &work_peer {
+                            peer.extra_send(command["label"].as_str().unwrap_or(""), command["text"].as_str().unwrap_or("").as_bytes());
+                        }
+                    }
                     "work-hangup" => {
                         send_frame(
                             "p2p_signaling",
@@ -31060,9 +31737,29 @@ mod call_phone {
                             ),
                             TextEvent::Open => out("work-open", json!({})),
                             TextEvent::Closed | TextEvent::Failed => out("work-closed", json!({})),
+                            TextEvent::ExtraOpen(label) => out("extra-open", json!({ "label": label })),
+                            TextEvent::ExtraMessage(label, data) => {
+                                out("extra", json!({ "label": label, "text": String::from_utf8_lossy(&data) }))
+                            }
+                            TextEvent::ExtraClosed(label) => out("extra-closed", json!({ "label": label })),
+                            TextEvent::ExtraDrained(_) => {}
                             TextEvent::Message(frame) => match work_framer.feed(&frame) {
                                 crate::calls::Feed::Ready(message) => {
                                     let message: Value = serde_json::from_slice(&message).unwrap_or_default();
+                                    // 客户端设备的反向请求：扮客户端回
+                                    let method = message["method"].as_str().unwrap_or("").to_string();
+                                    if method.starts_with("device.")
+                                        && message["id"].is_string()
+                                        && method != "device.slow"
+                                        && let Some(peer) = &work_peer
+                                    {
+                                        let result = if method == "device.list" {
+                                            json!({ "devices": [{ "id": "serial-1", "kind": "serial", "name": "假开发板", "port": "/dev/ttyUSB0" }] })
+                                        } else {
+                                            json!({ "ok": true, "method": method, "params": message["params"] })
+                                        };
+                                        peer.send(&json!({ "jsonrpc": "2.0", "id": message["id"], "result": result }).to_string());
+                                    }
                                     out("work", json!({ "message": message, "bytes": frame.len() }));
                                 }
                                 crate::calls::Feed::NeedMore => {}
@@ -31085,6 +31782,10 @@ mod call_phone {
                             ),
                             TextEvent::Open => out("text-open", json!({})),
                             TextEvent::Closed | TextEvent::Failed => out("text-closed", json!({})),
+                            TextEvent::ExtraOpen(_)
+                            | TextEvent::ExtraMessage(..)
+                            | TextEvent::ExtraClosed(_)
+                            | TextEvent::ExtraDrained(_) => {}
                             TextEvent::Message(frame) => {
                                 let message: Value = serde_json::from_slice(&frame).unwrap_or_default();
                                 out("text", json!({ "text": message["textContent"], "type": message["type"] }));
@@ -34640,6 +35341,8 @@ fn main() {
             continue;
         }
         match serde_json::from_str::<Value>(&line) {
+            // 客户端设备：反向请求的回复、device.* 通知直接转给常驻那份
+            Ok(message) if devices_message(&message) => {}
             Ok(message) => {
                 let _ = sender.send(message);
             }

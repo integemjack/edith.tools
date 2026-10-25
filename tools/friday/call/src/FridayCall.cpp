@@ -12,6 +12,7 @@
 #include <atomic>
 #include <cstdio>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -223,6 +224,9 @@ struct TextPeer {
     std::shared_ptr<rtc::DataChannel> channel;
     /// 认哪种通道（label 以它开头的）：P2P 文字是 p2p-text，远程工作通道是 friday-work（edith-friday 加的）
     std::string labelPrefix = "p2p-text";
+    /// 别的通道收下哪些前缀的（客户端设备的专用通道），主线程上：label → 通道
+    std::vector<std::string> extraPrefixes;
+    std::map<std::string, std::shared_ptr<rtc::DataChannel>> extras;
 
     explicit TextPeer(const friday_text_callbacks& callbacks)
         : cb(callbacks)
@@ -238,6 +242,9 @@ struct TextPeer {
         inbox.close();
         // 先清回调（会等正在跑的回调跑完），再关：之后不会再有回调进来
         dropChannel();
+        for (auto& [label, extra] : extras)
+            dropExtra(extra);
+        extras.clear();
         if (pc) {
             pc->resetCallbacks();
             try {
@@ -246,6 +253,70 @@ struct TextPeer {
             }
             pc.reset();
         }
+    }
+
+    static void dropExtra(const std::shared_ptr<rtc::DataChannel>& extra)
+    {
+        if (!extra)
+            return;
+        extra->resetCallbacks();
+        try {
+            extra->close();
+        } catch (...) {
+        }
+    }
+
+    bool isExtra(const std::string& label) const
+    {
+        for (const std::string& prefix : extraPrefixes) {
+            if (!prefix.empty() && label.rfind(prefix, 0) == 0)
+                return true;
+        }
+        return false;
+    }
+
+    /// 别的通道：登记（主线程上一定先登记好、再报消息）、积压发完、关了、来消息都排回主线程
+    void watchExtra(const std::shared_ptr<rtc::DataChannel>& value, bool registerNow)
+    {
+        const std::string label = value->label();
+        const std::weak_ptr<rtc::DataChannel> weak = value;
+        if (registerNow) {
+            inbox.post([this, value, label] {
+                extras[label] = value;
+                if (cb.on_extra_open)
+                    cb.on_extra_open(cb.ctx, label.c_str());
+            });
+        }
+        value->setBufferedAmountLowThreshold(1024 * 1024);
+        value->onBufferedAmountLow([this, label, weak] {
+            inbox.post([this, label, weak] {
+                const auto current = weak.lock();
+                if (current && extras.count(label) && extras[label] == current && cb.on_extra_drained)
+                    cb.on_extra_drained(cb.ctx, label.c_str());
+            });
+        });
+        value->onClosed([this, label, weak] {
+            inbox.post([this, label, weak] {
+                const auto current = weak.lock();
+                auto it = extras.find(label);
+                if (it == extras.end() || (current && it->second != current))
+                    return;
+                extras.erase(it);
+                if (cb.on_extra_closed)
+                    cb.on_extra_closed(cb.ctx, label.c_str());
+            });
+        });
+        value->onMessage([this, label](rtc::message_variant data) {
+            std::string frame;
+            if (const auto* textValue = std::get_if<std::string>(&data))
+                frame = *textValue;
+            else if (const auto* binary = std::get_if<rtc::binary>(&data))
+                frame.assign(reinterpret_cast<const char*>(binary->data()), binary->size());
+            inbox.post([this, label, frame] {
+                if (extras.count(label) && cb.on_extra_message)
+                    cb.on_extra_message(cb.ctx, label.c_str(), reinterpret_cast<const uint8_t*>(frame.data()), static_cast<int>(frame.size()));
+            });
+        });
     }
 
     void dropChannel()
@@ -288,8 +359,11 @@ struct TextPeer {
         });
         // 通道是主叫建的（label p2p-text；手机重建时是 p2p-text-<时间>）：到这里时已经开了
         pc->onDataChannel([this](std::shared_ptr<rtc::DataChannel> incoming) {
-            if (incoming->label().rfind(labelPrefix, 0) != 0)
+            if (incoming->label().rfind(labelPrefix, 0) != 0) {
+                if (isExtra(incoming->label()))
+                    watchExtra(incoming, true);
                 return;
+            }
             // 先排「换上这条通道」，再接消息：主线程上一定先换好、再处理消息
             inbox.post([this, incoming] {
                 if (channel != incoming) {
@@ -562,6 +636,75 @@ int friday_text_send_binary(friday_text_peer* peer, const uint8_t* data, int len
     } catch (const std::exception&) {
         return 1;
     }
+}
+
+void friday_text_accept_extra(friday_text_peer* peer, const char* prefixes)
+{
+    if (!peer)
+        return;
+    TextPeer* p = textPeer(peer);
+    p->extraPrefixes.clear();
+    std::string all = text(prefixes);
+    size_t start = 0;
+    while (start <= all.size()) {
+        const size_t comma = all.find(',', start);
+        const std::string part = all.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+        if (!part.empty())
+            p->extraPrefixes.push_back(part);
+        if (comma == std::string::npos)
+            break;
+        start = comma + 1;
+    }
+}
+
+int friday_text_open_extra(friday_text_peer* peer, const char* label)
+{
+    if (!peer || !textPeer(peer)->pc)
+        return 1;
+    TextPeer* p = textPeer(peer);
+    try {
+        auto channel = p->pc->createDataChannel(text(label));
+        const std::string name = channel->label();
+        p->extras[name] = channel;
+        p->watchExtra(channel, false);
+        channel->onOpen([p, name] {
+            p->inbox.post([p, name] {
+                if (p->extras.count(name) && p->cb.on_extra_open)
+                    p->cb.on_extra_open(p->cb.ctx, name.c_str());
+            });
+        });
+        return 0;
+    } catch (const std::exception&) {
+        return 1;
+    }
+}
+
+int64_t friday_text_extra_send(friday_text_peer* peer, const char* label, const uint8_t* data, int length)
+{
+    if (!peer || !data || length < 0)
+        return -1;
+    TextPeer* p = textPeer(peer);
+    auto it = p->extras.find(text(label));
+    if (it == p->extras.end() || !it->second)
+        return -1;
+    try {
+        it->second->send(reinterpret_cast<const std::byte*>(data), static_cast<size_t>(length));
+        return static_cast<int64_t>(it->second->bufferedAmount());
+    } catch (const std::exception&) {
+        return -1;
+    }
+}
+
+void friday_text_extra_close(friday_text_peer* peer, const char* label)
+{
+    if (!peer)
+        return;
+    TextPeer* p = textPeer(peer);
+    auto it = p->extras.find(text(label));
+    if (it == p->extras.end())
+        return;
+    TextPeer::dropExtra(it->second);
+    p->extras.erase(it);
 }
 
 uint64_t friday_text_buffered(friday_text_peer* peer)
