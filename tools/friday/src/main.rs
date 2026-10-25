@@ -3724,7 +3724,19 @@ fn server_info() -> Value {
 fn features() -> Vec<&'static str> {
     let mut list = vec!["mkdir", "submitFrom", "activity", "assistant", "config", "memory", "memorySearch", "commands", "storage"];
     if serve_mode() != "off" {
-        list.extend(["powers", "models", "userVoices", "loops", "hooks", "plugins", "prompts", "services", "serviceOps", "serviceUsage"]);
+        list.extend([
+            "powers",
+            "models",
+            "userVoices",
+            "loops",
+            "hooks",
+            "plugins",
+            "prompts",
+            "services",
+            "serviceOps",
+            "serviceUsage",
+            "voice",
+        ]);
     }
     list
 }
@@ -3732,6 +3744,9 @@ fn features() -> Vec<&'static str> {
 fn directories_state() -> Value {
     json!({ "recent": META.recent().iter().map(|path| json!({ "path": path, "exists": Path::new(path).is_dir() })).collect::<Vec<_>>() })
 }
+
+/// 连进来的客户端（hello 的 client.platform）：语音被接过去时说是谁
+static HELLO_CLIENT: Mutex<String> = Mutex::new(String::new());
 
 fn hello(params: &Value) -> Reply {
     let protocol = params["protocol"].as_i64().unwrap_or(0);
@@ -3742,6 +3757,8 @@ fn hello(params: &Value) -> Reply {
         ));
     }
     log(&format!("hello：{}", params["client"]));
+    *HELLO_CLIENT.lock().unwrap() =
+        params["client"]["platform"].as_str().or(params["client"]["name"].as_str()).unwrap_or("Friday").to_string();
     // 先连上常驻的那份（终端、浏览器在它那里）和在跑的大脑：在干活的会话、在等的批准马上就有
     if serve_mode() != "off"
         && let Err(error) = hub()
@@ -4412,6 +4429,13 @@ fn handle(method: &str, params: &Value) -> Reply {
         {
             hub_forward(method, params)
         }
+        // 实时语音：听写、交给大脑、边写边念都在常驻那份（客户端只管麦克风和喇叭）；接过去时说是谁
+        "voice.start" => {
+            let mut params = params.clone();
+            params["owner"] = json!(format!("远程设备（{}）", HELLO_CLIENT.lock().unwrap()));
+            hub_forward("voice.start", &params)
+        }
+        method if method.starts_with("voice.") => hub_forward(method, params),
         method if method.starts_with("browser.") => browser_request(method, params),
         method
             if method.starts_with("config.")
@@ -4713,7 +4737,8 @@ fn serve_initialize() -> Value {
             "description": "Friday 的内置浏览器（用户在浏览器卡片里看得见、能一起操作）、定时任务、自定义脚本工具",
         },
         "actions": actions,
-        "receives": ["turn.started", "done"],
+        // text、stats：语音会话的回复边写边念、插话时哪段不念了（voice）
+        "receives": ["turn.started", "text", "stats", "done"],
         "sessions": "all",
         "hooks": hooks::EVENTS,
         // 本地模型（power://llm）的真地址由这里给（能力协议 §6.6）
@@ -4866,6 +4891,10 @@ fn serve_brain_message(brain: &Arc<Brain>, message: Value, ready: &mut Option<Se
         (Some("event"), None) => {
             let params = &message["params"];
             let session = params["session"].as_str().unwrap_or("").to_string();
+            let kind = params["type"].as_str().unwrap_or("");
+            if matches!(kind, "turn.started" | "text" | "stats" | "done") {
+                voice::on_event(&session, params["turn"].as_str().unwrap_or(""), kind, &params["data"]);
+            }
             match params["type"].as_str() {
                 Some("turn.started") => {
                     TURNS.lock().unwrap().insert((brain.workspace.clone(), session));
@@ -5011,6 +5040,7 @@ fn serve_request(client: &str, method: &str, params: &Value) -> Reply {
         method if method.starts_with("prompts.") => prompt_files::request(method, params),
         method if method.starts_with("storage.") => storage::handle(method, params),
         method if method.starts_with("services.") => services::request(method, params),
+        method if method.starts_with("voice.") => voice::request(client, method, params),
         // 网关要搬文件存放位置：收好退出
         "serve.exit" => {
             SERVE_EXIT.store(true, Ordering::Relaxed);
@@ -5102,7 +5132,8 @@ fn serve_client(stream: TcpStream, token: &str) {
             });
         };
         // 慢的（连大脑、起浏览器开标签）另起线程；别的按收到的顺序（打的字、鼠标键盘不能乱）
-        let slow = ["attach", "browser.open", "powers.importVoice", "powers.deleteVoice", "models.delete", "powers.uninstall"];
+        let slow =
+            ["attach", "browser.open", "powers.importVoice", "powers.deleteVoice", "models.delete", "powers.uninstall", "voice.start"];
         let tests = [
             "tools.saveScript",
             "tools.testScript",
@@ -5123,6 +5154,7 @@ fn serve_client(stream: TcpStream, token: &str) {
     CLIENTS.lock().unwrap().remove(&name);
     pty::forget(&name);
     browser::forget(&name);
+    voice::forget(&name);
 }
 
 /// 起来就一直开着（同一台只一份：拿不到锁的直接退）
@@ -5201,6 +5233,7 @@ fn serve() -> Result<(), String> {
             || powers::busy()
             || models::busy()
             || loops::active()
+            || voice::active()
         {
             idle_since = Instant::now();
         } else if idle_since.elapsed() >= idle {
@@ -5331,6 +5364,8 @@ fn on_hub_message(hub: &Arc<Brain>, message: Value) {
             std::thread::spawn(|| config_changed(&["capabilities"]));
         }
         Some("modelsFailed") => event("modelsFailed", message["params"].clone()),
+        // 实时语音：只推给开了的那个网关（原样转）
+        Some(method) if method.starts_with("voice.") => event(method, message["params"].clone()),
         // 本地模型下好了：建了本地引擎、给会话换上了（会话上选的记在 friday.json）
         Some("engines.changed") => {
             event("engines", engines_state());
@@ -5446,7 +5481,14 @@ fn hub_forward(method: &str, params: &Value) -> Reply {
         "plugins.update",
         "plugins.install",
     ];
-    let wait = if slow.contains(&method) { 660 } else { 30 };
+    let wait = if slow.contains(&method) {
+        660
+    } else if method == "voice.start" {
+        // 要等本地语音拉起来
+        180
+    } else {
+        30
+    };
     let reply = hub.request(target, params.clone(), Duration::from_secs(wait)).map_err(|error| hub_error(&error))?;
     // 调过 loops.*、prompts.* 的客户端之后收 loops、prompts 事件
     if method.starts_with("loops.") {
@@ -5474,6 +5516,9 @@ fn hub_error(error: &str) -> (i64, String) {
     if error.starts_with("这台机器上没有这个本地模型") || error.starts_with("没有定时任务") || error.starts_with("没有这个提示词版本")
     {
         (NOT_FOUND, error.to_string())
+    } else if ["这台没装本地语音", "本地语音被关掉了", "这台的本地语音不能"].iter().any(|prefix| error.starts_with(prefix))
+    {
+        (NOT_ALLOWED, error.to_string())
     } else {
         (-32603, error.to_string())
     }
@@ -19876,6 +19921,668 @@ mod caps {
             }
             _ => json!(false),
         }
+    }
+}
+
+mod wsclient {
+    //! 连本机服务的 WebSocket（不用 TLS）：文本帧、二进制帧、分片、ping。实时语音连本地语音的两条用
+
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpStream;
+    use std::sync::{Arc, Mutex};
+
+    pub enum Message {
+        Text(String),
+        Binary(Vec<u8>),
+    }
+
+    #[derive(Clone)]
+    pub struct Writer(Arc<Mutex<TcpStream>>);
+
+    pub struct Reader(BufReader<TcpStream>, Writer);
+
+    /// url：ws://主机:端口/路径?参数
+    pub fn connect(url: &str) -> Result<(Writer, Reader), String> {
+        use base64::Engine;
+        let rest = url.strip_prefix("ws://").ok_or_else(|| format!("只认 ws:// 地址：{url}"))?;
+        let (address, path) = rest.split_once('/').map(|(address, path)| (address, format!("/{path}"))).unwrap_or((rest, "/".into()));
+        let mut stream = TcpStream::connect(address).map_err(|error| format!("连不上 {address}：{error}"))?;
+        let key = base64::engine::general_purpose::STANDARD.encode(uuid::Uuid::new_v4().as_bytes());
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: {address}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).map_err(|error| error.to_string())?;
+        let mut reader = BufReader::new(stream.try_clone().map_err(|error| error.to_string())?);
+        let mut status = String::new();
+        reader.read_line(&mut status).map_err(|error| error.to_string())?;
+        if !status.contains(" 101 ") {
+            return Err(format!("{address} 不肯升级成 WebSocket：{}", status.trim()));
+        }
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).map_err(|error| error.to_string())? == 0 || line == "\r\n" {
+                break;
+            }
+        }
+        let writer = Writer(Arc::new(Mutex::new(stream)));
+        Ok((writer.clone(), Reader(reader, writer)))
+    }
+
+    fn frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x80 | opcode];
+        let length = payload.len();
+        if length < 126 {
+            out.push(0x80 | length as u8);
+        } else if length <= u16::MAX as usize {
+            out.push(0x80 | 126);
+            out.extend_from_slice(&(length as u16).to_be_bytes());
+        } else {
+            out.push(0x80 | 127);
+            out.extend_from_slice(&(length as u64).to_be_bytes());
+        }
+        let mask = *uuid::Uuid::new_v4().as_bytes();
+        out.extend_from_slice(&mask[..4]);
+        out.extend(payload.iter().enumerate().map(|(index, byte)| byte ^ mask[index % 4]));
+        out
+    }
+
+    impl Writer {
+        fn send(&self, opcode: u8, payload: &[u8]) -> bool {
+            let mut stream = self.0.lock().unwrap();
+            stream.write_all(&frame(opcode, payload)).and_then(|_| stream.flush()).is_ok()
+        }
+
+        pub fn text(&self, text: &str) -> bool {
+            self.send(0x1, text.as_bytes())
+        }
+
+        pub fn binary(&self, data: &[u8]) -> bool {
+            self.send(0x2, data)
+        }
+
+        pub fn close(&self) {
+            self.send(0x8, &[]);
+            let _ = self.0.lock().unwrap().shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    impl Reader {
+        /// 下一条消息（分片的拼好）；断了是 None
+        pub fn next(&mut self) -> Option<Message> {
+            let mut message = Vec::new();
+            let mut kind = 0u8;
+            loop {
+                let mut head = [0u8; 2];
+                self.0.read_exact(&mut head).ok()?;
+                let (fin, opcode) = (head[0] & 0x80 != 0, head[0] & 0x0f);
+                let mut length = (head[1] & 0x7f) as u64;
+                if length == 126 {
+                    let mut bytes = [0u8; 2];
+                    self.0.read_exact(&mut bytes).ok()?;
+                    length = u16::from_be_bytes(bytes) as u64;
+                } else if length == 127 {
+                    let mut bytes = [0u8; 8];
+                    self.0.read_exact(&mut bytes).ok()?;
+                    length = u64::from_be_bytes(bytes);
+                }
+                let mask = if head[1] & 0x80 != 0 {
+                    let mut bytes = [0u8; 4];
+                    self.0.read_exact(&mut bytes).ok()?;
+                    Some(bytes)
+                } else {
+                    None
+                };
+                let mut payload = vec![0u8; length as usize];
+                self.0.read_exact(&mut payload).ok()?;
+                if let Some(mask) = mask {
+                    for (index, byte) in payload.iter_mut().enumerate() {
+                        *byte ^= mask[index % 4];
+                    }
+                }
+                match opcode {
+                    0x8 => return None,
+                    0x9 => {
+                        self.1.send(0xA, &payload);
+                        continue;
+                    }
+                    0xA => continue,
+                    0x1 | 0x2 => kind = opcode,
+                    _ => {}
+                }
+                message.extend(payload);
+                if fin {
+                    return Some(if kind == 0x2 {
+                        Message::Binary(message)
+                    } else {
+                        Message::Text(String::from_utf8_lossy(&message).into_owned())
+                    });
+                }
+            }
+        }
+    }
+}
+
+mod voice {
+    //! 实时语音（Friday 远程协议的 voice.*，Friday 仓库 qt/docs/REMOTE.md §6「语音」）：客户端只管麦克风和喇叭，听写、交给大脑、边写边念、
+    //! 插话都在这台做。这台没有助手（EDITH 是大脑）：说的话交给一段专门的「语音」会话（默认工作目录里，第一次说话时建，记在
+    //! settings.json 的 voice.conversation），回复边写边念。听写、合成用本地语音（friday-voice）的两条实时 WebSocket
+    //! （Friday.Powers 的 docs/voice-protocol.md）。一台同时只有一路：后开的接过来，原来那一路停下、说明被谁接过去了。
+    //! 音频一律 16 位小端单声道 PCM，base64。
+
+    use std::sync::{LazyLock, Mutex};
+    use std::time::Duration;
+
+    use base64::Engine;
+    use serde_json::{Value, json};
+
+    use crate::wsclient::{self, Message};
+
+    struct Voice {
+        /// 哪个网关（连接名）的
+        client: String,
+        owner: String,
+        output_rate: u32,
+        /// listening / thinking / speaking
+        state: String,
+        caption: String,
+        /// 按住说话时攒着、还没交出去的
+        pending: String,
+        error: String,
+        held: bool,
+        playing: bool,
+        /// 正在念这一轮（大脑开始回话到念完）
+        speaking: bool,
+        /// 交给大脑的这一轮（交出去还没回话时是空串）
+        turn: Option<String>,
+        /// 语音会话（交过话才有）
+        session: String,
+        /// 大脑正在吐字（这一步还没完）
+        streaming: bool,
+        /// 插话时正在吐的那段：念的停下了，剩下的字也不念（这一步完了，看到插话的下一步照常念）
+        muted: bool,
+        transcriber: Option<wsclient::Writer>,
+        speaker: Option<wsclient::Writer>,
+        /// 用户插话：念着的压低了
+        ducked: bool,
+        /// 这一路的代次：旧连接的读线程看到不是自己的就退出
+        generation: u64,
+    }
+
+    static VOICE: LazyLock<Mutex<Option<Voice>>> = LazyLock::new(|| Mutex::new(None));
+    static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// 这台的本地语音能不能用（装了、开着、清单里有听录音和说话）
+    fn available() -> Result<(), String> {
+        let state = crate::powers::state();
+        let voice = state["powers"].as_array().into_iter().flatten().find(|power| power["id"] == "voice").cloned();
+        let Some(voice) = voice.filter(|voice| voice["installedVersion"].as_str().is_some_and(|version| !version.is_empty())) else {
+            return Err("这台没装本地语音：设置 › 能力 里装好「本地语音」才能用语音".into());
+        };
+        if !crate::powers::is_enabled("voice") {
+            return Err("本地语音被关掉了（设置 › 能力）".into());
+        }
+        let declared: Vec<&str> = voice["capabilities"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+        if !declared.contains(&"transcription") || !declared.contains(&"speech") {
+            return Err("这台的本地语音不能实时听写、边写边读".into());
+        }
+        Ok(())
+    }
+
+    fn state_of(voice: Option<&Voice>, client: &str) -> Value {
+        let ready = available();
+        match voice {
+            Some(voice) if voice.client == client => json!({
+                "available": ready.is_ok(), "active": true, "state": voice.state, "caption": voice.caption, "pending": voice.pending,
+                "error": voice.error, "held": voice.held, "filtering": false,
+            }),
+            other => json!({
+                "available": ready.is_ok(), "active": false, "state": "idle", "caption": "", "pending": "",
+                "error": match other {
+                    Some(voice) => format!("语音被 {} 接过去了", voice.owner),
+                    None => ready.err().unwrap_or_default(),
+                },
+                "held": false, "filtering": false,
+            }),
+        }
+    }
+
+    fn emit_state() {
+        let (client, state) = {
+            let voice = VOICE.lock().unwrap();
+            match voice.as_ref() {
+                Some(current) => (current.client.clone(), state_of(Some(current), &current.client)),
+                None => return,
+            }
+        };
+        crate::notify_clients(&[client], "voice.state", state);
+    }
+
+    fn emit(method: &str, params: Value) {
+        let client = VOICE.lock().unwrap().as_ref().map(|voice| voice.client.clone());
+        if let Some(client) = client {
+            crate::notify_clients(&[client], method, params);
+        }
+    }
+
+    fn with<T>(generation: u64, change: impl FnOnce(&mut Voice) -> T) -> Option<T> {
+        let mut voice = VOICE.lock().unwrap();
+        voice.as_mut().filter(|voice| voice.generation == generation).map(change)
+    }
+
+    /// voice.start：开始听写、连上合成；一台只有一路，原来的那一路停下
+    pub fn start(client: &str, owner: &str, input_rate: u32, output_rate: u32) -> Result<Value, String> {
+        available()?;
+        let (url, token) = crate::powers::ensure_running("voice", Duration::from_secs(150))?;
+        let host = url.trim_start_matches("http://").trim_end_matches('/');
+        let generation = GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let previous = VOICE.lock().unwrap().take();
+        if let Some(previous) = previous {
+            close(&previous);
+            if previous.client != client {
+                crate::notify_clients(
+                    std::slice::from_ref(&previous.client),
+                    "voice.state",
+                    json!({
+                        "available": true, "active": false, "state": "idle", "caption": "", "pending": "",
+                        "error": format!("语音被 {owner} 接过去了"), "held": false, "filtering": false,
+                    }),
+                );
+            }
+        }
+        let (transcriber, mut transcribe_reader) = wsclient::connect(&format!("ws://{host}/v1/realtime/transcribe?token={token}"))?;
+        transcriber.text(
+            &json!({ "type": "start", "sample_rate": input_rate, "language": "auto", "end_silence_ms": 450, "partials": true }).to_string(),
+        );
+        let (speaker, mut speak_reader) = wsclient::connect(&format!("ws://{host}/v1/realtime/speak?token={token}"))?;
+        speaker.text(&json!({ "type": "start", "sample_rate": output_rate }).to_string());
+        let session =
+            crate::read_json_file(&crate::serve_dir().join("settings.json"))["voice"]["conversation"].as_str().unwrap_or("").to_string();
+        *VOICE.lock().unwrap() = Some(Voice {
+            client: client.to_string(),
+            owner: owner.to_string(),
+            output_rate,
+            state: "listening".into(),
+            caption: String::new(),
+            pending: String::new(),
+            error: String::new(),
+            held: false,
+            playing: false,
+            speaking: false,
+            turn: None,
+            session,
+            streaming: false,
+            muted: false,
+            transcriber: Some(transcriber),
+            speaker: Some(speaker),
+            ducked: false,
+            generation,
+        });
+        // 听写：开口（插话时压低念着的）、实时字幕、定稿交给大脑
+        std::thread::spawn(move || {
+            while let Some(message) = transcribe_reader.next() {
+                let Message::Text(text) = message else { continue };
+                let Ok(event) = serde_json::from_str::<Value>(&text) else { continue };
+                if with(generation, |_| ()).is_none() {
+                    return;
+                }
+                match event["type"].as_str() {
+                    Some("speech_start") => {
+                        let duck = with(generation, |voice| {
+                            let duck = voice.speaking && !voice.ducked;
+                            voice.ducked |= duck;
+                            duck
+                        });
+                        if duck == Some(true) {
+                            emit("voice.duck", json!({ "on": true }));
+                        }
+                    }
+                    Some("partial") => {
+                        with(generation, |voice| voice.caption = event["text"].as_str().unwrap_or("").to_string());
+                        emit_state();
+                    }
+                    Some("final") => {
+                        let said = event["text"].as_str().unwrap_or("").trim().to_string();
+                        let held = with(generation, |voice| {
+                            voice.caption.clear();
+                            if voice.held && !said.is_empty() {
+                                voice.pending.push_str(&said);
+                            }
+                            voice.held
+                        });
+                        emit_state();
+                        if held == Some(false) && !said.is_empty() {
+                            submit(generation, &said);
+                        }
+                    }
+                    Some("speech_end") => {
+                        let unduck = with(generation, |voice| {
+                            voice.caption.clear();
+                            std::mem::take(&mut voice.ducked)
+                        });
+                        if unduck == Some(true) {
+                            emit("voice.duck", json!({ "on": false }));
+                        }
+                        emit_state();
+                    }
+                    Some("error") => {
+                        with(generation, |voice| voice.error = event["message"].as_str().unwrap_or("听写出错").to_string());
+                        emit_state();
+                    }
+                    _ => {}
+                }
+            }
+        });
+        // 合成：音频按 20 毫秒一帧发给客户端，念完了回到听
+        std::thread::spawn(move || {
+            while let Some(message) = speak_reader.next() {
+                let Some(rate) = with(generation, |voice| voice.output_rate) else { return };
+                match message {
+                    Message::Binary(pcm) => {
+                        let frame = (rate as usize / 50 * 2).max(2);
+                        for chunk in pcm.chunks(frame) {
+                            emit("voice.audio", json!({ "pcm": base64::engine::general_purpose::STANDARD.encode(chunk) }));
+                        }
+                        let changed = with(generation, |voice| {
+                            let changed = voice.state != "speaking";
+                            voice.state = "speaking".into();
+                            changed
+                        });
+                        if changed == Some(true) {
+                            emit_state();
+                        }
+                    }
+                    Message::Text(text) => {
+                        let Ok(event) = serde_json::from_str::<Value>(&text) else { continue };
+                        // 念完了（喇叭还在放的等它放完）；打断的（cancelled）由打断的那边改状态
+                        if matches!(event["type"].as_str(), Some("done" | "cancelled")) {
+                            let done = event["type"] == "done";
+                            let unduck = with(generation, |voice| {
+                                if done && voice.turn.is_none() {
+                                    voice.speaking = false;
+                                    if !voice.playing {
+                                        voice.state = "listening".into();
+                                    }
+                                }
+                                std::mem::take(&mut voice.ducked)
+                            });
+                            if unduck == Some(true) {
+                                emit("voice.duck", json!({ "on": false }));
+                            }
+                            emit_state();
+                        }
+                    }
+                }
+            }
+        });
+        Ok(state_of(VOICE.lock().unwrap().as_ref(), client))
+    }
+
+    fn close(voice: &Voice) {
+        if let Some(writer) = &voice.transcriber {
+            writer.text(&json!({ "type": "stop" }).to_string());
+            writer.close();
+        }
+        if let Some(writer) = &voice.speaker {
+            writer.text(&json!({ "type": "cancel" }).to_string());
+            writer.close();
+        }
+    }
+
+    const SPOKEN: &str = "（这段会话是语音对话：用户用嘴说、你的回复会被念出来。回答说口语、简短，先说结论；别用表格、代码块，\
+                          要给代码、长清单就写进文件、说一声在哪。）";
+
+    /// 语音会话：settings.json 的 voice.conversation；没有（或删了）就在默认工作目录里建一段
+    fn conversation() -> Result<(std::sync::Arc<crate::Brain>, String), String> {
+        let settings = crate::read_json_file(&crate::serve_dir().join("settings.json"));
+        let saved = settings["voice"]["conversation"].as_str().map(str::to_string).filter(|id| crate::find_session(id).is_some());
+        let directory = saved
+            .as_ref()
+            .and_then(|id| crate::find_session(id))
+            .map(|stored| stored.cwd)
+            .filter(|cwd| !cwd.is_empty())
+            .unwrap_or_else(crate::default_directory);
+        let brain = crate::serve_brain_for(&directory)?;
+        if let Some(id) = saved {
+            return Ok((brain, id));
+        }
+        let id = uuid::Uuid::new_v4().to_string().to_lowercase();
+        brain.request("sessions.create", json!({ "id": id, "cwd": directory }), Duration::from_secs(30))?;
+        if let Some(path) = crate::stored_session(&id).and_then(|stored| stored.path) {
+            crate::append_title(&path, "语音");
+        }
+        // 回复是念给人听的：先记一条说明（不起一轮）
+        brain.request("sense", json!({ "session": id, "text": SPOKEN, "urgency": "note", "kind": "user" }), Duration::from_secs(30))?;
+        crate::update_serve_settings(|settings| {
+            let voice = settings.entry("voice").or_insert_with(|| json!({}));
+            if !voice.is_object() {
+                *voice = json!({});
+            }
+            voice["conversation"] = json!(id);
+        });
+        Ok((brain, id))
+    }
+
+    /// 说完一句：交给大脑（在回话的话就是插话：念着的停下，补充进这一轮）
+    fn submit(generation: u64, said: &str) {
+        let interrupting = with(generation, |voice| {
+            let busy = voice.speaking || voice.turn.is_some();
+            voice.muted = voice.turn.is_some() && voice.streaming;
+            voice.state = "thinking".into();
+            voice.speaking = true;
+            busy
+        })
+        .unwrap_or(false);
+        if interrupting {
+            if let Some(Some(speaker)) = with(generation, |voice| voice.speaker.clone()) {
+                speaker.text(&json!({ "type": "cancel" }).to_string());
+            }
+            emit("voice.clearAudio", json!({}));
+        }
+        emit_state();
+        let said = said.to_string();
+        std::thread::spawn(move || {
+            let outcome = conversation().and_then(|(brain, session)| {
+                with(generation, |voice| {
+                    voice.session = session.clone();
+                    voice.turn.get_or_insert_with(String::new);
+                });
+                let mut request = json!({ "session": session, "text": said, "urgency": "interject", "kind": "user" });
+                crate::with_prefs(&mut request, &session, &[]);
+                let reply = brain.request("sense", request, Duration::from_secs(30))?;
+                if let Some(turn) = reply["turn"].as_str().filter(|turn| !turn.is_empty()) {
+                    with(generation, |voice| {
+                        if voice.turn.is_some() {
+                            voice.turn = Some(turn.to_string());
+                        }
+                    });
+                }
+                Ok(())
+            });
+            if let Err(error) = outcome {
+                with(generation, |voice| {
+                    voice.error = error;
+                    voice.state = "listening".into();
+                    voice.speaking = false;
+                    voice.turn = None;
+                });
+                emit_state();
+            }
+        });
+    }
+
+    /// 大脑那边的事件（常驻那份收着全部会话的）：语音会话的回复边写边念，这一轮做完念完剩下的。
+    /// 这一轮直接答完了的插话 EDITH 另起一轮：语音会话里开的轮都算（这段会话就是给语音的）
+    pub fn on_event(session: &str, turn: &str, kind: &str, data: &Value) {
+        let (speaker, started) = {
+            let mut voice = VOICE.lock().unwrap();
+            let Some(voice) = voice.as_mut().filter(|voice| voice.session == session) else { return };
+            if kind == "turn.started" {
+                voice.turn = Some(turn.to_string());
+                voice.speaking = true;
+                voice.state = "thinking".into();
+                (voice.speaker.clone(), true)
+            } else if voice.turn.as_deref().is_some_and(|mine| mine.is_empty() || mine == turn) {
+                // 交出去还没回话（turn 是空串）时也认：回话可能排在第一段字后面
+                (voice.speaker.clone(), false)
+            } else {
+                return;
+            }
+        };
+        if started {
+            emit_state();
+            return;
+        }
+        let Some(speaker) = speaker else { return };
+        match kind {
+            "text" => {
+                let muted = VOICE.lock().unwrap().as_mut().is_some_and(|voice| {
+                    voice.streaming = true;
+                    voice.muted
+                });
+                if let Some(text) = data["text"].as_str().filter(|_| !muted) {
+                    speaker.text(&json!({ "type": "text", "text": text }).to_string());
+                }
+            }
+            // 这一步吐完了
+            "stats" => {
+                if let Some(voice) = VOICE.lock().unwrap().as_mut() {
+                    voice.streaming = false;
+                    voice.muted = false;
+                }
+            }
+            "done" => {
+                speaker.text(&json!({ "type": "flush" }).to_string());
+                if let Some(voice) = VOICE.lock().unwrap().as_mut() {
+                    voice.turn = None;
+                    voice.streaming = false;
+                    voice.muted = false;
+                    if let Some(error) = data["error"].as_str().filter(|error| !error.is_empty()) {
+                        voice.error = error.to_string();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn current(client: &str) -> Option<u64> {
+        VOICE.lock().unwrap().as_ref().filter(|voice| voice.client == client).map(|voice| voice.generation)
+    }
+
+    /// voice.*（网关转来的，client 是哪个网关）
+    pub fn request(client: &str, method: &str, params: &Value) -> crate::Reply {
+        match method {
+            "voice.start" => {
+                let owner = params["owner"].as_str().unwrap_or(client).to_string();
+                let input = params["inputSampleRate"].as_u64().unwrap_or(16000) as u32;
+                let output = params["outputSampleRate"].as_u64().unwrap_or(16000) as u32;
+                start(client, &owner, input, output).map_err(|error| (crate::NOT_ALLOWED, error))
+            }
+            "voice.stop" => {
+                let stopped = {
+                    let mut voice = VOICE.lock().unwrap();
+                    if voice.as_ref().is_some_and(|voice| voice.client == client) { voice.take() } else { None }
+                };
+                if let Some(stopped) = stopped {
+                    close(&stopped);
+                }
+                Ok(state_of(None, client))
+            }
+            "voice.state" => Ok(state_of(VOICE.lock().unwrap().as_ref(), client)),
+            "voice.feed" => {
+                let pcm = base64::engine::general_purpose::STANDARD.decode(params["pcm"].as_str().unwrap_or("")).unwrap_or_default();
+                if !pcm.is_empty()
+                    && let Some(writer) =
+                        VOICE.lock().unwrap().as_ref().filter(|voice| voice.client == client).and_then(|voice| voice.transcriber.clone())
+                {
+                    writer.binary(&pcm);
+                }
+                Ok(json!({}))
+            }
+            "voice.interrupt" => {
+                if let Some(generation) = current(client) {
+                    let (speaker, turn) = with(generation, |voice| {
+                        voice.speaking = false;
+                        voice.state = "listening".into();
+                        (voice.speaker.clone(), voice.turn.take())
+                    })
+                    .unwrap_or((None, None));
+                    if let Some(speaker) = speaker {
+                        speaker.text(&json!({ "type": "cancel" }).to_string());
+                    }
+                    emit("voice.clearAudio", json!({}));
+                    // 大脑还在想：停下这一轮
+                    if turn.is_some()
+                        && let Ok((brain, session)) = conversation()
+                    {
+                        let _ = brain.request("sessions.stop", json!({ "id": session }), Duration::from_secs(10));
+                    }
+                    emit_state();
+                }
+                Ok(json!({}))
+            }
+            "voice.held" => {
+                let held = params["held"].as_bool().unwrap_or(false);
+                if let Some(generation) = current(client) {
+                    let (transcriber, pending) = with(generation, |voice| {
+                        voice.held = held;
+                        (voice.transcriber.clone(), if held { String::new() } else { voice.pending.clone() })
+                    })
+                    .unwrap_or((None, String::new()));
+                    emit_state();
+                    if !held {
+                        // 松开：正在说的这句马上定稿（等它一下），连同攒着的交出去
+                        if let Some(writer) = transcriber {
+                            writer.text(&json!({ "type": "flush" }).to_string());
+                        }
+                        std::thread::spawn(move || {
+                            std::thread::sleep(Duration::from_millis(400));
+                            let pending = with(generation, |voice| std::mem::take(&mut voice.pending)).unwrap_or(pending);
+                            if !pending.trim().is_empty() {
+                                submit(generation, &pending);
+                            }
+                        });
+                    }
+                }
+                Ok(json!({}))
+            }
+            "voice.playing" => {
+                if let Some(generation) = current(client) {
+                    let playing = params["playing"].as_bool().unwrap_or(false);
+                    // 放完了、也不在念：回到听
+                    let finished = with(generation, |voice| {
+                        voice.playing = playing;
+                        let finished = !playing && !voice.speaking && voice.state == "speaking";
+                        if finished {
+                            voice.state = "listening".into();
+                        }
+                        finished
+                    });
+                    if finished == Some(true) {
+                        emit_state();
+                    }
+                }
+                Ok(json!({}))
+            }
+            "voice.played" => Ok(json!({})),
+            other => Err((-32601, format!("没有这个方法：{other}"))),
+        }
+    }
+
+    /// 网关断了：它的那一路停下
+    pub fn forget(client: &str) {
+        let stopped = {
+            let mut voice = VOICE.lock().unwrap();
+            if voice.as_ref().is_some_and(|voice| voice.client == client) { voice.take() } else { None }
+        };
+        if let Some(stopped) = stopped {
+            close(&stopped);
+        }
+    }
+
+    /// 有在用的语音（常驻那份闲着不退）
+    pub fn active() -> bool {
+        VOICE.lock().unwrap().is_some()
     }
 }
 
