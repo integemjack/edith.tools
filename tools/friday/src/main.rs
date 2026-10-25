@@ -5280,6 +5280,7 @@ fn serve() -> Result<(), String> {
             || models::busy()
             || loops::active()
             || voice::active()
+            || learn::busy()
         {
             idle_since = Instant::now();
         } else if idle_since.elapsed() >= idle {
@@ -22764,6 +22765,10 @@ path CLAUDE.md
             value("improve.enabled") == "1"
         }
 
+        pub fn running() -> bool {
+            RUNNING.load(Ordering::Relaxed)
+        }
+
         fn pending_count() -> usize {
             all().iter().filter(|proposal| ["pending", "branch"].contains(&text(proposal, "status"))).count()
         }
@@ -23673,6 +23678,11 @@ path CLAUDE.md
             changed();
             Ok(state())
         }
+    }
+
+    /// 在整理、判定、评测、找改进（常驻那份闲着不退，免得做到一半）
+    pub fn busy() -> bool {
+        JUDGING.load(Ordering::Relaxed) || !ORGANIZING.lock().unwrap().is_empty() || eval_running() || improve::running()
     }
 
     // MARK: - 起来
