@@ -1663,6 +1663,8 @@ struct State {
     models: bool,
     /// 调过 loops.*（设置 › 定时任务）
     loops: bool,
+    /// 看过提示词文件（prompts.*，设置 › 自我改进）：之后推 prompts 事件
+    prompts: bool,
     /// 常驻那份开着的终端（TerminalInfo 们）、浏览器（BrowserState；还没连上它时是 None）
     terminals: Vec<Value>,
     browser: Option<Value>,
@@ -3662,7 +3664,7 @@ fn server_info() -> Value {
 fn features() -> Vec<&'static str> {
     let mut list = vec!["mkdir", "submitFrom", "activity", "assistant", "config", "memory", "memorySearch"];
     if serve_mode() != "off" {
-        list.extend(["powers", "models", "userVoices", "loops", "hooks", "plugins"]);
+        list.extend(["powers", "models", "userVoices", "loops", "hooks", "plugins", "prompts"]);
     }
     list
 }
@@ -4257,7 +4259,7 @@ fn handle(method: &str, params: &Value) -> Reply {
         "assistant.channels.list" => Ok(json!({ "channels": [] })),
         method if method.starts_with("assistant.") => Err((NOT_ALLOWED, "这台的 EDITH 没有助手：助手开在客户端那台上".into())),
         method if method.starts_with("term.") => terminal_request(method, params),
-        method if ["powers.", "models.", "loops.", "hooks.", "plugins."].iter().any(|prefix| method.starts_with(prefix)) => {
+        method if ["powers.", "models.", "loops.", "hooks.", "plugins.", "prompts."].iter().any(|prefix| method.starts_with(prefix)) => {
             hub_forward(method, params)
         }
         method if method.starts_with("browser.") => browser_request(method, params),
@@ -4750,6 +4752,7 @@ fn serve_request(client: &str, method: &str, params: &Value) -> Reply {
         method if method.starts_with("hooks.") => hooks::request(method, params),
         method if method.starts_with("capabilities.") => caps::request(method, params),
         method if method.starts_with("plugins.") => plugins::request(method, params),
+        method if method.starts_with("prompts.") => prompt_files::request(method, params),
         other => Err((-32601, format!("常驻的那份没有 {other}"))),
     }
 }
@@ -4882,6 +4885,7 @@ fn serve() -> Result<(), String> {
     models::start();
     loops::start();
     plugins::start();
+    prompt_files::start();
     {
         let token = token.clone();
         std::thread::spawn(move || {
@@ -5032,6 +5036,7 @@ fn on_hub_message(hub: &Arc<Brain>, message: Value) {
         Some("powers") if STATE.lock().unwrap().powers => event("powers", message["params"].clone()),
         Some("models") if STATE.lock().unwrap().models => event("models", message["params"].clone()),
         Some("loops") if STATE.lock().unwrap().loops => event("loops", message["params"].clone()),
+        Some("prompts") if STATE.lock().unwrap().prompts => event("prompts", message["params"].clone()),
         // 脚本工具、能力提供方变了：设置页重列（另起线程：重列要问常驻那份，回话得靠这个线程读）
         Some("scripts") => {
             std::thread::spawn(|| config_changed(&["tools"]));
@@ -5157,9 +5162,12 @@ fn hub_forward(method: &str, params: &Value) -> Reply {
     ];
     let wait = if slow.contains(&method) { 660 } else { 30 };
     let reply = hub.request(target, params.clone(), Duration::from_secs(wait)).map_err(|error| hub_error(&error))?;
-    // 调过 loops.* 的客户端之后收 loops 事件
+    // 调过 loops.*、prompts.* 的客户端之后收 loops、prompts 事件
     if method.starts_with("loops.") {
         STATE.lock().unwrap().loops = true;
+    }
+    if method.starts_with("prompts.") {
+        STATE.lock().unwrap().prompts = true;
     }
     if let Some((what, on)) = subscribe {
         let mut state = STATE.lock().unwrap();
@@ -5174,7 +5182,8 @@ fn hub_forward(method: &str, params: &Value) -> Reply {
 
 /// 常驻那份回的错误：没有这个模型回 3，别的原样
 fn hub_error(error: &str) -> (i64, String) {
-    if error.starts_with("这台机器上没有这个本地模型") || error.starts_with("没有定时任务") {
+    if error.starts_with("这台机器上没有这个本地模型") || error.starts_with("没有定时任务") || error.starts_with("没有这个提示词版本")
+    {
         (NOT_FOUND, error.to_string())
     } else {
         (-32603, error.to_string())
@@ -11577,6 +11586,230 @@ mod plugins {
 }
 
 // MARK: - 能力提供方（本机的：本地语音、生图 / 生视频）
+
+mod prompt_files {
+    //! 提示词文件（设置 › 自我改进 › 提示词文件，同 Friday 的 PromptStore）：EDITH 的 `~/.edith/Prompts` 是一个 git 仓库，
+    //! 文件一变（用户、智能体改的）停 1.5 秒自动提交一次；设置里看历史、回滚到任一版本、恢复成自带的。
+    //! 用 friday-core 的 prompt_store（每秒看文件、git 一次跑一个）。自带的那份取 `.upstream/`（EDITH 上次合并自带提示词时写的，
+    //! EDITH 升级换了自带的就跟着换）；大脑每段请求前看文件变没变，回滚、恢复以后在跑的大脑也用新的。
+    //! 自动回滚的开关、说明记在常驻那份的 settings.json（prompts.autoRollback / autoRollbackNote）。
+
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use friday_core::{events, prompt_store, prompts};
+    use serde_json::{Value, json};
+
+    /// .upstream 里各文件的名字、大小、修改时间
+    type Signature = Vec<(String, u64, Option<std::time::SystemTime>)>;
+
+    /// 上次读 .upstream 时的（变了重新装）
+    static UPSTREAM: Mutex<Option<Signature>> = Mutex::new(None);
+
+    pub fn directory() -> PathBuf {
+        crate::edith_home().join("Prompts")
+    }
+
+    fn upstream_signature(dir: &Path) -> Signature {
+        let mut names: Signature = std::fs::read_dir(dir.join(".upstream"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().into_string().ok()?;
+                let info = entry.metadata().ok()?;
+                (name.ends_with(".md") && info.is_file()).then(|| (name, info.len(), info.modified().ok()))
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// 装上 EDITH 自带的那份（.upstream 里的）；变了才重装。返回装没装过
+    fn sync_bundled() -> bool {
+        let dir = directory();
+        let now = upstream_signature(&dir);
+        let mut last = UPSTREAM.lock().unwrap();
+        if last.as_ref() == Some(&now) {
+            return false;
+        }
+        let bundled: BTreeMap<String, String> = now
+            .iter()
+            .filter_map(|(name, _, _)| Some((name.clone(), std::fs::read_to_string(dir.join(".upstream").join(name)).ok()?)))
+            .collect();
+        prompts::setup(bundled, dir.is_dir().then_some(dir), Vec::new());
+        *last = Some(now);
+        true
+    }
+
+    /// 这台的 git（macOS 没装命令行工具时 /usr/bin/git 一调就弹安装框：先问 xcode-select）
+    fn find_git() -> Option<String> {
+        let path = std::env::var_os("PATH")?;
+        let names: &[&str] = if cfg!(windows) { &["git.exe", "git.cmd"] } else { &["git"] };
+        let git = std::env::split_paths(&path).flat_map(|dir| names.iter().map(move |name| dir.join(name))).find(|path| path.is_file())?;
+        if cfg!(target_os = "macos") && std::fs::canonicalize(&git).ok().as_deref() == Some(Path::new("/usr/bin/git")) {
+            let installed = std::process::Command::new("/usr/bin/xcode-select")
+                .arg("-p")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            if !installed {
+                return None;
+            }
+        }
+        Some(git.to_string_lossy().into_owned())
+    }
+
+    /// 还不是 git 仓库、文件和自带的一样（EDITH 刚写进去的）：第一次提交写「EDITH 自带的提示词」
+    /// （不然核心按「没开时改过的」写）
+    fn first_commit(git: Option<&str>) {
+        let dir = directory();
+        let Some(git) = git else { return };
+        if dir.join(".git").exists() || !dir.is_dir() {
+            return;
+        }
+        let names = prompts::prompt_files(&dir);
+        let bundled = !names.is_empty()
+            && names.iter().all(|name| {
+                let upstream = std::fs::read(dir.join(".upstream").join(name)).ok();
+                upstream.is_some() && upstream == std::fs::read(dir.join(name)).ok()
+            });
+        if !bundled {
+            return;
+        }
+        let run = |args: &[&str]| {
+            std::process::Command::new(git)
+                .args([
+                    "-c",
+                    "user.name=Friday",
+                    "-c",
+                    "user.email=friday@localhost",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.autocrlf=false",
+                ])
+                .args(args)
+                .current_dir(&dir)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        };
+        let _ = run(&["init", "-q"]) && run(&["add", "-A"]) && run(&["commit", "-q", "-m", "EDITH 自带的提示词"]);
+    }
+
+    fn begin() {
+        let git = find_git();
+        first_commit(git.as_deref());
+        prompt_store::start(Some(git), Vec::new(), &format!("edith-friday {}", crate::VERSION));
+    }
+
+    /// 常驻那份起来时开始看文件（EDITH 还没跑过、没有提示词文件夹时也开着：之后建出来了点「重新检查」）
+    pub fn start() {
+        events::set_handler(Some(Box::new(|line| {
+            let Ok(message) = serde_json::from_str::<Value>(line) else { return };
+            match message["event"].as_str() {
+                Some("promptStore.state") => crate::notify_all_clients("prompts", state()),
+                // 核心请两端做的事：这里都不做（给了 git，不会请找 git）
+                Some("request") => {
+                    if let Some(id) = message["request"].as_u64() {
+                        std::thread::spawn(move || {
+                            events::reply(id, Err("常驻的那份不做这件事".into()));
+                        });
+                    }
+                }
+                _ => {}
+            }
+        })));
+        sync_bundled();
+        begin();
+    }
+
+    fn settings() -> Value {
+        crate::read_json_file(&crate::serve_dir().join("settings.json"))
+    }
+
+    pub fn auto_rollback() -> bool {
+        settings()["prompts"]["autoRollback"].as_bool().unwrap_or(true)
+    }
+
+    /// 设置页要的（同 Friday 的 promptsJson；评测还没有：没有题）
+    pub fn state() -> Value {
+        let store = prompt_store::state();
+        let directory = store["directory"].as_str().map(|path| if cfg!(windows) { path.replace('/', "\\") } else { path.to_string() });
+        json!({
+            "directory": directory.unwrap_or_default(),
+            "gitAvailable": store["gitAvailable"],
+            "history": store["history"],
+            "problems": store["problems"],
+            "keptLocal": store["keptLocal"],
+            "busy": store["busy"],
+            "lastError": store["lastError"],
+            "autoRollback": auto_rollback(),
+            "autoRollbackNote": settings()["prompts"]["autoRollbackNote"].as_str().unwrap_or(""),
+            "eval": eval_state(),
+        })
+    }
+
+    /// 评测（还没有评测集：没有题）
+    fn eval_state() -> Value {
+        json!({ "caseCount": 0, "running": false, "progress": "", "runs": [], "lastError": "" })
+    }
+
+    pub fn request(method: &str, params: &Value) -> crate::Reply {
+        if prompt_store::state()["directory"].is_null() && directory().is_dir() {
+            // 起来时还没有文件夹（EDITH 在这台还没跑过）：现在有了，开始看
+            *UPSTREAM.lock().unwrap() = None;
+            sync_bundled();
+            begin();
+        } else {
+            // EDITH 升级换了自带的：先换上（恢复成自带的要用新的）
+            sync_bundled();
+        }
+        match method {
+            "prompts.get" => {}
+            "prompts.recheck" => prompt_store::refresh(Some(find_git())),
+            "prompts.rollback" => {
+                let id = params["id"].as_str().unwrap_or("");
+                let known =
+                    prompt_store::state()["history"].as_array().is_some_and(|list| list.iter().any(|entry| entry["id"] == json!(id)));
+                if id.is_empty() || !known {
+                    return Err((crate::NOT_FOUND, "没有这个提示词版本".into()));
+                }
+                prompt_store::rollback(id, None);
+            }
+            "prompts.restoreBundled" => {
+                if upstream_signature(&directory()).is_empty() {
+                    return Err((crate::NOT_ALLOWED, "还没有 EDITH 自带的提示词（EDITH 在这台跑过一次就有）".into()));
+                }
+                prompt_store::restore_bundled();
+            }
+            "prompts.setAutoRollback" => {
+                let Some(value) = params["value"].as_bool() else {
+                    return Err((-32602, "缺少参数 value".into()));
+                };
+                crate::update_serve_settings(|settings| {
+                    let prompts = settings.entry("prompts").or_insert_with(|| json!({}));
+                    if !prompts.is_object() {
+                        *prompts = json!({});
+                    }
+                    prompts["autoRollback"] = json!(value);
+                });
+            }
+            "prompts.evaluate" => return Err((crate::NOT_ALLOWED, "还没有评测题（判过的事攒够了才有）".into())),
+            other => return Err((-32601, format!("没有这个方法：{other}"))),
+        }
+        // 刚排上的 git 活（回滚、恢复）先等一会儿：回的状态里就有新的历史
+        if matches!(method, "prompts.rollback" | "prompts.restoreBundled" | "prompts.recheck") {
+            prompt_store::settle(Duration::from_secs(10));
+        }
+        Ok(state())
+    }
+}
 
 mod caps {
     //! 能力层（照 Friday 的 CapabilityRegistry + PowerBackend）：装好的本地能力是「本机」提供方（`power-<id>`）——本地语音能听录音、说话，
