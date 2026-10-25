@@ -93,10 +93,10 @@ Friday 客户端 ──SSH──▶ edith-friday --attach（一条连接一个�
 - **文件存放位置**（`storage.*`）：整个数据根（默认 `~/.edith`）换位置，默认位置留 `storage.json` 指过去（EDITH、网关、edith-connect、edith-websocket 都按它找）；
   「重启服务」时才搬（停掉常驻那份和闲着的大脑，复制、核对、改指向、删旧的）。模型文件夹单独选，默认缓存里的能「搬过来」。
 - **实时语音**（`voice.*`）：客户端只管麦克风和喇叭（`voice.feed` 进、`voice.audio` 出，16 位 PCM），听写、交给大脑、边写边念、插话都在常驻那份做——
-  连本地语音的两条实时 WebSocket（Friday.Powers 的 voice-protocol.md）。这台没有助手：说的话交给一段专门的「语音」会话（默认工作目录里，第一次说话时建，
-  记在 `settings.json` 的 `voice.conversation`，开头记一条「回复会被念出来、说口语」），回复的字边到边念。按住说话（`voice.held`）松开前攒着；
+  连本地语音的两条实时 WebSocket（Friday.Powers 的 voice-protocol.md）。说的话交给这台的**助手**（见下面「助手」，助手关着时不能用语音），
+  记进助手的日志（来源 `voice`），助手的回复边到边念（「（不说）」不念）。按住说话（`voice.held`）松开前攒着；
   回话时开口压低音量（`voice.duck`），说完一句算插话：念的停下、客户端丢掉没放的（`voice.clearAudio`），这一步剩下的字不念，看到插话的下一步照常念；
-  「停」（`voice.interrupt`）停下大脑这一轮。一台同时一路：后开的接过来，原来那一路 `active` 变假、说明被谁接过去。
+  「停」（`voice.interrupt`）停下大脑这一轮；打断之后、合成回「已打断」之前到的音频丢掉。一台同时一路：后开的接过来，原来那一路 `active` 变假、说明被谁接过去。
 - **复盘、内置钩子、自我改进**（同 Friday 的 MemoryLearner / BuiltinHooks / PromptEval / PromptImprover）：常驻那份收着全部会话的事件，每一轮记一条
   （用户说的、提示词版本、停止 / 改了重发 / 重试 / 出错这些信号、读过的技能、查到的记忆、调了哪些工具、回答），存在 `~/.edith/friday/learn.json`。
   - 内置钩子（`hooks.state` 的 `builtin` / `builtinModels`、`hooks.setBuiltin`，默认都开）：「会话第一条消息」附上记忆库和技能的目录（UserPromptSubmit 补的上下文，
@@ -110,8 +110,22 @@ Friday 客户端 ──SSH──▶ edith-friday --attach（一条连接一个�
   - 自我改进（`improve.*`，默认关）：每天一次（或「现在找一次」）看最近没做好的段和题，诊断、改几段提示词（受保护的、工具参数的说明不给改），
     评测不比现在的差才交给用户，采用才写进提示词文件、提交成一个版本；要改代码的在设好的源码目录开工作树（`~/.edith/friday/Improve/<id>`，分支
     `improve/<id>`）交给一段会话做，做完核对改了哪些文件（碰了受保护的拦下），等用户推送或丢掉；改进者自己成绩差时改它自己的几段，采用后采用率掉了就退回。
-- **助手**：这台没有助手（EDITH 是大脑，助手开在客户端那台上）。客户端的助手看这台的会话走 `activity.*`（开始、跑命令、待确认、做完的简报）；
-  助手页看这台时说没开，不说版本太旧。
+- **助手**（`assistant.*`，同 Friday 的 AssistantRuntime / WorldBoard / Triage / TurnBrief，Friday 仓库 qt/docs/ASSISTANT.md）：在常驻那份里，
+  默认关，设置里打开（`assistant.settings.update {enabled}`）。客户端的助手页看这台时看的就是它。
+  - **脑子是 EDITH**：一段藏起来的「助手」会话（默认工作目录的大脑里，`sessions.create` 带 `owner: "#assistant"`、会话列表不列，带助手的人设当专用系统提示
+    `instructions`，id 记在 `~/.edith/friday/assistant/state.json`）。用户说的话交给它，后面附上「[现在]」和状态板；助手在回时用户又说话就打断它带上这句重来
+    （`urgency: interrupt`）；它的回复边写边进日志，回「（不说）」的标 silent。以「#短号」开头的话原样发给那段会话、不经过大脑。
+  - **管会话的工具**是常驻那份的动作，只给助手会话（动作的 `sessions`）：`list_sessions`、`create_session`（在某个目录开会话、交任务）、`send_to_session`
+    （默认排到下一轮，`interject` 补进正在做的这一轮）、`read_session`、`manage_session`（停下、关注、改名）、`post_detail`（给看的内容）；记事用 EDITH 的
+    `save_memory` / `search_memory`，定时用 `loop`。
+  - **状态板**：这台全部会话现在的样子（在跑 / 等确认 / 在问你 / 出错 / 空闲，在跑哪个工具、最后一句、短号、助手派的、用户在等的），代码维护，
+    80 毫秒合并推一次（`assistant.board`）。「等确认」靠 EDITH 的 `approval` 事件；回执上的「批准 / 拒绝」（`assistant.resolveApproval`）由客户端连着的网关
+    认出手上那件待确认来答。
+  - **回执和分诊**：一轮做完按代码模板写（`完成｜机器｜标题 #短号`、挑出来的一句、改了几个文件 · 跑了几条命令 · 用时），不过模型；出错、在问你、等确认、
+    卡住（在跑 5 分钟没动静，有工具在跑时 15 分钟）立即，助手派的、关注的、30 分钟内提到过的「用户在等」及时——这两级叫醒助手（每小时最多 30 次，
+    客户端前台正看着那段会话时不叫），带上交给它的和它最后的回答让它核对；别的只上状态板、记日志。推送（`assistant.push`）按推送规则（默认要紧的）。
+  - 日志在 `~/.edith/friday/assistant/journal/<日期>.jsonl`（只追加，同一个 id 后写的算），设置在 `settings.json`；`assistant.history` 按页取，`assistant.clear`
+    清空并换一段新的助手会话。开着助手时常驻那份不闲退；`activity.subscribe` 的快照报 `assistant: true`（客户端的助手对这台的会话只上状态板）。
 
 ## 装上
 
@@ -180,11 +194,12 @@ cp edith ~/.friday-server/bin/                            # 或者 edith 在 PAT
 | 文件存放位置（特性 `storage`） | `storage.get` / `measure` / `move` / `cancel` / `setModels` / `adoptModels` / `restart`、`storage` 事件 |
 | 实时语音（特性 `voice`） | `voice.start` / `stop` / `state` / `feed` / `held` / `interrupt` / `playing` / `played`、`voice.state` / `voice.audio` / `voice.clearAudio` / `voice.duck` 事件 |
 | 自我改进（特性 `improve`） | `improve.get` / `run` / `runSelf` / `setEnabled` / `setEngine` / `setRepository` / `accept` / `dismiss` / `push` / `discard`、`improve` 事件 |
-| 客户端的助手看这台（特性 `activity`、`assistant`） | `activity.subscribe` / `unsubscribe`、`activity` 事件、`assistant.status` |
+| 客户端的助手看这台的会话（特性 `activity`） | `activity.subscribe` / `unsubscribe`、`activity` / `activity.assistant` 事件 |
+| 助手（特性 `assistant`） | `assistant.status` / `subscribe` / `unsubscribe` / `history` / `say` / `stop` / `settings.update` / `presence` / `resolveApproval` / `clear` / `memory.list`、`assistant.entry` / `board` / `state` / `push` / `reset` 事件 |
 
 还不行的（回 `-32601` 没有，或错误 `4` 说明原因；`server.features` 不报，客户端就不显示）：
 
-- 助手（`assistant.*` 的对话、渠道、通话）：EDITH 是大脑，助手开在客户端那台上；实时语音对着这台专门的「语音」会话说。
+- 助手的渠道（SChat、Telegram、脚本渠道）和通话：还没搬（`assistant.channels.*` 回错误 `4`）；助手回答会话的 `ask_user` 问题、附件读取还没有。
 - 任务模式「不派子智能体」：EDITH 上没有这一档，按原来的（需要时派）做。
 - 要批准的事：没有客户端连着时大脑等能批准的连上来（最多 10 分钟，过了就不做）；要无人值守就选「完全」权限模式，
   或在 `~/.edith/config.json` 的 `permissions.allow` 里放开、用 `edith --auto`。
@@ -207,4 +222,5 @@ cd tools/friday && cargo test
 脚本工具的建 / 自测 / 回滚 / 开关 / 沙盒；钩子的四个时机和项目信任、插件的装 / 投到 EDITH / 停用 / 卸载；能力提供方的听写 / 合成 / 生图 / 生视频；
 智能体的浏览器工具（真 Chrome）；命令的展开 / allowed-tools / use_command；提示词文件的历史 / 回滚 / 恢复；文件存放位置的搬；在线服务商的接入、
 模型列表、余额（假的服务）；实时语音（假的本地语音：听写把 PCM 当字、合成把字当 PCM）的说一句、按住说话、插话、叫停、接过去；
-复盘的第一条消息附目录、一轮结束整理、判定、评测、改进建议（评测比过才交、采用写进提示词、改代码开工作树交给会话、丢掉）。
+复盘的第一条消息附目录、一轮结束整理、判定、评测、改进建议（评测比过才交、采用写进提示词、改代码开工作树交给会话、丢掉）；
+助手的开关、说话（藏起来的助手会话、人设、附状态板）、回执、派活（create_session）、做完叫醒助手、直达会话、不说、历史、等确认和在助手页拒绝。
