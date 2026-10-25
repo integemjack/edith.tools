@@ -131,6 +131,16 @@ Friday 客户端 ──SSH──▶ edith-friday --attach（一条连接一个�
     在聊天工具里给机器人发「/bind 绑定码」成为主人，在群里发就是推送的去处；只听主人的私聊。主人的话交给助手（来源是渠道 id），回复回到最近
     说话的那个聊天、在想时「正在输入」；/help /status /sessions /stop /new 直接答；图片、视频、文件下载好当附件，语音先听写；回执和助手主动说的
     推到开了「通知」的渠道的主人和群（回执带「接着做…」按钮、记着 #短号：引用回复它 = 直接发给那段会话）。都按纯文本渲染、超长切条。助手关着时渠道都停。
+  - **通话**（同 Friday 的 AssistantCalls / AssistantTextSession，Friday 仓库 qt/docs/ASSISTANT.md §8；`calls` 特性，见下面「通话内核」）：SChat 渠道
+    （`options.calls`，默认开）连上后 `setCallSettings` 声明能打电话，另开一条通话连接（`ws(s)://服务器/ws`，子协议 `schat-ws.v1`，hello 带机器人 token，
+    回 self ack 才算连上，渠道列表的 `callsReady`；每 25 秒 ping，断了 3 秒起翻倍重连），`p2p_*` 信令原样进出。只接主人打来的（设置「接电话」`answerCalls`，
+    默认开；还要装着本地语音），先拿服务器给的 TURN（`getIceServers`）再自动接；别人打来的回 `user_rejected`，在别的渠道通话时 `busy`，两边同时打按 `p2p_glare` 让。
+    接通后先应一声，之后就是实时语音那一路接过来：对方的声音换成 16 kHz 交给听写，说完的话交给助手（来源 `call:<渠道>`，口语、短），回复边写边念、
+    48 kHz 每 20 毫秒一帧送进通话（用户开口时压低、插话打断照语音那样），`post_detail` 的长内容发到那个聊天里；视频通话时助手的画面是一个跟着音量起伏的光环
+    （360×640）。挂断记通话时长。助手的 `call_user` 打给最近跟它说话的主人（按设置「主动打电话」`callPolicy`：never / asked / important——没人让打的一刻钟最多一次；
+    免打扰 `quietStart` / `quietEnd`，`set_quiet_hours` 设），接通后先念打电话的理由，30 秒没人接发 `request_cancel`。
+    P2P 文字（`callType: "text"`）：同一道闸，建一条只有 DataChannel 的连接（手机出 offer），打的字交给助手（来源 `p2ptext:<渠道>`），回复转纯文本发回通道
+    （没开时攒着，会话结束了发到普通聊天里）；图片、文件回一句只看得懂文字，要升级成语音回 `upgrade_reject`。远程工作通道（`callType: "work"`）回 `error`。
   - 日志在 `~/.edith/friday/assistant/journal/<日期>.jsonl`（只追加，同一个 id 后写的算），设置在 `settings.json`；`assistant.history` 按页取，`assistant.clear`
     清空并换一段新的助手会话。开着助手时常驻那份不闲退；`activity.subscribe` 的快照报 `assistant: true`（客户端的助手对这台的会话只上状态板）。
 
@@ -204,14 +214,27 @@ cp edith ~/.friday-server/bin/                            # 或者 edith 在 PAT
 | 客户端的助手看这台的会话（特性 `activity`） | `activity.subscribe` / `unsubscribe`、`activity` / `activity.assistant` 事件 |
 | 助手（特性 `assistant`） | `assistant.status` / `subscribe` / `unsubscribe` / `history` / `say` / `stop` / `settings.update` / `presence` / `resolveApproval` / `clear` / `memory.list`、`assistant.entry` / `board` / `state` / `push` / `reset` 事件 |
 | 助手的聊天工具 | `assistant.channels.list` / `add` / `update` / `remove` / `removeOwner` / `removeGroup` / `bindCode`、`assistant.channels` 事件 |
+| 助手的通话（SChat 渠道的语音 / 视频电话、P2P 文字） | 渠道列表的 `calls` / `callsReady`、`options.calls`；设置的 `answerCalls` / `callPolicy` / `quietStart` / `quietEnd` |
 
 还不行的（回 `-32601` 没有，或错误 `4` 说明原因；`server.features` 不报，客户端就不显示）：
 
-- 助手的通话还没搬；渠道里批准工具调用（`approveFromChannels`）、流式回复（SChat streams、Telegram 草稿）、发文件和语音回复、问题卡片还没有；
-  助手回答会话的 `ask_user` 问题、附件读取还没有。
+- 渠道里批准工具调用（`approveFromChannels`）、流式回复（SChat streams、Telegram 草稿）、发文件和语音回复、问题卡片还没有；
+  助手回答会话的 `ask_user` 问题、附件读取还没有。通话里「只听我的声音」（声纹过滤）、视频通话时把对方摄像头的画面交给助手看、
+  SChat 的远程工作通道（`callType: "work"`，在 DataChannel 上跑远程协议）还没有；不带 `calls` 特性的包（Linux 的 x86、armv7、armv6、riscv64、loong64、
+  ppc64le、s390x）不能打电话（渠道列表 `calls: false`）。
 - 任务模式「不派子智能体」：EDITH 上没有这一档，按原来的（需要时派）做。
 - 要批准的事：没有客户端连着时大脑等能批准的连上来（最多 10 分钟，过了就不做）；要无人值守就选「完全」权限模式，
   或在 `~/.edith/config.json` 的 `permissions.allow` 里放开、用 `edith --auto`。
+
+## 通话内核
+
+`tools/friday/call/`：Secret-Chat 桌面端的通话内核（P2PCallManager + DcMediaEngine，Friday 也用这一套）、C 接口和依赖的 CMake（libdatachannel、
+Mbed TLS、Opus、openh264，第一次配置时从 GitHub 拉源码），见那里的 README.md。`cargo build --features calls` 时 `build.rs` 用 CMake（Release）编好、
+静态链进 edith-friday；不开特性就不要 CMake、不带通话。发布的包在 macOS（arm64、x64）、Windows（x64、x86、arm64）、Linux（x64、arm64）上开着。
+
+```bash
+cd tools/friday && cargo build --release --features calls     # 要 CMake 3.24+、C++17 编译器；FRIDAY_CALL_DEPS_DIR 指到现成的依赖源码就不下载
+```
 
 ## 测试
 
@@ -233,4 +256,7 @@ cd tools/friday && cargo test
 模型列表、余额（假的服务）；实时语音（假的本地语音：听写把 PCM 当字、合成把字当 PCM）的说一句、按住说话、插话、叫停、接过去；
 复盘的第一条消息附目录、一轮结束整理、判定、评测、改进建议（评测比过才交、采用写进提示词、改代码开工作树交给会话、丢掉）；
 助手的开关、说话（藏起来的助手会话、人设、附状态板）、回执、派活（create_session）、做完叫醒助手、直达会话、不说、历史、等确认和在助手页拒绝；
-渠道（假的 SChat、Telegram 服务器、脚本渠道）的绑定、只听主人、说话回到那个聊天、命令、回执推送和引用回复直达、图片附件、自签证书的指纹、关助手渠道停。
+渠道（假的 SChat、Telegram 服务器、脚本渠道）的绑定、只听主人、说话回到那个聊天、命令、回执推送和引用回复直达、图片附件、自签证书的指纹、关助手渠道停；
+通话（假的 SChat 服务器转信令，假手机 `edith-friday __call-phone <ws 地址> <用户 token>` 是另一部通话内核、媒体真走本机 WebRTC；假的本地语音按音量断句、
+合成回一段音调）的通话连接、不是主人和工作通道直接拒、打进来自动接和先应一声、说一句交给助手、回复念回去、视频通话收到光环画面、挂断记时长、
+call_user 打给主人、关掉主动打电话不打、P2P 文字收发和媒体回一句。

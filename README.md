@@ -36,7 +36,8 @@
 顶上的 `version` 是这份索引生成的时间，每个工具的版本在它自己的 `version` 里。
 
 平台：macOS（arm64、x64）、Windows（x64、x86、arm64）、Linux（x64、x86、arm64、armv7、armv6、riscv64、loong64、ppc64le、s390x；
-musl 静态程序，不挑发行版）。每个包里只有那一个程序。
+musl 静态程序，不挑发行版）。每个包里只有那一个程序。`edith-friday` 在 macOS、Windows、Linux x64 / arm64 上的包带着助手的通话
+（`calls` 特性：`tools/friday/call/` 的 C++ 通话内核静态链进去），别的平台的不带。
 
 ## 大脑怎么起它们
 
@@ -61,7 +62,7 @@ cargo build --release
 ```
 
 加一个工具：`tools/<目录>/` 放一个独立工程（`Cargo.toml` 里写 `[workspace]`，开发依赖 `edith-tools-support = { path = "../../support" }`），
-再照 `.github/workflows/friday.yml` 加一个调 `tool.yml` 的工作流。
+再照 `.github/workflows/friday.yml` 加一个调 `tool.yml` 的工作流（`features` / `feature_keys`：只在列出的平台上多开的 cargo 特性）。
 
 每次推送，改了的工具（`tools/<目录>/`、共用的 `support/`、`rust-toolchain.toml`、`scripts/`、流水线）在 GitHub Actions 上编全平台全架构、跑测试；
 推到 `main`、而且这个工具自上一版以来改过（只改了 `support/` 的只测不发），发它的一版：版本 `v<它 Cargo.toml 版本的前两位>.<这个工具发过几次>`，
@@ -69,4 +70,5 @@ cargo build --release
 
 ## 许可证
 
-MIT 或 Apache-2.0 任选（[LICENSE-MIT](LICENSE-MIT)、[LICENSE-APACHE](LICENSE-APACHE)）。
+MIT 或 Apache-2.0 任选（[LICENSE-MIT](LICENSE-MIT)、[LICENSE-APACHE](LICENSE-APACHE)）。`tools/friday/call/` 编进去的第三方库各按各的许可证
+（libdatachannel MPL-2.0、Mbed TLS Apache-2.0、Opus BSD-3、openh264 BSD-2，见那里的 README.md）。

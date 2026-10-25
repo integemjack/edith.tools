@@ -18,6 +18,14 @@ on:
         description: 没改也发一版
         type: boolean
         default: false
+      features:
+        description: 多打开的 cargo 特性（只在 feature_keys 列的平台上，测试和打包都开）
+        type: string
+        default: ""
+      feature_keys:
+        description: 打开 features 的平台（matrix 的 key，空格分开）
+        type: string
+        default: ""
 
 permissions:
   contents: write
@@ -91,6 +99,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # 有的工具在部分平台上多开特性（edith-friday 的 calls：通话内核是 C++，要 CMake，编得了的平台才开）
+      - name: Features
+        run: |
+          if [ -n "${{ inputs.features }}" ] && [[ " ${{ inputs.feature_keys }} " == *" ${{ matrix.key }} "* ]]; then
+            echo "FEATURES=--features ${{ inputs.features }}" >> "$GITHUB_ENV"
+            echo "打开特性：${{ inputs.features }}"
+          fi
+
       # rust-toolchain.toml（仓库根上）定版本，rustup 第一次用时自动装；目标平台的标准库另加
       - name: Rust target
         run: rustup target add "$TARGET"
@@ -122,10 +138,10 @@ jobs:
       - name: Test
         if: matrix.test
         run: |
-          if [ -n "${{ matrix.zig }}" ]; then cargo test --locked --release; else cargo test --locked --release --target "$TARGET"; fi
+          if [ -n "${{ matrix.zig }}" ]; then cargo test --locked --release $FEATURES; else cargo test --locked --release --target "$TARGET" $FEATURES; fi
 
       - name: Build
-        run: $BUILD --locked --release --target "$BUILD_TARGET"
+        run: $BUILD --locked --release --target "$BUILD_TARGET" $FEATURES
 
       # 包里只有这个程序（Windows .zip、其余 .tar.gz），名字 <工具>-<版本>-<平台>
       - name: Package (macOS / Linux)

@@ -30,3 +30,6 @@ jobs:
     with:
       dir: friday
       release: ${{ inputs.release == true }}
+      # 助手的通话（tools/friday/call/：C++ 通话内核，CMake 编好静态链进来）；别的平台的包不带通话
+      features: calls
+      feature_keys: macos-arm64 macos-x64 windows-x64 windows-x86 windows-arm64 linux-x64 linux-arm64
