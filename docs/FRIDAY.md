@@ -110,6 +110,9 @@ Friday 客户端 ──SSH──▶ edith-friday --attach（一条连接一个�
   - 自我改进（`improve.*`，默认关）：每天一次（或「现在找一次」）看最近没做好的段和题，诊断、改几段提示词（受保护的、工具参数的说明不给改），
     评测不比现在的差才交给用户，采用才写进提示词文件、提交成一个版本；要改代码的在设好的源码目录开工作树（`~/.edith/friday/Improve/<id>`，分支
     `improve/<id>`）交给一段会话做，做完核对改了哪些文件（碰了受保护的拦下），等用户推送或丢掉；改进者自己成绩差时改它自己的几段，采用后采用率掉了就退回。
+- **升级后换新的常驻那份**：常驻的那份在 `serve.json` 里记着自己的版本、程序文件和它当时的修改时间、大小（`exe`、`build`）。网关连它之前先看：
+  同一个程序文件后来换过（升级了 edith-friday——同一版的补丁号程序里的工程版本不变，所以看文件），或者它的版本比网关旧，就请它退出（`serve.retire`；
+  0.9 及以前的不认，按 pid 结束它）、起新的。别的拷贝起的、版本不比网关旧的不动（免得两份来回踢）。开着助手时它不会闲退，不这样就一直是旧的。
 - **助手**（`assistant.*`，同 Friday 的 AssistantRuntime / WorldBoard / Triage / TurnBrief，Friday 仓库 qt/docs/ASSISTANT.md）：在常驻那份里，
   默认关，设置里打开（`assistant.settings.update {enabled}`）。客户端的助手页看这台时看的就是它。
   - **脑子是 EDITH**：一段藏起来的「助手」会话（默认工作目录的大脑里，`sessions.create` 带 `owner: "#assistant"`、会话列表不列，带助手的人设当专用系统提示
@@ -176,7 +179,11 @@ Friday 客户端 ──SSH──▶ edith-friday --attach（一条连接一个�
 
 ## 装上
 
-在要被连的那台机器上（没装 Friday 桌面版的；装了的客户端会先用桌面版自带的服务端）装好 EDITH，配好模型，一条命令：
+**最省事**：Friday 客户端 2.83 起添加远程机器时「服务端」选 EDITH（默认是 Friday 服务端），连接时客户端自动把 EDITH 和 edith-friday
+装到那台的 `~/.edith/bin/`（Windows：`%USERPROFILE%\.edith\bin\`），之后有新版自动升级（Friday 仓库 qt/docs/REMOTE.md §9「EDITH 当服务端」）；
+连上后在 设置 › 模型 里给那台配模型。
+
+也可以在要被连的那台机器上自己装（给选了 Friday 服务端、但那台没装 Friday 桌面版的；装了的客户端会先用桌面版自带的服务端）：装好 EDITH，配好模型，一条命令：
 
 ```bash
 edith friday install        # 下载 edith-friday、装成 ~/.friday-server/bin/friday-server，edith 自己拷一份到旁边

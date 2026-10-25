@@ -4884,6 +4884,8 @@ static SERVING: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(H
 static TURNS: LazyLock<Mutex<HashSet<(String, String)>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 /// 网关要搬文件存放位置（serve.exit）：收好退出
 static SERVE_EXIT: AtomicBool = AtomicBool::new(false);
+/// 新版本的网关请这份退出（serve.retire：升级过 edith-friday）
+static SERVE_RETIRE: AtomicBool = AtomicBool::new(false);
 
 /// 推一条通知给这几个网关（终端的输出给开了、接着它的）
 fn notify_clients(names: &[String], method: &str, params: Value) {
@@ -5237,6 +5239,11 @@ fn serve_request(client: &str, method: &str, params: &Value) -> Reply {
     let invalid = |message: String| (-32602, message);
     match method {
         "ping" => Ok(json!({})),
+        // 新版本的网关（升级过 edith-friday）：这份退出，它起新的
+        "serve.retire" => {
+            SERVE_RETIRE.store(true, Ordering::Relaxed);
+            Ok(json!({}))
+        }
         "attach" => serve_attach(params, Duration::from_secs(15)).map(|_| json!({})).map_err(|error| (NOT_FOUND, error)),
         // 内置终端：伪终端跑 shell，网关断了照常跑
         "terminals.list" | "terminals.open" | "terminals.attach" | "terminals.detach" | "terminals.write" | "terminals.resize"
@@ -5435,7 +5442,8 @@ fn serve() -> Result<(), String> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|error| error.to_string())?;
     let address = listener.local_addr().map_err(|error| error.to_string())?.to_string();
     let token = uuid::Uuid::new_v4().simple().to_string();
-    let entry = json!({ "pid": std::process::id(), "version": VERSION, "address": address, "token": token,
+    let (exe, build) = own_build();
+    let entry = json!({ "pid": std::process::id(), "version": VERSION, "address": address, "token": token, "exe": exe, "build": build,
         "started": chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false) });
     let registered = serve_registry();
     std::fs::write(&registered, serde_json::to_string_pretty(&entry).unwrap()).map_err(|error| error.to_string())?;
@@ -5481,6 +5489,10 @@ fn serve() -> Result<(), String> {
         std::thread::sleep(Duration::from_secs(1));
         if SERVE_EXIT.load(Ordering::Relaxed) {
             serve_log("serve", "网关要搬文件存放位置，退出");
+            break;
+        }
+        if SERVE_RETIRE.load(Ordering::Relaxed) {
+            serve_log("serve", "新版本的网关来了，退出换新的");
             break;
         }
         // 命令文件加了、改了、删了：大脑那边 use_command 的清单跟着换
@@ -5574,6 +5586,86 @@ fn serve_entry() -> Option<Value> {
     let entry = read_json_file(&serve_registry());
     let address = entry["address"].as_str()?.parse().ok()?;
     TcpStream::connect_timeout(&address, Duration::from_millis(500)).is_ok().then_some(entry)
+}
+
+/// 版本号 a 比 b 旧（0.9.0 < 0.10.0）
+fn version_older(a: &str, b: &str) -> bool {
+    let parse =
+        |text: &str| text.trim().trim_start_matches('v').split('.').map(|part| part.parse::<u64>().unwrap_or(0)).collect::<Vec<_>>();
+    !a.trim().is_empty() && parse(a) < parse(b)
+}
+
+/// 这个程序文件和它现在的样子（修改时间、大小）：常驻那份记进 serve.json，网关拿来看它是不是旧的（换过包、同一版的补丁号工程版本不变）
+fn own_build() -> (String, String) {
+    let exe = std::env::current_exe().ok().and_then(|path| path.canonicalize().ok()).unwrap_or_default();
+    let build = std::fs::metadata(&exe)
+        .ok()
+        .map(|meta| {
+            let modified = meta
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|age| age.as_secs())
+                .unwrap_or(0);
+            format!("{modified}-{}", meta.len())
+        })
+        .unwrap_or_default();
+    (exe.to_string_lossy().into_owned(), build)
+}
+
+/// 开着的常驻那份是旧的——同一个程序文件后来换过（升级了 edith-friday），或者它的版本比这个网关旧：请它退出（0.10 起认 serve.retire；
+/// 更旧的按 pid 结束），等它退了回 true。别的拷贝起的、不比这个旧的不动（免得两份来回踢）
+fn retire_old_hub(entry: &Value) -> bool {
+    let theirs = entry["version"].as_str().unwrap_or("");
+    let (exe, build) = own_build();
+    let replaced =
+        !build.is_empty() && entry["exe"].as_str() == Some(exe.as_str()) && entry["build"].as_str().is_some_and(|theirs| theirs != build);
+    if !replaced && !version_older(theirs, VERSION) {
+        return false;
+    }
+    log(&format!("常驻的那份是旧的（{theirs}{}，这个网关 {VERSION}）：请它退出，换新的", if replaced { "，程序换过" } else { "" }));
+    let asked = (|| -> Result<(), String> {
+        let address = entry["address"].as_str().unwrap_or("").parse().map_err(|_| "地址不对".to_string())?;
+        let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(3)).map_err(|error| error.to_string())?;
+        stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        writeln!(stream, "{}", json!({ "jsonrpc": "2.0", "method": "auth", "params": { "token": entry["token"] } }))
+            .map_err(|error| error.to_string())?;
+        writeln!(stream, "{}", json!({ "jsonrpc": "2.0", "id": 1, "method": "serve.retire", "params": {} }))
+            .map_err(|error| error.to_string())?;
+        let mut reader = BufReader::new(stream);
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).map_err(|error| error.to_string())? == 0 {
+                return Err("断了".into());
+            }
+            let reply: Value = serde_json::from_str(&line).unwrap_or_default();
+            if reply["id"] == json!(1) {
+                return if reply.get("error").is_some() {
+                    Err(reply["error"]["message"].as_str().unwrap_or("").to_string())
+                } else {
+                    Ok(())
+                };
+            }
+        }
+    })();
+    if let Err(error) = asked
+        && let Some(pid) = entry["pid"].as_u64()
+    {
+        log(&format!("旧版的常驻那份不认 serve.retire（{error}）：结束它（pid {pid}）"));
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(pid as i32, libc::SIGTERM);
+        }
+        #[cfg(windows)]
+        {
+            let _ = std::process::Command::new("taskkill").args(["/PID", &pid.to_string(), "/F"]).output();
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while serve_entry().is_some_and(|current| current["pid"] == entry["pid"]) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    true
 }
 
 /// 在后台起常驻的那份（脱离这次 SSH：网关退了它还在）
@@ -5676,21 +5768,24 @@ fn hub() -> Result<Arc<Brain>, String> {
     if let Some(hub) = HUB.lock().unwrap().clone() {
         return Ok(hub);
     }
-    let entry = match serve_entry() {
-        Some(entry) => entry,
-        None => {
-            spawn_serve()?;
-            let deadline = Instant::now() + Duration::from_secs(20);
-            loop {
-                if let Some(entry) = serve_entry() {
-                    break entry;
-                }
-                if Instant::now() >= deadline {
-                    return Err(format!("常驻的那份没起来（日志在 {}）", serve_dir().join("serve.log").display()));
-                }
-                std::thread::sleep(Duration::from_millis(100));
+    let start = || -> Result<Value, String> {
+        spawn_serve()?;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(entry) = serve_entry() {
+                return Ok(entry);
             }
+            if Instant::now() >= deadline {
+                return Err(format!("常驻的那份没起来（日志在 {}）", serve_dir().join("serve.log").display()));
+            }
+            std::thread::sleep(Duration::from_millis(100));
         }
+    };
+    let entry = match serve_entry() {
+        // 升级过 edith-friday、旧版的那份还开着（开着助手时它不会闲退）：请它退出，换新的
+        Some(entry) if retire_old_hub(&entry) => start()?,
+        Some(entry) => entry,
+        None => start()?,
     };
     let address = entry["address"].as_str().unwrap_or("");
     let mut stream = TcpStream::connect(address).map_err(|error| format!("连不上常驻的那份：{error}"))?;
