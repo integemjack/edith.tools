@@ -28,7 +28,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Seek, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -59,10 +59,15 @@ fn user_home() -> PathBuf {
     std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// EDITH 的数据根：EDITH_HOME；没指时默认位置（~/.edith）的 storage.json 里换过位置就用换过的（设置 › 文件存放位置）
 fn edith_home() -> PathBuf {
     match std::env::var_os("EDITH_HOME") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => user_home().join(".edith"),
+        _ => {
+            let default = user_home().join(".edith");
+            let root = read_json_file(&default.join("storage.json"))["root"].as_str().map(str::trim).unwrap_or("").to_string();
+            if root.is_empty() { default } else { PathBuf::from(root) }
+        }
     }
 }
 
@@ -1707,6 +1712,8 @@ struct State {
     loops: bool,
     /// 看过提示词文件（prompts.*，设置 › 自我改进）：之后推 prompts 事件
     prompts: bool,
+    /// 看过文件存放位置（storage.*）：之后推 storage 事件（搬模型的进度）
+    storage: bool,
     /// 常驻那份开着的终端（TerminalInfo 们）、浏览器（BrowserState；还没连上它时是 None）
     terminals: Vec<Value>,
     browser: Option<Value>,
@@ -3704,7 +3711,7 @@ fn server_info() -> Value {
 
 /// 做了的（客户端只用报了的）；本地能力、本地模型、用户音色在常驻的那份里
 fn features() -> Vec<&'static str> {
-    let mut list = vec!["mkdir", "submitFrom", "activity", "assistant", "config", "memory", "memorySearch", "commands"];
+    let mut list = vec!["mkdir", "submitFrom", "activity", "assistant", "config", "memory", "memorySearch", "commands", "storage"];
     if serve_mode() != "off" {
         list.extend(["powers", "models", "userVoices", "loops", "hooks", "plugins", "prompts"]);
     }
@@ -4369,7 +4376,17 @@ fn handle(method: &str, params: &Value) -> Reply {
         "assistant.channels.list" => Ok(json!({ "channels": [] })),
         method if method.starts_with("assistant.") => Err((NOT_ALLOWED, "这台的 EDITH 没有助手：助手开在客户端那台上".into())),
         method if method.starts_with("term.") => terminal_request(method, params),
-        method if ["powers.", "models.", "loops.", "hooks.", "plugins.", "prompts."].iter().any(|prefix| method.starts_with(prefix)) => {
+        // 文件存放位置：重启（搬）在网关里；其余（看、量、登记、搬模型）在常驻那份（模型在它那里下、用），没有它时在这里
+        "storage.restart" => storage::restart(!STATE.lock().unwrap().generating.is_empty()),
+        method if method.starts_with("storage.") && serve_mode() == "off" => {
+            STATE.lock().unwrap().storage = true;
+            storage::handle(method, params)
+        }
+        method
+            if ["powers.", "models.", "loops.", "hooks.", "plugins.", "prompts.", "storage."]
+                .iter()
+                .any(|prefix| method.starts_with(prefix)) =>
+        {
             hub_forward(method, params)
         }
         method if method.starts_with("browser.") => browser_request(method, params),
@@ -4596,6 +4613,8 @@ static SERVED: LazyLock<Mutex<HashMap<String, Arc<Brain>>>> = LazyLock::new(|| M
 static SERVING: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 /// 在干活的（工作目录, 会话）：闲着不退
 static TURNS: LazyLock<Mutex<HashSet<(String, String)>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+/// 网关要搬文件存放位置（serve.exit）：收好退出
+static SERVE_EXIT: AtomicBool = AtomicBool::new(false);
 
 /// 推一条通知给这几个网关（终端的输出给开了、接着它的）
 fn notify_clients(names: &[String], method: &str, params: Value) {
@@ -4963,6 +4982,12 @@ fn serve_request(client: &str, method: &str, params: &Value) -> Reply {
         method if method.starts_with("capabilities.") => caps::request(method, params),
         method if method.starts_with("plugins.") => plugins::request(method, params),
         method if method.starts_with("prompts.") => prompt_files::request(method, params),
+        method if method.starts_with("storage.") => storage::handle(method, params),
+        // 网关要搬文件存放位置：收好退出
+        "serve.exit" => {
+            SERVE_EXIT.store(true, Ordering::Relaxed);
+            Ok(json!({}))
+        }
         // 用户这一轮打的命令放开的调用（allowed-tools）：一轮结束撤掉
         "commands.grant" => {
             let rules: Vec<String> =
@@ -5128,6 +5153,10 @@ fn serve() -> Result<(), String> {
     let mut commands_seen = (Instant::now(), commands::signature());
     loop {
         std::thread::sleep(Duration::from_secs(1));
+        if SERVE_EXIT.load(Ordering::Relaxed) {
+            serve_log("serve", "网关要搬文件存放位置，退出");
+            break;
+        }
         // 命令文件加了、改了、删了：大脑那边 use_command 的清单跟着换
         if commands_seen.0.elapsed() >= Duration::from_secs(5) {
             let now = commands::signature();
@@ -5263,6 +5292,7 @@ fn on_hub_message(hub: &Arc<Brain>, message: Value) {
         Some("models") if STATE.lock().unwrap().models => event("models", message["params"].clone()),
         Some("loops") if STATE.lock().unwrap().loops => event("loops", message["params"].clone()),
         Some("prompts") if STATE.lock().unwrap().prompts => event("prompts", message["params"].clone()),
+        Some("storage") if STATE.lock().unwrap().storage => event("storage", message["params"].clone()),
         // 脚本工具、能力提供方变了：设置页重列（另起线程：重列要问常驻那份，回话得靠这个线程读）
         Some("scripts") => {
             std::thread::spawn(|| config_changed(&["tools"]));
@@ -5394,6 +5424,9 @@ fn hub_forward(method: &str, params: &Value) -> Reply {
     }
     if method.starts_with("prompts.") {
         STATE.lock().unwrap().prompts = true;
+    }
+    if method.starts_with("storage.") {
+        STATE.lock().unwrap().storage = true;
     }
     if let Some((what, on)) = subscribe {
         let mut state = STATE.lock().unwrap();
@@ -7146,19 +7179,54 @@ mod models {
         std::env::var_os(name).filter(|value| !value.is_empty()).map(PathBuf::from)
     }
 
-    fn modelscope_root() -> PathBuf {
+    /// 魔搭 / HF 的默认缓存（别的程序也用）
+    pub fn default_modelscope_root() -> PathBuf {
         env_path("MODELSCOPE_CACHE").map(|dir| dir.join("models")).unwrap_or_else(|| home().join(".cache/modelscope/hub/models"))
     }
 
-    fn huggingface_root() -> PathBuf {
+    pub fn default_huggingface_root() -> PathBuf {
         env_path("HF_HUB_CACHE")
             .or_else(|| env_path("HF_HOME").map(|dir| dir.join("hub")))
             .unwrap_or_else(|| home().join(".cache/huggingface/hub"))
     }
 
-    /// 模型库的目录（魔搭、HF 两个缓存；friday-llm 的 --models）
+    /// 新下的放哪：设置 › 文件存放位置选了模型文件夹（或换了位置）时是它下面的，不然默认缓存
+    pub fn modelscope_target() -> PathBuf {
+        crate::storage::effective_models_dir().map(|dir| dir.join("modelscope").join("models")).unwrap_or_else(default_modelscope_root)
+    }
+
+    pub fn huggingface_target() -> PathBuf {
+        crate::storage::effective_models_dir().map(|dir| dir.join("huggingface").join("hub")).unwrap_or_else(default_huggingface_root)
+    }
+
+    /// 认模型的地方：新下的那里在前，默认缓存里下好的照样认
+    fn modelscope_roots() -> Vec<PathBuf> {
+        let (target, fallback) = (modelscope_target(), default_modelscope_root());
+        if target == fallback { vec![target] } else { vec![target, fallback] }
+    }
+
+    fn huggingface_roots() -> Vec<PathBuf> {
+        let (target, fallback) = (huggingface_target(), default_huggingface_root());
+        if target == fallback { vec![target] } else { vec![target, fallback] }
+    }
+
+    /// 魔搭仓库的目录：已经在哪就是哪，都没有放新下的那里
+    fn modelscope_repo(repo: &str) -> PathBuf {
+        modelscope_roots()
+            .into_iter()
+            .map(|root| root.join(repo))
+            .find(|dir| dir.is_dir())
+            .unwrap_or_else(|| modelscope_target().join(repo))
+    }
+
+    /// 模型库的目录（魔搭、HF 的缓存；friday-llm 的 --models）
     pub fn roots() -> Vec<PathBuf> {
-        vec![modelscope_root(), huggingface_root()]
+        modelscope_roots().into_iter().chain(huggingface_roots()).collect()
+    }
+
+    /// 设置 › 文件存放位置搬完模型：重列模型库
+    pub fn changed_after_move() {
+        std::thread::spawn(rescan);
     }
 
     #[derive(Clone, Copy, PartialEq, Debug)]
@@ -7193,7 +7261,7 @@ mod models {
         /// 仓库在本机的目录（HF 是 refs/main 指着的快照，没有就第一个）
         fn local_directory(self, repo: &str) -> PathBuf {
             match self {
-                Source::ModelScope => modelscope_root().join(repo),
+                Source::ModelScope => modelscope_repo(repo),
                 Source::HuggingFace => {
                     let root = hf_repo_dir(repo);
                     let snapshots = root.join("snapshots");
@@ -7216,7 +7284,12 @@ mod models {
     }
 
     fn hf_repo_dir(repo: &str) -> PathBuf {
-        huggingface_root().join(format!("models--{}", repo.replace('/', "--")))
+        let name = format!("models--{}", repo.replace('/', "--"));
+        huggingface_roots()
+            .into_iter()
+            .map(|root| root.join(&name))
+            .find(|dir| dir.is_dir())
+            .unwrap_or_else(|| huggingface_target().join(name))
     }
 
     /// 默认的下载源（`~/.edith/friday/settings.json` 的 downloadSource，没有用魔搭）
@@ -7647,22 +7720,32 @@ mod models {
 
     fn scan_local() -> Vec<LocalModel> {
         let mut result = Vec::new();
-        // 魔搭：<根>/<组织>/<仓库>
-        let root = modelscope_root();
-        for org in sorted_dirs(&root) {
-            for repo in sorted_dirs(&root.join(&org)) {
-                let dir = root.join(&org).join(&repo);
-                result.extend(inspect(&format!("{org}/{repo}"), Source::ModelScope, &dir, &dir));
+        // 魔搭：<根>/<组织>/<仓库>（选了模型文件夹时它和默认缓存都看，同一个仓库先找到的算）
+        let mut seen = HashSet::new();
+        for root in modelscope_roots() {
+            for org in sorted_dirs(&root) {
+                for repo in sorted_dirs(&root.join(&org)) {
+                    let id = format!("{org}/{repo}");
+                    if seen.insert(format!("ms:{}", id.to_lowercase())) {
+                        let dir = root.join(&org).join(&repo);
+                        result.extend(inspect(&id, Source::ModelScope, &dir, &dir));
+                    }
+                }
             }
         }
         // Hugging Face：<根>/models--组织--仓库/snapshots/<提交>
-        for entry in sorted_dirs(&huggingface_root()) {
-            let Some(rest) = entry.strip_prefix("models--") else { continue };
-            let Some((org, repo)) = rest.split_once("--") else { continue };
-            let id = format!("{org}/{repo}");
-            let snapshot = Source::HuggingFace.local_directory(&id);
-            if snapshot.is_dir() {
-                result.extend(inspect(&id, Source::HuggingFace, &snapshot, &hf_repo_dir(&id)));
+        for root in huggingface_roots() {
+            for entry in sorted_dirs(&root) {
+                let Some(rest) = entry.strip_prefix("models--") else { continue };
+                let Some((org, repo)) = rest.split_once("--") else { continue };
+                let id = format!("{org}/{repo}");
+                if !seen.insert(format!("hf:{}", id.to_lowercase())) {
+                    continue;
+                }
+                let snapshot = Source::HuggingFace.local_directory(&id);
+                if snapshot.is_dir() {
+                    result.extend(inspect(&id, Source::HuggingFace, &snapshot, &hf_repo_dir(&id)));
+                }
             }
         }
         result.sort_by_key(|model| std::cmp::Reverse(model.modified));
@@ -7697,7 +7780,7 @@ mod models {
         if !valid_repo(&repo) {
             return None;
         }
-        let ms = modelscope_root().join(&repo);
+        let ms = modelscope_repo(&repo);
         if let Some(found) = inspect(&repo, Source::ModelScope, &ms, &ms).into_iter().find(|model| id_matches(model, id)) {
             return Some(found);
         }
@@ -7807,7 +7890,7 @@ mod models {
             return Err(format!("仓库 {repo} 里没有要下的文件"));
         }
         let directory = match source {
-            Source::ModelScope => modelscope_root().join(repo),
+            Source::ModelScope => modelscope_repo(repo),
             Source::HuggingFace => {
                 // 快照目录：提交 sha 不好拿时沿用本地的 refs/main 或 main（Friday 的 HubDownloader 用第一跳的 X-Repo-Commit）
                 let root = hf_repo_dir(repo);
@@ -13099,6 +13182,724 @@ mod commands {
     }
 }
 
+mod storage {
+    //! 文件存放位置（设置 › 通用 › 文件存放位置，同 Friday 的 StorageLocation / ModelMover）：
+    //! - 这台的 EDITH 只有一个数据根（默认 `~/.edith`：会话、记忆、配置、提示词，常驻那份的本地能力 `friday/powers`、缓存 `friday/cache` 都在它下面），
+    //!   换位置 = 整个搬走。默认位置留一个 `storage.json`（`{root, pending?, models?}`）指过去，EDITH、网关、edith-connect、edith-websocket 都按它找；
+    //!   环境变量 EDITH_HOME（还有 FRIDAY_POWERS_DIR）指定了时不让换。
+    //! - 不在跑着的时候搬：设置里只登记 pending；「重启服务」时网关停掉常驻那份和这台闲着的大脑（有在干活的不搬），复制 → 核对 → 改 storage.json →
+    //!   删掉旧的，然后退出（客户端重连，新起的网关用新位置）。搬的时候默认位置有 `storage.moving`，新起的网关等它搬完。
+    //! - 模型：魔搭 / Hugging Face 缓存的布局（`<文件夹>/modelscope/models`、`<文件夹>/huggingface/hub`）。选了模型文件夹（models）时新下的放那；
+    //!   没选、换了位置时放 `<根>/friday/models`；都没有用默认缓存。默认缓存里下好的照样认，「搬过来」把里面 Friday 的模型（有 GGUF、没下完的）挪过去。
+
+    use std::path::{Path, PathBuf};
+    use std::sync::{LazyLock, Mutex};
+
+    use serde_json::{Value, json};
+
+    /// 默认位置（不看 storage.json）
+    pub fn default_home() -> PathBuf {
+        crate::user_home().join(".edith")
+    }
+
+    pub fn pointer_file() -> PathBuf {
+        default_home().join("storage.json")
+    }
+
+    fn pointer() -> Value {
+        crate::read_json_file(&pointer_file())
+    }
+
+    fn clean(path: &str) -> String {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            return String::new();
+        }
+        let mut text = trimmed.replace('\\', "/");
+        while text.len() > 1 && text.ends_with('/') && !text.ends_with(":/") {
+            text.pop();
+        }
+        text
+    }
+
+    fn text(value: &Value, key: &str) -> String {
+        clean(value.get(key).and_then(Value::as_str).unwrap_or(""))
+    }
+
+    /// 换过的根（空 = 默认位置）
+    pub fn root() -> String {
+        text(&pointer(), "root")
+    }
+
+    pub fn pending() -> Option<String> {
+        let value = pointer();
+        value.get("pending").map(|_| text(&value, "pending"))
+    }
+
+    /// 选了的模型文件夹（空 = 没选）
+    pub fn models_dir() -> String {
+        text(&pointer(), "models")
+    }
+
+    /// 实际的模型文件夹：选了的；没选、换了位置时 <根>/friday/models；都没有为 None（默认缓存）
+    pub fn effective_models_dir() -> Option<PathBuf> {
+        let models = models_dir();
+        if !models.is_empty() {
+            return Some(PathBuf::from(models));
+        }
+        let root = root();
+        (!root.is_empty()).then(|| Path::new(&root).join("friday").join("models"))
+    }
+
+    /// EDITH_HOME（还有 FRIDAY_POWERS_DIR）指定了位置
+    pub fn overridden() -> bool {
+        ["EDITH_HOME", "FRIDAY_POWERS_DIR"].iter().any(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()))
+    }
+
+    fn write_pointer(root: &str, pending: Option<&str>, models: Option<&str>) -> Result<(), String> {
+        let mut value = json!({});
+        if !root.is_empty() {
+            value["root"] = json!(root);
+        }
+        if let Some(pending) = pending {
+            value["pending"] = json!(pending);
+        }
+        let models = models.map(str::to_string).unwrap_or_else(models_dir);
+        if !models.is_empty() {
+            value["models"] = json!(models);
+        }
+        let _ = std::fs::create_dir_all(default_home());
+        crate::write_json_file(&pointer_file(), &value).map_err(|(_, error)| error)
+    }
+
+    fn native(path: &Path) -> String {
+        let text = path.to_string_lossy().into_owned();
+        if cfg!(windows) { text.replace('/', "\\") } else { text }
+    }
+
+    fn human(bytes: u64) -> String {
+        if bytes >= 1 << 30 { format!("{:.1} GB", bytes as f64 / (1u64 << 30) as f64) } else { format!("{} MB", (bytes >> 20).max(1)) }
+    }
+
+    /// 三个目录：数据（EDITH 的根）、缓存、本地能力
+    pub fn dirs_for(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        (root.to_path_buf(), root.join("friday").join("cache"), root.join("friday").join("powers"))
+    }
+
+    /// 规范化：还不存在的路径规范化存在的那一截再接上后面的（macOS 的 /var 是 /private/var 的链接）
+    fn resolved(path: &Path) -> PathBuf {
+        let mut existing = path.to_path_buf();
+        let mut rest = Vec::new();
+        while !existing.exists() {
+            match (existing.file_name().map(|name| name.to_os_string()), existing.parent()) {
+                (Some(name), Some(parent)) => {
+                    rest.push(name);
+                    existing = parent.to_path_buf();
+                }
+                _ => break,
+            }
+        }
+        let mut result = crate::canonical(&existing);
+        for name in rest.into_iter().rev() {
+            result.push(name);
+        }
+        result
+    }
+
+    fn same_or_inside(path: &Path, dir: &Path) -> bool {
+        let a = resolved(path).to_string_lossy().replace('\\', "/");
+        let b = resolved(dir).to_string_lossy().replace('\\', "/");
+        let (a, b) = if cfg!(windows) { (a.to_lowercase(), b.to_lowercase()) } else { (a, b) };
+        a == b || a.starts_with(&format!("{}/", b.trim_end_matches('/')))
+    }
+
+    /// 顶层不搬、不算的：storage.json（只在默认位置）、正在搬的标记、大脑的登记、常驻那份的登记和锁
+    fn skipped(relative: &str) -> bool {
+        matches!(relative, "storage.json" | "storage.moving" | "friday/serve.json" | "friday/serve.lock")
+            || relative.starts_with("instances/")
+    }
+
+    /// 一个目录下的普通文件（相对路径、正斜杠；不跟符号链接，链接本身算一项）；excluding 里套在它里面的不算
+    fn files_in(root: &Path, excluding: &[PathBuf]) -> Vec<(String, u64)> {
+        fn walk(dir: &Path, prefix: &str, skip: &[PathBuf], out: &mut Vec<(String, u64)>) {
+            let Ok(entries) = std::fs::read_dir(dir) else { return };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let relative = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
+                if skip.iter().any(|other| other == &path) {
+                    continue;
+                }
+                let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+                if meta.is_dir() {
+                    walk(&path, &relative, skip, out);
+                } else {
+                    out.push((relative, meta.len()));
+                }
+            }
+        }
+        let nested: Vec<PathBuf> = excluding.iter().filter(|other| other.as_path() != root && other.starts_with(root)).cloned().collect();
+        let mut files = Vec::new();
+        walk(root, "", &nested, &mut files);
+        files.retain(|(relative, _)| !skipped(relative));
+        files
+    }
+
+    fn size_of(root: &Path, excluding: &[PathBuf]) -> u64 {
+        files_in(root, excluding).iter().map(|(_, size)| size).sum()
+    }
+
+    fn free_space(path: &Path) -> Option<u64> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let text = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+            let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+            if unsafe { libc::statvfs(text.as_ptr(), &mut stat) } != 0 {
+                return None;
+            }
+            Some(stat.f_bavail as u64 * stat.f_frsize as u64)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            None
+        }
+    }
+
+    // MARK: 搬的时候
+
+    fn alive(pid: u64) -> bool {
+        #[cfg(unix)]
+        {
+            unsafe { libc::kill(pid as i32, 0) == 0 }
+        }
+        #[cfg(windows)]
+        {
+            std::process::Command::new("tasklist")
+                .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+                .output()
+                .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).contains(&pid.to_string()))
+        }
+    }
+
+    fn terminate(pid: u64) {
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(pid as i32, libc::SIGTERM);
+        }
+        #[cfg(windows)]
+        {
+            let _ = std::process::Command::new("taskkill").args(["/PID", &pid.to_string(), "/F"]).output();
+        }
+    }
+
+    fn marker() -> PathBuf {
+        default_home().join("storage.moving")
+    }
+
+    /// 网关起来时：另一个网关正在搬（重启服务那一下），等它搬完（最多半小时）
+    pub fn wait_for_move() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1800);
+        while std::time::Instant::now() < deadline {
+            let pid = crate::read_json_file(&marker())["pid"].as_u64();
+            match pid {
+                Some(pid) if pid != std::process::id() as u64 && alive(pid) => std::thread::sleep(std::time::Duration::from_secs(1)),
+                _ => return,
+            }
+        }
+    }
+
+    /// storage.restart（网关里）：停掉常驻那份和这台的大脑（有在干活的不搬），搬到登记的新位置，然后退出——客户端重连，新起的网关用新位置
+    pub fn restart(busy: bool) -> crate::Reply {
+        if pending().is_none() {
+            return Err((crate::NOT_ALLOWED, "没有要搬的：先选一个新位置".into()));
+        }
+        if busy || crate::models::busy() || MOVE.lock().unwrap()["active"].as_bool() == Some(true) {
+            return Err((crate::NOT_ALLOWED, "有会话在干活、模型在下或在搬：等它做完再搬".into()));
+        }
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let _ = crate::write_json_file(&marker(), &json!({ "pid": std::process::id() }));
+            let wait = |done: &dyn Fn() -> bool| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+                while !done() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            };
+            // 常驻的那份：请它收好退出
+            if let Some(hub) = crate::HUB.lock().unwrap().clone() {
+                let _ = hub.request("serve.exit", json!({}), std::time::Duration::from_secs(10));
+            }
+            let hub = crate::read_json_file(&crate::serve_dir().join("serve.json"))["pid"].as_u64();
+            wait(&|| hub.is_none_or(|pid| !alive(pid)));
+            // 这台的大脑：按登记的进程号停掉（会话是只追加的存档，停在哪都不丢）
+            let pids: Vec<u64> = crate::registry().iter().filter_map(|entry| entry["pid"].as_u64()).collect();
+            for pid in &pids {
+                terminate(*pid);
+            }
+            wait(&|| pids.iter().all(|pid| !alive(*pid)));
+            match perform_pending() {
+                Ok(()) => crate::log(&format!("搬好了：{}", native(&crate::edith_home()))),
+                Err(error) => crate::log(&format!("没搬成，还用原来的位置：{error}")),
+            }
+            let _ = std::fs::remove_file(marker());
+            std::process::exit(0);
+        });
+        Ok(json!({}))
+    }
+
+    // MARK: 状态
+
+    /// 搬模型的进度（{active, done, total, to, error}；没搬过为空）
+    static MOVE: LazyLock<Mutex<Value>> = LazyLock::new(|| Mutex::new(json!({})));
+
+    pub fn state(with_leftovers: bool) -> Value {
+        let home = crate::edith_home();
+        let (data, cache, _) = dirs_for(&home);
+        let mut state = json!({
+            "dataDir": native(&data),
+            "cacheDir": native(&cache),
+            "powersDir": native(&crate::powers::root()),
+            "root": native(Path::new(&root())),
+            "overridden": overridden(),
+            "modelsDir": native(Path::new(&models_dir())),
+            "modelsEffective": effective_models_dir().map(|dir| native(&dir)).unwrap_or_default(),
+            "modelScopeDir": native(&crate::models::modelscope_target()),
+            "huggingFaceDir": native(&crate::models::huggingface_target()),
+            "canRestart": true,
+        });
+        if let Some(pending) = pending() {
+            state["pending"] = json!(native(Path::new(&pending)));
+        }
+        let movement = MOVE.lock().unwrap().clone();
+        if movement.as_object().is_some_and(|object| !object.is_empty()) {
+            state["modelsMove"] = movement;
+        }
+        if with_leftovers {
+            state["leftoverModels"] = leftovers();
+        }
+        state
+    }
+
+    fn changed() {
+        crate::notify_all_clients("storage", state(false));
+    }
+
+    /// storage.measure：各占多少
+    pub fn measure() -> Value {
+        let home = crate::edith_home();
+        let (data, cache, _) = dirs_for(&home);
+        let powers = crate::powers::root();
+        let all = vec![data.clone(), cache.clone(), powers.clone()];
+        let (data, cache, powers) = (size_of(&data, &all), size_of(&cache, &all), size_of(&powers, &all));
+        let total = data + cache + powers;
+        json!({ "data": data as f64, "cache": cache as f64, "powers": powers as f64, "total": total as f64,
+            "text": format!("数据 {} · 缓存 {} · 本地能力 {}，共 {}", human(data), human(cache), human(powers), human(total)) })
+    }
+
+    /// 选的文件夹 → 实际的根：空的（或还不存在）就直接用，否则在里面建一个 EDITH 子文件夹
+    fn root_for(folder: &str) -> String {
+        let path = clean(folder);
+        if path.is_empty() {
+            return path;
+        }
+        let empty = std::fs::read_dir(&path).map(|mut entries| entries.next().is_none()).unwrap_or(true);
+        if empty { path } else { format!("{path}/EDITH") }
+    }
+
+    /// storage.move：登记「重启时搬到 folder」（空 = 搬回默认）；不行回原因
+    pub fn request(folder: &str, usage: Option<u64>) -> Result<(), String> {
+        if overridden() {
+            return Err("现在的位置是环境变量（EDITH_HOME 等）指定的，不能在这里换".into());
+        }
+        let target = root_for(folder);
+        if !target.is_empty() && !Path::new(&target).is_absolute() {
+            return Err("要选一个完整的文件夹路径".into());
+        }
+        let now = root();
+        if clean(&target) == now {
+            return Err(if target.is_empty() { "已经在默认位置了".into() } else { "文件已经放在这里了".into() });
+        }
+        let from = if now.is_empty() { default_home() } else { PathBuf::from(&now) };
+        let to = if target.is_empty() { default_home() } else { PathBuf::from(&target) };
+        if same_or_inside(&to, &from) || same_or_inside(&from, &to) {
+            return Err(format!("新位置不能在现在的文件夹里面（{}）", native(&from)));
+        }
+        if !files_in(&to, &[]).is_empty() {
+            return Err(format!("{} 里已经有文件了：换一个空文件夹", native(&to)));
+        }
+        std::fs::create_dir_all(&to).map_err(|_| format!("建不了文件夹 {}", native(&to)))?;
+        let probe = to.join(".edith-write-test");
+        std::fs::write(&probe, b"").map_err(|_| format!("这个文件夹不能写（{}）", native(&to)))?;
+        let _ = std::fs::remove_file(&probe);
+        let total = usage.unwrap_or_else(|| size_of(&from, &[]));
+        if let Some(free) = free_space(&to)
+            && free < total + (200 << 20)
+        {
+            return Err(format!("空间不够：要 {}，{} 只剩 {}", human(total), native(&to), human(free)));
+        }
+        write_pointer(&now, Some(&target), None)
+    }
+
+    pub fn cancel() -> Result<(), String> {
+        write_pointer(&root(), None, None)
+    }
+
+    /// 重启时搬（网关停掉常驻那份和大脑以后调）：复制 → 核对 → 改 storage.json → 删掉旧的。失败回原因（待办取消，已复制的删掉，还用原来的）
+    pub fn perform_pending() -> Result<(), String> {
+        let Some(target) = pending() else { return Ok(()) };
+        let old = root();
+        let from = if old.is_empty() { default_home() } else { PathBuf::from(&old) };
+        let to = if target.is_empty() { default_home() } else { PathBuf::from(&target) };
+        let files = files_in(&from, &[]);
+        let fail = |reason: String| {
+            for (relative, _) in &files {
+                let _ = std::fs::remove_file(to.join(relative));
+            }
+            let _ = write_pointer(&old, None, None);
+            Err(reason)
+        };
+        for (relative, size) in &files {
+            let source = from.join(relative);
+            let destination = to.join(relative);
+            if let Some(parent) = destination.parent()
+                && std::fs::create_dir_all(parent).is_err()
+            {
+                return fail(format!("建不了文件夹 {}", native(parent)));
+            }
+            let meta = std::fs::symlink_metadata(&source).ok();
+            if meta.as_ref().is_some_and(|meta| meta.file_type().is_symlink()) {
+                #[cfg(unix)]
+                if let Ok(link) = std::fs::read_link(&source) {
+                    let _ = std::os::unix::fs::symlink(link, &destination);
+                }
+                continue;
+            }
+            if let Err(error) = std::fs::copy(&source, &destination) {
+                return fail(format!("复制 {} 出错（空间不够？）：{error}", native(&source)));
+            }
+            if std::fs::metadata(&destination).map(|meta| meta.len()).unwrap_or(0) != *size {
+                return fail(format!("{} 复制得不完整", native(&source)));
+            }
+        }
+        // 模型跟着位置走（没选模型文件夹）：原来 <旧根>/friday/models 在根里，复制过去了；原来在默认缓存的留着照样认（设置里能「搬过来」）
+        if let Err(error) = write_pointer(&target, None, None) {
+            return fail(error);
+        }
+        // 搬好了：旧的删掉（默认位置留着 storage.json）；停掉了的大脑、常驻那份的登记也删
+        for (relative, _) in &files {
+            let _ = std::fs::remove_file(from.join(relative));
+        }
+        let _ = std::fs::remove_dir_all(from.join("instances"));
+        for name in ["friday/serve.json", "friday/serve.lock"] {
+            let _ = std::fs::remove_file(from.join(name));
+        }
+        remove_empty_dirs(&from);
+        if from != default_home() {
+            let _ = std::fs::remove_dir(&from);
+        }
+        Ok(())
+    }
+
+    fn remove_empty_dirs(dir: &Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir()) {
+                remove_empty_dirs(&path);
+                let _ = std::fs::remove_dir(&path);
+            }
+        }
+    }
+
+    // MARK: 模型
+
+    struct Item {
+        from: PathBuf,
+        to: PathBuf,
+        bytes: u64,
+    }
+
+    fn tree_bytes(path: &Path) -> u64 {
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.is_dir() => {
+                std::fs::read_dir(path).into_iter().flatten().flatten().map(|entry| tree_bytes(&entry.path())).sum()
+            }
+            Ok(meta) if meta.is_file() => meta.len(),
+            _ => 0,
+        }
+    }
+
+    /// 仓库里有没有 Friday 的文件（GGUF、没下完的 .part / .incomplete）
+    fn has_friday_files(dir: &Path) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else { return false };
+        entries.flatten().any(|entry| {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            if std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir()) {
+                has_friday_files(&path)
+            } else {
+                name.ends_with(".gguf") || name.ends_with(".part") || name.ends_with(".incomplete")
+            }
+        })
+    }
+
+    fn subdirs(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| std::fs::symlink_metadata(entry.path()).is_ok_and(|meta| meta.is_dir()))
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// 从模型文件夹 from 搬到 to（None = 默认缓存）要搬哪些：源是默认缓存（别的程序也用）时只搬 Friday 的，源是自己的模型文件夹时全搬
+    fn plan(from: Option<&Path>, to: Option<&Path>) -> Vec<Item> {
+        let ms = |dir: Option<&Path>| {
+            dir.map(|dir| dir.join("modelscope").join("models")).unwrap_or_else(crate::models::default_modelscope_root)
+        };
+        let hf =
+            |dir: Option<&Path>| dir.map(|dir| dir.join("huggingface").join("hub")).unwrap_or_else(crate::models::default_huggingface_root);
+        let shared = from.is_none();
+        let mut items = Vec::new();
+        let (ms_from, ms_to) = (ms(from), ms(to));
+        if ms_from != ms_to {
+            for org in subdirs(&ms_from).into_iter().filter(|org| !org.starts_with('.')) {
+                for repo in subdirs(&ms_from.join(&org)) {
+                    let dir = ms_from.join(&org).join(&repo);
+                    if !shared || has_friday_files(&dir) {
+                        items.push(Item { to: ms_to.join(&org).join(&repo), bytes: tree_bytes(&dir), from: dir });
+                    }
+                }
+            }
+        }
+        let (hf_from, hf_to) = (hf(from), hf(to));
+        if hf_from != hf_to {
+            for entry in subdirs(&hf_from).into_iter().filter(|entry| entry.starts_with("models--")) {
+                let dir = hf_from.join(&entry);
+                if !shared || has_friday_files(&dir) {
+                    items.push(Item { to: hf_to.join(&entry), bytes: tree_bytes(&dir), from: dir });
+                }
+            }
+        }
+        items
+    }
+
+    /// 把 from 这棵树并进 to：目标里同样大小（或更大）的不再复制；符号链接照原样建
+    fn copy_tree(from: &Path, to: &Path, done: &mut u64, total: u64, progress: &mut dyn FnMut(u64, u64)) -> Result<(), String> {
+        let meta = std::fs::symlink_metadata(from).map_err(|_| format!("读不了 {}", native(from)))?;
+        if meta.file_type().is_symlink() {
+            if std::fs::symlink_metadata(to).is_err() {
+                let link = std::fs::read_link(from).map_err(|_| format!("读不了链接 {}", native(from)))?;
+                if let Some(parent) = to.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&link, to).map_err(|error| format!("建不了链接 {}：{error}", native(to)))?;
+                #[cfg(windows)]
+                std::fs::copy(from, to).map(|_| ()).map_err(|error| format!("复制不了 {}：{error}", native(from)))?;
+            }
+            return Ok(());
+        }
+        if meta.is_dir() {
+            std::fs::create_dir_all(to).map_err(|_| format!("建不了文件夹 {}", native(to)))?;
+            for entry in std::fs::read_dir(from).map_err(|_| format!("读不了 {}", native(from)))?.flatten() {
+                copy_tree(&entry.path(), &to.join(entry.file_name()), done, total, progress)?;
+            }
+            return Ok(());
+        }
+        let size = meta.len();
+        if std::fs::metadata(to).is_ok_and(|existing| existing.len() >= size) {
+            *done += size;
+            progress(*done, total);
+            return Ok(());
+        }
+        if let Some(parent) = to.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let temp = PathBuf::from(format!("{}.friday-moving", to.to_string_lossy()));
+        std::fs::copy(from, &temp).map_err(|error| format!("写 {} 出错（空间不够？）：{error}", native(to)))?;
+        if std::fs::metadata(&temp).map(|meta| meta.len()).unwrap_or(0) != size {
+            let _ = std::fs::remove_file(&temp);
+            return Err(format!("{} 复制得不完整", native(from)));
+        }
+        std::fs::rename(&temp, to).map_err(|error| format!("换不上 {}：{error}", native(to)))?;
+        *done += size;
+        progress(*done, total);
+        Ok(())
+    }
+
+    fn remove_tree(path: &Path) {
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.is_dir() => {
+                let _ = std::fs::remove_dir_all(path);
+            }
+            Ok(_) => {
+                let _ = std::fs::remove_file(path);
+            }
+            Err(_) => {}
+        }
+    }
+
+    /// 搬：同一个盘、目标还没有的直接改名；其余复制（并进去）再删原来的。中途失败把改了名的改回来
+    fn move_items(items: &[Item], progress: &mut dyn FnMut(u64, u64)) -> Result<(), String> {
+        let total: u64 = items.iter().map(|item| item.bytes).sum();
+        let mut done = 0;
+        progress(0, total);
+        let mut renamed: Vec<(PathBuf, PathBuf)> = Vec::new();
+        let mut copied: Vec<PathBuf> = Vec::new();
+        for item in items {
+            if std::fs::symlink_metadata(&item.from).is_err() {
+                continue;
+            }
+            if std::fs::symlink_metadata(&item.to).is_err() {
+                if let Some(parent) = item.to.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if std::fs::rename(&item.from, &item.to).is_ok() {
+                    renamed.push((item.from.clone(), item.to.clone()));
+                    done += item.bytes;
+                    progress(done, total);
+                    continue;
+                }
+            }
+            if let Err(error) = copy_tree(&item.from, &item.to, &mut done, total, progress) {
+                for (from, to) in renamed.iter().rev() {
+                    let _ = std::fs::rename(to, from);
+                }
+                return Err(error);
+            }
+            copied.push(item.from.clone());
+        }
+        for from in copied {
+            remove_tree(&from);
+        }
+        progress(total, total);
+        Ok(())
+    }
+
+    /// 自己的模型文件夹搬空了：删掉空的 modelscope / huggingface 目录和文件夹本身
+    fn remove_empty(dir: &Path) {
+        for path in
+            [dir.join("modelscope/models"), dir.join("modelscope"), dir.join("huggingface/hub"), dir.join("huggingface"), dir.to_path_buf()]
+        {
+            let _ = std::fs::remove_dir(path);
+        }
+    }
+
+    /// 默认缓存里还留着的 Friday 的模型（选了模型文件夹、换了位置时）
+    fn leftovers() -> Value {
+        let Some(current) = effective_models_dir() else { return json!({ "count": 0, "bytes": 0.0 }) };
+        let items = plan(None, Some(&current));
+        json!({ "count": items.len(), "bytes": items.iter().map(|item| item.bytes).sum::<u64>() as f64 })
+    }
+
+    fn check_models_dir(folder: &str) -> Result<(), String> {
+        let target = clean(folder);
+        if target.is_empty() {
+            return Ok(());
+        }
+        if !Path::new(&target).is_absolute() {
+            return Err("要选一个完整的文件夹路径".into());
+        }
+        std::fs::create_dir_all(&target).map_err(|_| format!("建不了文件夹 {}", native(Path::new(&target))))?;
+        let probe = Path::new(&target).join(".friday-write-test");
+        std::fs::write(&probe, b"").map_err(|error| format!("文件夹 {} 写不进去：{error}", native(Path::new(&target))))?;
+        let _ = std::fs::remove_file(probe);
+        Ok(())
+    }
+
+    /// 搬模型（工作线程；进度经 storage 事件）：先停掉本地大模型（在用模型文件），搬完记下选的文件夹
+    fn relocate(from: Option<PathBuf>, to: Option<PathBuf>, commit: Option<String>) {
+        *MOVE.lock().unwrap() =
+            json!({ "active": true, "done": 0.0, "total": 0.0, "to": to.as_deref().map(native).unwrap_or_default(), "error": "" });
+        changed();
+        std::thread::spawn(move || {
+            crate::powers::stop_all();
+            let items = plan(from.as_deref(), to.as_deref());
+            let mut last = std::time::Instant::now();
+            let outcome = move_items(&items, &mut |done, total| {
+                if last.elapsed() >= std::time::Duration::from_millis(250) || done >= total {
+                    last = std::time::Instant::now();
+                    {
+                        let mut movement = MOVE.lock().unwrap();
+                        movement["done"] = json!(done as f64);
+                        movement["total"] = json!(total as f64);
+                    }
+                    changed();
+                }
+            });
+            let outcome = outcome.and_then(|_| match &commit {
+                Some(folder) => write_pointer(&root(), pending().as_deref(), Some(folder)),
+                None => Ok(()),
+            });
+            if outcome.is_ok()
+                && let Some(from) = &from
+            {
+                remove_empty(from);
+            }
+            {
+                let mut movement = MOVE.lock().unwrap();
+                movement["active"] = json!(false);
+                movement["error"] = json!(outcome.err().unwrap_or_default());
+            }
+            crate::notify_all_clients("storage", state(true));
+            // 模型库跟着重列
+            crate::models::changed_after_move();
+        });
+    }
+
+    /// storage.*（重启在网关里：storage.restart）
+    pub fn handle(method: &str, params: &Value) -> crate::Reply {
+        let moving = || MOVE.lock().unwrap()["active"].as_bool() == Some(true);
+        match method {
+            "storage.get" => Ok(state(true)),
+            "storage.measure" => Ok(measure()),
+            "storage.move" => {
+                if moving() {
+                    return Err((crate::NOT_ALLOWED, "正在搬模型，搬完再换".into()));
+                }
+                let usage = params["usage"].as_f64().map(|bytes| bytes as u64);
+                request(params["folder"].as_str().unwrap_or(""), usage).map_err(|error| (-32602, error))?;
+                Ok(state(true))
+            }
+            "storage.cancel" => {
+                cancel().map_err(|error| (crate::NOT_ALLOWED, error))?;
+                Ok(state(true))
+            }
+            "storage.setModels" | "storage.adoptModels" => {
+                if moving() {
+                    return Err((crate::NOT_ALLOWED, "正在搬模型，搬完再换".into()));
+                }
+                if crate::models::busy() {
+                    return Err((crate::NOT_ALLOWED, "正在下模型：下完再搬".into()));
+                }
+                if method == "storage.adoptModels" {
+                    if let Some(current) = effective_models_dir() {
+                        relocate(None, Some(current), None);
+                    }
+                } else {
+                    let folder = clean(params["folder"].as_str().unwrap_or(""));
+                    check_models_dir(&folder).map_err(|error| (-32602, error))?;
+                    let target = if folder.is_empty() {
+                        let root = root();
+                        (!root.is_empty()).then(|| Path::new(&root).join("friday").join("models"))
+                    } else {
+                        Some(PathBuf::from(&folder))
+                    };
+                    relocate(effective_models_dir(), target, Some(folder));
+                }
+                Ok(state(false))
+            }
+            other => Err((-32601, format!("没有这个方法：{other}"))),
+        }
+    }
+}
+
 mod caps {
     //! 能力层（照 Friday 的 CapabilityRegistry + PowerBackend）：装好的本地能力是「本机」提供方（`power-<id>`）——本地语音能听录音、说话，
     //! friday-diffusion 能生图、生视频。智能体看到的是固定的几个工具（transcribe_audio、speak、generate_image、generate_video、check_job），
@@ -17259,6 +18060,8 @@ fn main() {
         log(&format!("不认识 {other}（edith-friday [--attach]：在标准输入 / 输出上讲 Friday 的远程协议）"));
         std::process::exit(2);
     }
+    // 另一个网关正在搬文件存放位置（重启服务）：等它搬完再开始
+    storage::wait_for_move();
     std::thread::spawn(flush_loop);
     // 别的客户端（或 edith run）新起的大脑：几秒看一次，连上
     std::thread::spawn(|| {

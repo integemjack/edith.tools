@@ -29,13 +29,20 @@ use serde_json::{Value, json};
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUSY: i64 = -32005;
 
+/// EDITH 的数据根：EDITH_HOME；没指时 ~/.edith（它的 storage.json 里换过位置就用换过的，同 EDITH）
 fn home() -> PathBuf {
     match std::env::var_os("EDITH_HOME") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
         _ => {
             let user =
                 std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).unwrap_or_else(|| ".".into());
-            user.join(".edith")
+            let default = user.join(".edith");
+            let pointer: serde_json::Value =
+                std::fs::read(default.join("storage.json")).ok().and_then(|data| serde_json::from_slice(&data).ok()).unwrap_or_default();
+            match pointer["root"].as_str().map(str::trim).filter(|root| !root.is_empty()) {
+                Some(root) => PathBuf::from(root),
+                None => default,
+            }
         }
     }
 }
