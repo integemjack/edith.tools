@@ -11,7 +11,8 @@ Friday 客户端 ──SSH──▶ edith-friday --attach（一条连接一个�
 ```
 
 **两份**：网关（`--attach`，一个客户端一条，客户端走了就退）只管翻译协议；Friday 专有、要一直在的放在**常驻的那份**
-（`edith-friday serve`，像 edith-connect 的设备服务：整台机器一个）——终端、浏览器、智能体的浏览器工具，之后的本地模型、定时任务、钩子、插件……
+（`edith-friday serve`，像 edith-connect 的设备服务：整台机器一个）——终端、浏览器、智能体的浏览器工具、本地能力和模型、定时任务、钩子、插件、
+能力提供方、实时语音、复盘和自我改进……
 大脑只给它开两个口子：模型地址和钩子（EDITH 的能力协议 §6.6、§6.7）。
 
 - **一条连接一个网关**：客户端断了网关就退出；要一直干的活在大脑里，断了照常跑。几个客户端各开一个网关，看到的是同一份。
@@ -75,7 +76,35 @@ Friday 客户端 ──SSH──▶ edith-friday --attach（一条连接一个�
   （「插件名-服务名」，带 `fridayPlugin` 标记）——停用、卸载时撤掉。插件的脚本工具只读。
 - **能力提供方**（`capabilities.*`）：装好的本地语音是「听录音、说话」的提供方，friday-diffusion 是「生图、生视频」的；智能体的 `transcribe_audio` / `speak` /
   `generate_image` / `generate_video` / `check_job` 是常驻那份的动作（有开着的提供方才给；生视频是异步任务，check_job 取回）。设置页能开关、关掉一项、改名、看任务。
-  结果存在 `~/.edith/friday/media/`。在线服务的提供方、提供方包（脚本提供方）还不支持。
+  结果存在 `~/.edith/friday/media/`。在线服务接入时它的看图 / 生图 / 听录音这些也是提供方（照 Friday 的在线提供方发请求）；提供方包（`.fridayprovider`，
+  脚本提供方）导入、导出、重测、删，脚本照 Friday 的格式跑。
+- **在线服务商**（`services.*`，设置 › 服务与密钥）：服务目录同 Friday，一个密钥一家服务；接入时对话模型进 EDITH 的 `config.json`、别的进能力提供方，
+  同一家第二个账号是「id#n」、密钥名 X_n，不在目录里的 OpenAI 兼容服务认成 custom-…；拉模型列表（`/models`），余额和套餐用量按接口地址认
+  （DeepSeek、Kimi、硅基流动、OpenRouter、智谱 / Z.ai、MiniMax、one-api / new-api 中转）。
+- **命令**（`commands.*`，输入框里的「/名字」）：同 Claude Code 的 slash commands（会话目录的 `.friday/commands/`、`.claude/commands/`，`~/.claude/commands/`，
+  `~/.edith/friday/commands/`，这台 Friday 的 Commands，插件的）；发给模型的是展开后的内容（$ARGUMENTS、!`命令`、model、allowed-tools 那一轮免确认），
+  对话里照旧显示用户打的。模型能用 `use_command` 自己调（`disable-model-invocation` 的除外）；现成的子智能体是大脑的（`subagent_type`）。
+- **提示词文件**（`prompts.*`）：EDITH 的 `~/.edith/Prompts` 是 git 仓库，文件一变停 1.5 秒自动提交；看历史、回滚、恢复成自带的（`.upstream/`）、
+  自动回滚的开关；评测现在的和上一版（见下面「复盘」）。
+- **文件存放位置**（`storage.*`）：整个数据根（默认 `~/.edith`）换位置，默认位置留 `storage.json` 指过去（EDITH、网关、edith-connect、edith-websocket 都按它找）；
+  「重启服务」时才搬（停掉常驻那份和闲着的大脑，复制、核对、改指向、删旧的）。模型文件夹单独选，默认缓存里的能「搬过来」。
+- **实时语音**（`voice.*`）：客户端只管麦克风和喇叭（`voice.feed` 进、`voice.audio` 出，16 位 PCM），听写、交给大脑、边写边念、插话都在常驻那份做——
+  连本地语音的两条实时 WebSocket（Friday.Powers 的 voice-protocol.md）。这台没有助手：说的话交给一段专门的「语音」会话（默认工作目录里，第一次说话时建，
+  记在 `settings.json` 的 `voice.conversation`，开头记一条「回复会被念出来、说口语」），回复的字边到边念。按住说话（`voice.held`）松开前攒着；
+  回话时开口压低音量（`voice.duck`），说完一句算插话：念的停下、客户端丢掉没放的（`voice.clearAudio`），这一步剩下的字不念，看到插话的下一步照常念；
+  「停」（`voice.interrupt`）停下大脑这一轮。一台同时一路：后开的接过来，原来那一路 `active` 变假、说明被谁接过去。
+- **复盘、内置钩子、自我改进**（同 Friday 的 MemoryLearner / BuiltinHooks / PromptEval / PromptImprover）：常驻那份收着全部会话的事件，每一轮记一条
+  （用户说的、提示词版本、停止 / 改了重发 / 重试 / 出错这些信号、读过的技能、查到的记忆、调了哪些工具、回答），存在 `~/.edith/friday/learn.json`。
+  - 内置钩子（`hooks.state` 的 `builtin` / `builtinModels`、`hooks.setBuiltin`，默认都开）：「会话第一条消息」附上记忆库和技能的目录（UserPromptSubmit 补的上下文，
+    界面上不显示）；「一轮结束」这段会话全部做完后，用选的模型（自动：快的）整理——记下 / 改掉 / 忘掉 EDITH 的记忆（`memory.json`，`source: auto:turn`）、
+    记经验、建 / 改技能（`~/.edith/skills/<名字>/`，标 `source: auto`、`status: 试用`），没整理成的试 3 次。
+  - 判定：一段对话交付后 12 小时没再说话判一次——几件事、追问几次（就是各提示词版本的一次交付率、追问率），用过的记忆、技能记成败，对不上的改掉、忘掉，
+    试用的技能帮上了转正、带偏了移到回收站，写了「怎样算做好」的收成评测题；判完开着自动回滚、现在的提示词比上一版明显差时回滚（friday-core 的规则）。
+    自动学的记忆、技能追问比平时多或 90 天没用上的归档 / 移到回收站。
+  - 评测（`prompts.evaluate`）：照那个版本的段拼主智能体的系统提示、不带工具作答，再对照「怎样算做好」打分。
+  - 自我改进（`improve.*`，默认关）：每天一次（或「现在找一次」）看最近没做好的段和题，诊断、改几段提示词（受保护的、工具参数的说明不给改），
+    评测不比现在的差才交给用户，采用才写进提示词文件、提交成一个版本；要改代码的在设好的源码目录开工作树（`~/.edith/friday/Improve/<id>`，分支
+    `improve/<id>`）交给一段会话做，做完核对改了哪些文件（碰了受保护的拦下），等用户推送或丢掉；改进者自己成绩差时改它自己的几段，采用后采用率掉了就退回。
 - **助手**：这台没有助手（EDITH 是大脑，助手开在客户端那台上）。客户端的助手看这台的会话走 `activity.*`（开始、跑命令、待确认、做完的简报）；
   助手页看这台时说没开，不说版本太旧。
 
@@ -137,15 +166,20 @@ cp edith ~/.friday-server/bin/                            # 或者 edith 在 PAT
 | 本地模型（特性 `models`） | `models.subscribe` / `unsubscribe` / `refresh` / `use` / `download` / `cancel` / `retry` / `dismiss` / `release` / `delete`、`models`、`modelsFailed` 事件 |
 | 定时任务（特性 `loops`） | 会话里的 `/loop …`、`loops.list` / `setPaused` / `runNow` / `remove`、`loops` 事件 |
 | 脚本工具 | `tools.scriptVersions` / `saveScript` / `testScript` / `rollback` / `createScript` / `deleteScript`、`tools.setEnabled` |
-| 钩子（特性 `hooks`） | `hooks.state` / `saveGlobal` / `trust` / `example` |
+| 钩子（特性 `hooks`）、内置钩子（特性 `builtinHooks`） | `hooks.state` / `saveGlobal` / `trust` / `example` / `setBuiltin` |
 | 插件（特性 `plugins`） | `plugins.list` / `inspectGithub` / `inspectData` / `update` / `install` / `discard` / `setEnabled` / `uninstall` |
-| 能力提供方 | `capabilities.setEnabled` / `setKindAllowed` / `setTitle` / `deleteJob` / `refreshAvailability` |
+| 能力提供方、提供方包 | `capabilities.setEnabled` / `setKindAllowed` / `setTitle` / `setOption` / `deleteJob` / `refreshAvailability` / `retest` / `import` / `export` / `deletePackage` |
+| 在线服务商（特性 `services`、`serviceOps`、`serviceUsage`） | `services.install` / `installCustom` / `apply` / `setEnabled` / `uninstall` / `fetchModels` / `usage` |
+| 命令（特性 `commands`） | `commands.list`，输入框里的「/名字 参数」 |
+| 提示词文件（特性 `prompts`） | `prompts.get` / `recheck` / `rollback` / `restoreBundled` / `setAutoRollback` / `evaluate`、`prompts` 事件 |
+| 文件存放位置（特性 `storage`） | `storage.get` / `measure` / `move` / `cancel` / `setModels` / `adoptModels` / `restart`、`storage` 事件 |
+| 实时语音（特性 `voice`） | `voice.start` / `stop` / `state` / `feed` / `held` / `interrupt` / `playing` / `played`、`voice.state` / `voice.audio` / `voice.clearAudio` / `voice.duck` 事件 |
+| 自我改进（特性 `improve`） | `improve.get` / `run` / `runSelf` / `setEnabled` / `setEngine` / `setRepository` / `accept` / `dismiss` / `push` / `discard`、`improve` 事件 |
 | 客户端的助手看这台（特性 `activity`、`assistant`） | `activity.subscribe` / `unsubscribe`、`activity` 事件、`assistant.status` |
 
 还不行的（回 `-32601` 没有，或错误 `4` 说明原因；`server.features` 不报，客户端就不显示）：
 
-- 自我改进、提示词文件、文件存放位置、内置钩子（`builtinHooks`）、命令（`commands`）；能力提供方里的在线服务和提供方包；
-  实时语音（`voice.*`：要这台开着助手，EDITH 是大脑，助手开在客户端那台上）。
+- 助手（`assistant.*` 的对话、渠道、通话）：EDITH 是大脑，助手开在客户端那台上；实时语音对着这台专门的「语音」会话说。
 - 任务模式（工作方式）只记下，EDITH 一律需要时派子智能体。
 - 要批准的事：没有客户端连着时大脑等能批准的连上来（最多 10 分钟，过了就不做）；要无人值守就选「完全」权限模式，
   或在 `~/.edith/config.json` 的 `permissions.allow` 里放开、用 `edith --auto`。
@@ -166,4 +200,6 @@ cd tools/friday && cargo test
 和真的 EDITH 一起跑的端到端（假模型；本地能力用本地索引里的假包，不在测试机上加载真的大模型——16 GB 的机器按显存开满上下文会把系统卡死）：
 本地能力装 / 停 / 关 / 卸载和 `model.endpoint`（`x_friday`、令牌）、真索引和魔搭的文件列表；定时任务的问答、到点、结果、`/loop done`；
 脚本工具的建 / 自测 / 回滚 / 开关 / 沙盒；钩子的四个时机和项目信任、插件的装 / 投到 EDITH / 停用 / 卸载；能力提供方的听写 / 合成 / 生图 / 生视频；
-智能体的浏览器工具（真 Chrome）。
+智能体的浏览器工具（真 Chrome）；命令的展开 / allowed-tools / use_command；提示词文件的历史 / 回滚 / 恢复；文件存放位置的搬；在线服务商的接入、
+模型列表、余额（假的服务）；实时语音（假的本地语音：听写把 PCM 当字、合成把字当 PCM）的说一句、按住说话、插话、叫停、接过去；
+复盘的第一条消息附目录、一轮结束整理、判定、评测、改进建议（评测比过才交、采用写进提示词、改代码开工作树交给会话、丢掉）。

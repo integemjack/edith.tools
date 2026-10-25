@@ -784,6 +784,8 @@ fn command_key(expanded: &str) -> String {
 }
 
 fn shown_user_text(text: &str) -> String {
+    // 用户发消息时的钩子（用户配的、内置的目录）补的上下文：接在后面存进了消息，不给人看
+    let text = text.split_once("\n\n[用户配的钩子补充的信息]\n").map_or(text, |(said, _)| said);
     if let Some((first, rest)) = text.split_once('\n')
         && first.starts_with('（')
         && first.ends_with('）')
@@ -1714,6 +1716,8 @@ struct State {
     prompts: bool,
     /// 看过文件存放位置（storage.*）：之后推 storage 事件（搬模型的进度）
     storage: bool,
+    /// 调过 improve.*（设置 › 自我改进）：之后推 improve 事件
+    improve: bool,
     /// 常驻那份开着的终端（TerminalInfo 们）、浏览器（BrowserState；还没连上它时是 None）
     terminals: Vec<Value>,
     browser: Option<Value>,
@@ -3227,18 +3231,25 @@ impl Brain {
 
     /// 发请求等回话（别拿着 STATE 的锁调：回话排在事件后面，处理事件要那把锁）
     fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
+        self.request_coded(method, params, timeout).map_err(|(_, message)| message)
+    }
+
+    /// 同 request，错误带着对方回的错误码（连接断了、等不到是 -32603）
+    fn request_coded(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, (i64, String)> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = mpsc::channel();
         self.pending.lock().unwrap().insert(id, sender);
         if !self.write(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })) {
-            return Err("和 EDITH 的连接断了".into());
+            return Err((-32603, "和 EDITH 的连接断了".into()));
         }
         match receiver.recv_timeout(timeout) {
             Ok(Ok(result)) => Ok(result),
-            Ok(Err(error)) => Err(error["message"].as_str().unwrap_or("EDITH 回了错误").to_string()),
+            Ok(Err(error)) => {
+                Err((error["code"].as_i64().unwrap_or(-32603), error["message"].as_str().unwrap_or("EDITH 回了错误").to_string()))
+            }
             Err(_) => {
                 self.pending.lock().unwrap().remove(&id);
-                Err(format!("EDITH 等了 {} 秒没回话", timeout.as_secs()))
+                Err((-32603, format!("EDITH 等了 {} 秒没回话", timeout.as_secs())))
             }
         }
     }
@@ -3736,6 +3747,8 @@ fn features() -> Vec<&'static str> {
             "serviceOps",
             "serviceUsage",
             "voice",
+            "improve",
+            "builtinHooks",
         ]);
     }
     list
@@ -3958,6 +3971,15 @@ fn submit(params: &Value) -> Reply {
     Ok(json!({}))
 }
 
+/// 告诉常驻那份（复盘）：用户改了消息重发、出错后点了重试（这件事被追问了一次）
+fn hub_signal(session: &str, signal: &str) {
+    if serve_mode() != "off"
+        && let Ok(hub) = hub()
+    {
+        hub.write(&json!({ "jsonrpc": "2.0", "method": "learn.signal", "params": { "session": session, "signal": signal } }));
+    }
+}
+
 fn busy(session: &Stored) -> Result<(), (i64, String)> {
     if STATE.lock().unwrap().generating.contains(&session.id) {
         return Err((NOT_ALLOWED, "这段会话在干活：先停下".into()));
@@ -3981,6 +4003,7 @@ fn branch_off(brain: &Brain, session: &Stored, replacing: &str) -> Result<(), (i
     let archive = request_on(brain, "sessions.fork", json!({ "id": session.id, "hidden": true }))?;
     let archive = archive["id"].as_str().unwrap_or("").to_string();
     request_on(brain, "sessions.truncate", json!({ "id": session.id, "keep": keep }))?;
+    hub_signal(&session.id, "edited");
     let (main, mut paths) = META.branches(&session.id);
     let next = paths.iter().map(|(_, rank)| *rank).chain([main]).max().unwrap_or(0) + 1;
     paths.push((archive.clone(), main));
@@ -4031,6 +4054,7 @@ fn retry(session: &Stored) -> Reply {
     let text = shown_user_text(&user_text(&session.history[index]));
     let brain = brain_for(&session.cwd).map_err(|error| (NOT_ALLOWED, error))?;
     request_on(&brain, "sessions.truncate", json!({ "id": session.id, "keep": index }))?;
+    hub_signal(&session.id, "retried");
     META.set_ended(&session.id, 0, "", false);
     // 那句附的图片（存档里记成 file://路径）照样带上
     let images: Vec<String> = session.history[index]["content"]
@@ -4423,7 +4447,7 @@ fn handle(method: &str, params: &Value) -> Reply {
             storage::handle(method, params)
         }
         method
-            if ["powers.", "models.", "loops.", "hooks.", "plugins.", "prompts.", "storage."]
+            if ["powers.", "models.", "loops.", "hooks.", "plugins.", "prompts.", "storage.", "improve."]
                 .iter()
                 .any(|prefix| method.starts_with(prefix)) =>
         {
@@ -4737,8 +4761,8 @@ fn serve_initialize() -> Value {
             "description": "Friday 的内置浏览器（用户在浏览器卡片里看得见、能一起操作）、定时任务、自定义脚本工具",
         },
         "actions": actions,
-        // text、stats：语音会话的回复边写边念、插话时哪段不念了（voice）
-        "receives": ["turn.started", "text", "stats", "done"],
+        // text、stats：语音会话的回复边写边念、插话时哪段不念了（voice）；input、tool、result：复盘记这一轮做了什么（learn）
+        "receives": ["turn.started", "input", "text", "tool", "result", "stats", "done"],
         "sessions": "all",
         "hooks": hooks::EVENTS,
         // 本地模型（power://llm）的真地址由这里给（能力协议 §6.6）
@@ -4860,6 +4884,15 @@ fn serve_brain_message(brain: &Arc<Brain>, message: Value, ready: &mut Option<Se
                 let params = &message["params"];
                 let event = params["hook_event_name"].as_str().unwrap_or("");
                 let mut reply = hooks::run(params).reply(event);
+                // 内置钩子「会话第一条消息」：附上记忆库和技能的目录（用户配的钩子拦下了就不用）
+                if event == "UserPromptSubmit" && reply.get("decision").is_none() {
+                    let catalog = learn::catalog(params["session_id"].as_str().unwrap_or(""), params["prompt"].as_str().unwrap_or(""));
+                    if !catalog.is_empty() {
+                        let context =
+                            reply["additionalContext"].as_str().map(|context| format!("{context}\n\n{catalog}")).unwrap_or(catalog);
+                        reply["additionalContext"] = json!(context);
+                    }
+                }
                 // 用户这一轮打的命令（allowed-tools）放开了的：免确认（钩子自己有主意的照钩子的）
                 if event == "PreToolUse"
                     && reply.get("permissionDecision").is_none()
@@ -4897,10 +4930,16 @@ fn serve_brain_message(brain: &Arc<Brain>, message: Value, ready: &mut Option<Se
             }
             match params["type"].as_str() {
                 Some("turn.started") => {
-                    TURNS.lock().unwrap().insert((brain.workspace.clone(), session));
+                    TURNS.lock().unwrap().insert((brain.workspace.clone(), session.clone()));
+                    learn::on_event(&session, params["turn"].as_str().unwrap_or(""), "turn.started", &params["data"]);
+                }
+                // 复盘要的：工作时的补充、调了哪些工具、结果
+                Some(kind @ ("input" | "tool" | "result")) => {
+                    learn::on_event(&session, params["turn"].as_str().unwrap_or(""), kind, &params["data"]);
                 }
                 Some("done") => {
                     TURNS.lock().unwrap().remove(&(brain.workspace.clone(), session.clone()));
+                    learn::on_event(&session, params["turn"].as_str().unwrap_or(""), "done", &params["data"]);
                     commands::clear_grants(&session);
                     loops::on_done(&session, params["turn"].as_str().unwrap_or(""), &params["data"]);
                     // 智能体这一轮开的网页：关掉（带 keep 的、正交给用户的留着）
@@ -5041,6 +5080,12 @@ fn serve_request(client: &str, method: &str, params: &Value) -> Reply {
         method if method.starts_with("storage.") => storage::handle(method, params),
         method if method.starts_with("services.") => services::request(method, params),
         method if method.starts_with("voice.") => voice::request(client, method, params),
+        method if method.starts_with("improve.") => learn::improve::request(method, params),
+        // 网关报的信号（改了重发、重试）：记在这段会话最近一次开口的那轮
+        "learn.signal" => {
+            learn::signal(params["session"].as_str().unwrap_or(""), params["signal"].as_str().unwrap_or(""));
+            Ok(json!({}))
+        }
         // 网关要搬文件存放位置：收好退出
         "serve.exit" => {
             SERVE_EXIT.store(true, Ordering::Relaxed);
@@ -5190,6 +5235,7 @@ fn serve() -> Result<(), String> {
     prompt_files::start();
     caps::IS_HUB.store(true, Ordering::Relaxed);
     caps::start();
+    learn::start();
     {
         let token = token.clone();
         std::thread::spawn(move || {
@@ -5241,6 +5287,7 @@ fn serve() -> Result<(), String> {
         }
     }
     serve_log("serve", "闲着没人用，退出");
+    learn::flush();
     pty::close_all();
     browser::stop();
     powers::stop_all();
@@ -5356,6 +5403,7 @@ fn on_hub_message(hub: &Arc<Brain>, message: Value) {
         Some("loops") if STATE.lock().unwrap().loops => event("loops", message["params"].clone()),
         Some("prompts") if STATE.lock().unwrap().prompts => event("prompts", message["params"].clone()),
         Some("storage") if STATE.lock().unwrap().storage => event("storage", message["params"].clone()),
+        Some("improve") if STATE.lock().unwrap().improve => event("improve", message["params"].clone()),
         // 脚本工具、能力提供方变了：设置页重列（另起线程：重列要问常驻那份，回话得靠这个线程读）
         Some("scripts") => {
             std::thread::spawn(|| config_changed(&["tools"]));
@@ -5489,7 +5537,11 @@ fn hub_forward(method: &str, params: &Value) -> Reply {
     } else {
         30
     };
-    let reply = hub.request(target, params.clone(), Duration::from_secs(wait)).map_err(|error| hub_error(&error))?;
+    // 常驻那份回的错误码原样给客户端（旧版本的那份只回 -32603：按说法认）
+    let reply = hub.request_coded(target, params.clone(), Duration::from_secs(wait)).map_err(|(code, error)| match code {
+        -32603 => hub_error(&error),
+        code => (code, error),
+    })?;
     // 调过 loops.*、prompts.* 的客户端之后收 loops、prompts 事件
     if method.starts_with("loops.") {
         STATE.lock().unwrap().loops = true;
@@ -5499,6 +5551,9 @@ fn hub_forward(method: &str, params: &Value) -> Reply {
     }
     if method.starts_with("storage.") {
         STATE.lock().unwrap().storage = true;
+    }
+    if method.starts_with("improve.") {
+        STATE.lock().unwrap().improve = true;
     }
     if let Some((what, on)) = subscribe {
         let mut state = STATE.lock().unwrap();
@@ -11333,6 +11388,9 @@ mod hooks {
             "hooks": hooks,
             "recent": RECORDS.lock().unwrap().clone(),
             "example": example(),
+            // 内置钩子（第一条消息附目录、一轮结束整理）和整理能选的模型
+            "builtin": crate::learn::builtin_list(),
+            "builtinModels": crate::learn::builtin_models(),
         })
     }
 
@@ -11394,6 +11452,10 @@ mod hooks {
                 Ok(state(&directory))
             }
             "hooks.example" => Ok(json!({ "text": example() })),
+            "hooks.setBuiltin" => {
+                crate::learn::set_builtin(params)?;
+                Ok(state(&directory))
+            }
             other => Err((-32601, format!("没有这个方法：{other}"))),
         }
     }
@@ -12145,7 +12207,7 @@ mod prompt_files {
     }
 
     /// 这台的 git（macOS 没装命令行工具时 /usr/bin/git 一调就弹安装框：先问 xcode-select）
-    fn find_git() -> Option<String> {
+    pub fn find_git() -> Option<String> {
         let path = std::env::var_os("PATH")?;
         let names: &[&str] = if cfg!(windows) { &["git.exe", "git.cmd"] } else { &["git"] };
         let git = std::env::split_paths(&path).flat_map(|dir| names.iter().map(move |name| dir.join(name))).find(|path| path.is_file())?;
@@ -12214,6 +12276,11 @@ mod prompt_files {
             let Ok(message) = serde_json::from_str::<Value>(line) else { return };
             match message["event"].as_str() {
                 Some("promptStore.state") => crate::notify_all_clients("prompts", state()),
+                // 采用的改进建议提交好了：记下新版本（看采用后的效果）
+                Some("promptStore.committed") => {
+                    let data = &message["data"];
+                    crate::learn::improve::committed(data["token"].as_str().unwrap_or(""), data["version"].as_str().unwrap_or(""));
+                }
                 // 核心请两端做的事：这里都不做（给了 git，不会请找 git）
                 Some("request") => {
                     if let Some(id) = message["request"].as_u64() {
@@ -12237,7 +12304,7 @@ mod prompt_files {
         settings()["prompts"]["autoRollback"].as_bool().unwrap_or(true)
     }
 
-    /// 设置页要的（同 Friday 的 promptsJson；评测还没有：没有题）
+    /// 设置页要的（同 Friday 的 promptsJson）
     pub fn state() -> Value {
         let store = prompt_store::state();
         let directory = store["directory"].as_str().map(|path| if cfg!(windows) { path.replace('/', "\\") } else { path.to_string() });
@@ -12251,25 +12318,23 @@ mod prompt_files {
             "lastError": store["lastError"],
             "autoRollback": auto_rollback(),
             "autoRollbackNote": settings()["prompts"]["autoRollbackNote"].as_str().unwrap_or(""),
-            "eval": eval_state(),
+            "eval": crate::learn::eval_state(),
         })
     }
 
-    /// 评测（还没有评测集：没有题）
-    fn eval_state() -> Value {
-        json!({ "caseCount": 0, "running": false, "progress": "", "runs": [], "lastError": "" })
-    }
-
-    pub fn request(method: &str, params: &Value) -> crate::Reply {
+    /// 用提示词之前：起来时还没有文件夹（EDITH 在这台还没跑过）、现在有了的开始看；EDITH 升级换了自带的先换上
+    pub fn ensure() {
         if prompt_store::state()["directory"].is_null() && directory().is_dir() {
-            // 起来时还没有文件夹（EDITH 在这台还没跑过）：现在有了，开始看
             *UPSTREAM.lock().unwrap() = None;
             sync_bundled();
             begin();
         } else {
-            // EDITH 升级换了自带的：先换上（恢复成自带的要用新的）
             sync_bundled();
         }
+    }
+
+    pub fn request(method: &str, params: &Value) -> crate::Reply {
+        ensure();
         match method {
             "prompts.get" => {}
             "prompts.recheck" => prompt_store::refresh(Some(find_git())),
@@ -12300,7 +12365,12 @@ mod prompt_files {
                     prompts["autoRollback"] = json!(value);
                 });
             }
-            "prompts.evaluate" => return Err((crate::NOT_ALLOWED, "还没有评测题（判过的事攒够了才有）".into())),
+            "prompts.evaluate" => {
+                if crate::learn::eval_running() {
+                    return Err((crate::NOT_ALLOWED, "评测正在跑".into()));
+                }
+                crate::learn::evaluate_current_and_previous();
+            }
             other => return Err((-32601, format!("没有这个方法：{other}"))),
         }
         // 刚排上的 git 活（回滚、恢复）先等一会儿：回的状态里就有新的历史
@@ -20583,6 +20653,3074 @@ mod voice {
     /// 有在用的语音（常驻那份闲着不退）
     pub fn active() -> bool {
         VOICE.lock().unwrap().is_some()
+    }
+}
+
+mod learn {
+    //! 复盘、内置钩子、评测、改进（同 Friday 的 MemoryLearner、BuiltinHooks、PromptEval、PromptImprover，Friday 仓库 qt/docs/MEMORY.md §3–§10、
+    //! HOOKS.md §7）：常驻那份收着这台全部会话的事件，每一轮记一条——用户说的、当时的提示词版本、信号（停止、改了重发、重试、出错）、
+    //! 读过的技能、查到 / 放进去的记忆、调了哪些工具、最后的回答。
+    //! - 内置钩子「会话第一条消息」（catalog）：用户发第一条消息时（UserPromptSubmit）附上记忆库和技能的目录（memory.catalog）；
+    //! - 内置钩子「一轮结束」（organize）：这段会话全部做完 1 秒后，用选的模型（自动：快的）整理还没整理的轮次（memory.organize）——
+    //!   记下 / 改掉 / 忘掉记忆，记经验，建 / 改技能（标「试用」）；没整理成的试 3 次；
+    //! - 判定：一段对话交付后 12 小时没再说话，判一次（memory.judge）：几件事、追问几次（判过的段就是提示词版本的指标）；用过的记忆、技能记成败，
+    //!   对不上的改掉、忘掉，试用的技能帮上了转正、带偏了移到回收站；写了「怎样算做好」的收成评测题；判完看要不要自动回滚提示词；
+    //!   追问比平时多、90 天没用上的自动学的记忆归档，自动建的技能移到回收站；
+    //! - 评测（prompts.evaluate）：照某个版本的段拼主智能体的系统提示，不带工具作答（eval.ask），再对照「怎样算做好」打分（eval.judge）；
+    //! - 改进（improve.*）：看最近没做好的段、没做好的题，诊断、改几段提示词（improve.diagnose / rewrite），评测不比现在的差才交给用户，
+    //!   用户采用才写进提示词文件；要改代码的在设好的源码目录开工作树（<常驻那份>/Improve/<id>，分支 improve/<id>）、交给一段会话做，
+    //!   做完核对改了哪些文件（碰了受保护的拦下），等用户推送或丢掉；改进者自己成绩差时改它自己的几段（improve.self），采用后采用率掉了就退回。
+    //!
+    //! 都存在 ~/.edith/friday/learn.json；记忆写 EDITH 的 memory.json（同 EDITH 的 memory.rs，多记 wins / losses），技能写 ~/.edith/skills
+    //! （自动建的头里标 source: auto、status: 试用）。
+
+    use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{LazyLock, Mutex};
+    use std::time::Duration;
+
+    use chrono::{DateTime, Utc};
+    use friday_core::{chooser, model_traits, prompt_history, prompt_store, prompts};
+    use serde_json::{Map, Value, json};
+
+    // MARK: - 存的（learn.json）
+
+    static DATA: LazyLock<Mutex<Value>> = LazyLock::new(|| Mutex::new(load()));
+    static DIRTY: AtomicBool = AtomicBool::new(false);
+
+    fn path() -> PathBuf {
+        crate::serve_dir().join("learn.json")
+    }
+
+    fn load() -> Value {
+        let mut data = crate::read_json_file(&path());
+        if !data.is_object() {
+            data = json!({});
+        }
+        for key in ["turns", "episodes", "cases", "runs", "proposals"] {
+            if !data[key].is_array() {
+                data[key] = json!([]);
+            }
+        }
+        for key in ["skills", "values"] {
+            if !data[key].is_object() {
+                data[key] = json!({});
+            }
+        }
+        data
+    }
+
+    fn with<T>(change: impl FnOnce(&mut Value) -> T) -> T {
+        let mut data = DATA.lock().unwrap();
+        let result = change(&mut data);
+        DIRTY.store(true, Ordering::Relaxed);
+        result
+    }
+
+    fn read<T>(look: impl FnOnce(&Value) -> T) -> T {
+        look(&DATA.lock().unwrap())
+    }
+
+    /// 改过的写回文件（每 2 秒、退出时）
+    pub fn flush() {
+        if DIRTY.swap(false, Ordering::Relaxed) {
+            let data = DATA.lock().unwrap().clone();
+            let _ = crate::write_json_file(&path(), &data);
+        }
+    }
+
+    fn value(key: &str) -> String {
+        read(|data| data["values"][key].as_str().unwrap_or("").to_string())
+    }
+
+    fn set_value(key: &str, text: &str) {
+        with(|data| data["values"][key] = json!(text));
+    }
+
+    fn list(key: &str) -> Vec<Value> {
+        read(|data| data[key].as_array().cloned().unwrap_or_default())
+    }
+
+    // MARK: - 小工具
+
+    fn stamp() -> String {
+        crate::iso(std::time::SystemTime::now())
+    }
+
+    fn parse_time(text: &str) -> Option<DateTime<Utc>> {
+        DateTime::parse_from_rfc3339(text).ok().map(|time| time.with_timezone(&Utc))
+    }
+
+    fn time_of(item: &Value, key: &str) -> Option<DateTime<Utc>> {
+        item[key].as_str().and_then(parse_time)
+    }
+
+    /// 本地时间「10-14 09:00」
+    fn local(time: Option<DateTime<Utc>>) -> String {
+        time.map(|time| time.with_timezone(&chrono::Local).format("%-m-%-d %H:%M").to_string()).unwrap_or_default()
+    }
+
+    fn text<'a>(item: &'a Value, key: &str) -> &'a str {
+        item[key].as_str().unwrap_or("")
+    }
+
+    fn number(item: &Value, key: &str) -> i64 {
+        item[key].as_i64().unwrap_or(0)
+    }
+
+    fn strings(item: &Value, key: &str) -> Vec<String> {
+        item[key].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect()
+    }
+
+    fn truncate(text: &str, limit: usize) -> String {
+        let text = text.trim();
+        if text.chars().count() <= limit {
+            return text.to_string();
+        }
+        text.chars().take(limit).collect::<String>() + "…"
+    }
+
+    fn simplified(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    fn short_id() -> String {
+        uuid::Uuid::new_v4().simple().to_string()[..8].to_string()
+    }
+
+    /// 回复里的 JSON 对象（前后可能有别的字、```json 包着）
+    fn json_in(reply: &str) -> Option<Map<String, Value>> {
+        let start = reply.find('{')?;
+        let end = reply.rfind('}')?;
+        if end <= start {
+            return None;
+        }
+        serde_json::from_str::<Value>(&reply[start..=end]).ok()?.as_object().cloned()
+    }
+
+    fn args(pairs: &[(&str, String)]) -> prompts::Args {
+        pairs.iter().map(|(name, value)| (name.to_string(), value.clone())).collect()
+    }
+
+    /// 一段提示词（这台还没有那段时为空：EDITH 还没在这台跑过）
+    fn prompt(key: &str, pairs: &[(&str, String)]) -> String {
+        crate::prompt_files::ensure();
+        if !prompts::contains(key, None) {
+            return String::new();
+        }
+        prompts::text(key, &args(pairs), None)
+    }
+
+    fn percent(rate: f64) -> String {
+        if rate < 0.0 { "—".into() } else { format!("{}%", (rate * 100.0).round() as i64) }
+    }
+
+    fn quiet_seconds() -> i64 {
+        std::env::var("EDITH_FRIDAY_LEARN_QUIET").ok().and_then(|text| text.parse().ok()).unwrap_or(12 * 3600)
+    }
+
+    /// 某段会话的项目键（同 EDITH 记忆的 project：工作区的路径，「/」分隔）
+    fn project_of(conversation: &str) -> String {
+        let cwd = crate::find_session(conversation).map(|stored| stored.cwd).filter(|cwd| !cwd.is_empty());
+        cwd.map(|cwd| crate::workspace_key(&cwd).replace('\\', "/")).unwrap_or_default()
+    }
+
+    fn notes_log(what: &str, notes: &[String]) {
+        if !notes.is_empty() {
+            crate::serve_log("learn", &format!("{what}：{}", notes.join("；")));
+        }
+    }
+
+    // MARK: - 词（同 Friday 的 MemoryStore::terms / rank：汉字两两一组，别的按词；按稀有程度加权）
+
+    fn is_cjk(c: char) -> bool {
+        matches!(c as u32, 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0x3040..=0x30FF | 0xAC00..=0xD7AF)
+    }
+
+    pub fn terms(text: &str) -> Vec<String> {
+        let mut list: Vec<String> = Vec::new();
+        let mut word = String::new();
+        let mut previous: Option<char> = None;
+        let flush = |word: &mut String, list: &mut Vec<String>| {
+            if word.chars().count() >= 2 || word.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                list.push(std::mem::take(word));
+            }
+            word.clear();
+        };
+        for c in text.to_lowercase().chars() {
+            if is_cjk(c) {
+                flush(&mut word, &mut list);
+                if let Some(before) = previous {
+                    list.push(format!("{before}{c}"));
+                }
+                previous = Some(c);
+                continue;
+            }
+            previous = None;
+            if c.is_alphanumeric() || c == '_' || c == '-' || c == '.' {
+                word.push(c);
+            } else {
+                flush(&mut word, &mut list);
+            }
+        }
+        flush(&mut word, &mut list);
+        let mut seen = HashSet::new();
+        list.retain(|term| seen.insert(term.clone()));
+        list
+    }
+
+    /// 文档按和 query 的相关度排（下标、分数，分高的在前；一个词都对不上的不要）
+    pub fn rank(query: &str, documents: &[String]) -> Vec<(usize, f64)> {
+        let wanted: HashSet<String> = terms(query).into_iter().collect();
+        if wanted.is_empty() {
+            return Vec::new();
+        }
+        let lists: Vec<Vec<String>> = documents.iter().map(|document| terms(document)).collect();
+        let mut df: HashMap<&str, usize> = HashMap::new();
+        for list in &lists {
+            for term in list {
+                *df.entry(term.as_str()).or_default() += 1;
+            }
+        }
+        let idf = |term: &str| (1.0 + lists.len() as f64 / df.get(term).copied().unwrap_or(1).max(1) as f64).ln();
+        let mut result: Vec<(usize, f64)> = lists
+            .iter()
+            .enumerate()
+            .filter_map(|(index, list)| {
+                let (mut have, mut total) = (0.0, 0.0);
+                for term in list {
+                    let weight = idf(term);
+                    total += weight;
+                    if wanted.contains(term) {
+                        have += weight;
+                    }
+                }
+                (have > 0.0 && total > 0.0).then_some((index, have / total))
+            })
+            .collect();
+        result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        result
+    }
+
+    // MARK: - 记忆库（EDITH 的 memory.json）
+
+    mod book {
+        use super::*;
+
+        static LOCK: Mutex<()> = Mutex::new(());
+
+        fn path() -> PathBuf {
+            crate::edith_home().join("memory.json")
+        }
+
+        pub fn items() -> Vec<Value> {
+            crate::read_json_file(&path())["items"].as_array().cloned().unwrap_or_default()
+        }
+
+        fn store(items: &[Value]) {
+            let _ = crate::write_json_file(&path(), &json!({ "items": items }));
+        }
+
+        pub fn active(item: &Value) -> bool {
+            text(item, "state") != "archived"
+        }
+
+        pub fn label(kind: &str) -> &'static str {
+            match kind {
+                "fact" => "事实",
+                "decision" => "决定",
+                "correction" => "纠正",
+                "experience" => "经验",
+                "habit" => "习惯",
+                "routine" => "日常",
+                _ => "偏好",
+            }
+        }
+
+        fn kind_of(raw: &str) -> &'static str {
+            match raw.trim() {
+                "fact" => "fact",
+                "decision" => "decision",
+                "correction" => "correction",
+                "experience" => "experience",
+                _ => "preference",
+            }
+        }
+
+        /// 「- [偏好] 正文 [m1a2b]」
+        pub fn render(items: &[Value]) -> String {
+            items
+                .iter()
+                .map(|item| format!("- [{}] {} [{}]", label(text(item, "kind")), text(item, "text"), text(item, "id")))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        /// 目录里只列开头的：「[偏好] 提交用…」
+        pub fn title(item: &Value) -> String {
+            format!("[{}] {}", label(text(item, "kind")), truncate(&simplified(text(item, "text")), 18))
+        }
+
+        pub fn find(id: &str) -> Option<Value> {
+            let id = id.trim().trim_start_matches('[').trim_end_matches(']');
+            (!id.is_empty()).then(|| items().into_iter().find(|item| text(item, "id") == id)).flatten()
+        }
+
+        fn new_id(items: &[Value]) -> String {
+            loop {
+                let id = format!("m{}", &uuid::Uuid::new_v4().simple().to_string()[..4]);
+                if !items.iter().any(|item| text(item, "id") == id) {
+                    return id;
+                }
+            }
+        }
+
+        fn change(body: impl FnOnce(&mut Vec<Value>) -> bool) {
+            let _guard = LOCK.lock().unwrap();
+            let mut all = items();
+            if body(&mut all) {
+                store(&all);
+            }
+        }
+
+        /// 记一条（同一句话、同一个项目的已有那条不重记）；回记下了没有
+        pub fn add(kind: &str, words: &str, project: &str, source: &str) -> bool {
+            let words = words.trim();
+            if words.is_empty() {
+                return false;
+            }
+            let mut added = false;
+            change(|all| {
+                if all.iter().any(|item| active(item) && text(item, "text") == words && text(item, "project") == project) {
+                    return false;
+                }
+                let now = stamp();
+                all.push(json!({
+                    "id": new_id(all), "kind": kind_of(kind), "text": words, "project": project, "pinned": false, "source": source,
+                    "state": "active", "uses": 0, "created_at": now, "updated_at": now,
+                }));
+                added = true;
+                true
+            });
+            added
+        }
+
+        /// 改掉记错的那条（编号、常驻留着；计数清零）；回原来的字
+        pub fn replace(id: &str, kind: &str, words: &str, source: &str) -> Option<String> {
+            let mut before = None;
+            change(|all| {
+                let Some(item) = all.iter_mut().find(|item| text(item, "id") == id) else { return false };
+                if text(item, "text") == words.trim() {
+                    return false;
+                }
+                before = Some(text(item, "text").to_string());
+                item["text"] = json!(words.trim());
+                item["kind"] = json!(kind_of(kind));
+                item["source"] = json!(source);
+                item["state"] = json!("active");
+                item["wins"] = json!(0);
+                item["losses"] = json!(0);
+                item["updated_at"] = json!(stamp());
+                true
+            });
+            before
+        }
+
+        /// 归档；回原来的字（没有、已经归档了是 None）
+        pub fn archive(id: &str, reason: &str) -> Option<String> {
+            let mut archived = None;
+            change(|all| {
+                let Some(item) = all.iter_mut().find(|item| text(item, "id") == id && active(item)) else { return false };
+                archived = Some(text(item, "text").to_string());
+                item["state"] = json!("archived");
+                item["archived_at"] = json!(stamp());
+                item["archive_reason"] = json!(reason);
+                true
+            });
+            archived
+        }
+
+        /// 判定后的成败（所在那件事一次交付算成，被追问算没成）
+        pub fn outcomes(outcomes: &HashMap<String, (i64, i64)>) {
+            if outcomes.is_empty() {
+                return;
+            }
+            change(|all| {
+                for item in all.iter_mut() {
+                    if let Some((wins, losses)) = outcomes.get(text(item, "id")) {
+                        item["wins"] = json!(number(item, "wins") + wins);
+                        item["losses"] = json!(number(item, "losses") + losses);
+                    }
+                }
+                true
+            });
+        }
+
+        /// 用过了：uses + 1、记下时间
+        pub fn used(ids: &[String]) {
+            if ids.is_empty() {
+                return;
+            }
+            change(|all| {
+                let now = stamp();
+                for item in all.iter_mut().filter(|item| ids.iter().any(|id| id == text(item, "id"))) {
+                    item["uses"] = json!(number(item, "uses") + 1);
+                    item["last_used_at"] = json!(now);
+                }
+                true
+            });
+        }
+
+        /// 在用的、和 query 相关的（项目对得上或通用的），分高的在前；pinned 为假时常驻的不算（它们每轮都在）
+        pub fn scored(query: &str, project: &str, include_pinned: bool, min: f64) -> Vec<(Value, f64)> {
+            let base = super::baseline();
+            let all: Vec<Value> = items()
+                .into_iter()
+                .filter(|item| active(item) && (include_pinned || item["pinned"] != json!(true)))
+                .filter(|item| text(item, "project").is_empty() || project.is_empty() || text(item, "project") == project)
+                .collect();
+            let documents: Vec<String> = all.iter().map(|item| text(item, "text").to_string()).collect();
+            let mut scored: Vec<(Value, f64)> = rank(query, &documents)
+                .into_iter()
+                .map(|(index, relevance)| {
+                    let item = &all[index];
+                    let relevance = relevance + if !project.is_empty() && text(item, "project") == project { 0.1 } else { 0.0 };
+                    let weight = (1.0 + 2.0 * super::lift(number(item, "wins"), number(item, "losses"), base)).clamp(0.3, 2.0);
+                    (item.clone(), relevance, relevance * weight)
+                })
+                .filter(|(_, relevance, _)| *relevance >= min)
+                .map(|(item, _, score)| (item, score))
+                .collect();
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            scored
+        }
+
+        pub fn pinned(project: &str) -> Vec<Value> {
+            items()
+                .into_iter()
+                .filter(|item| active(item) && item["pinned"] == json!(true))
+                .filter(|item| text(item, "project").is_empty() || project.is_empty() || text(item, "project") == project)
+                .collect()
+        }
+
+        /// 自动学的：追问比平时多、90 天没用上的归档（用户写的、常驻的不动）
+        pub fn forget_stale(base: f64) -> Vec<String> {
+            let mut notes = Vec::new();
+            let now = Utc::now();
+            change(|all| {
+                let mut changed = false;
+                for item in all.iter_mut().filter(|item| active(item) && item["pinned"] != json!(true)) {
+                    if !text(item, "source").starts_with("auto") {
+                        continue;
+                    }
+                    let (wins, losses) = (number(item, "wins"), number(item, "losses"));
+                    let last = time_of(item, "last_used_at").or_else(|| time_of(item, "created_at"));
+                    let reason = if wins + losses >= super::MIN_JUDGED && super::lift(wins, losses, base) < super::ARCHIVE_LIFT {
+                        "放进去之后追问比平时多".to_string()
+                    } else if last.is_some_and(|last| (now - last).num_days() >= super::UNUSED_DAYS) {
+                        format!("{} 天没用上", super::UNUSED_DAYS)
+                    } else {
+                        continue;
+                    };
+                    notes.push(format!("归档了（{reason}）：{}", text(item, "text")));
+                    item["state"] = json!("archived");
+                    item["archived_at"] = json!(stamp());
+                    item["archive_reason"] = json!(reason);
+                    changed = true;
+                }
+                changed
+            });
+            notes
+        }
+    }
+
+    /// 判过的件数少时不可信：追问率和 0.3 按次数加权（同 Friday 的 MemoryStore::baseline）
+    fn baseline() -> f64 {
+        let recent = metrics(Utc::now() - chrono::Duration::days(30), None);
+        (recent.followups as f64 + 0.3 * 10.0) / (recent.deliveries as f64 + 10.0)
+    }
+
+    fn lift(wins: i64, losses: i64, baseline: f64) -> f64 {
+        let expected = 1.0 - baseline;
+        (wins as f64 + 4.0 * expected) / ((wins + losses) as f64 + 4.0) - expected
+    }
+
+    const MIN_JUDGED: i64 = 8;
+    const ARCHIVE_LIFT: f64 = -0.15;
+    const UNUSED_DAYS: i64 = 90;
+
+    // MARK: - 技能（~/.edith/skills；找的时候也看 Claude Code、Friday 的）
+
+    mod skills {
+        use super::*;
+
+        pub struct Skill {
+            pub name: String,
+            pub description: String,
+            pub file: PathBuf,
+            pub auto: bool,
+            pub trial: bool,
+        }
+
+        pub fn root() -> PathBuf {
+            crate::edith_home().join("skills")
+        }
+
+        fn roots() -> Vec<PathBuf> {
+            let mut roots = vec![root(), crate::commands::claude_dir().join("skills")];
+            if let Some(dir) = crate::commands::friday_data_dir() {
+                roots.push(dir.join("Skills"));
+            }
+            roots
+        }
+
+        fn field(header: &str, key: &str) -> String {
+            header
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("{key}:")))
+                .map(|value| value.trim().trim_matches('"').trim_matches('\'').to_string())
+                .unwrap_or_default()
+        }
+
+        fn header_and_body(content: &str) -> (String, String) {
+            match content.strip_prefix("---") {
+                Some(rest) => match rest.split_once("\n---") {
+                    Some((header, body)) => (header.to_string(), body.split_once('\n').map_or("", |(_, body)| body).to_string()),
+                    None => (String::new(), content.to_string()),
+                },
+                None => (String::new(), content.to_string()),
+            }
+        }
+
+        pub fn all() -> Vec<Skill> {
+            let mut seen = HashSet::new();
+            let mut list = Vec::new();
+            for dir in roots() {
+                for entry in crate::sorted_names(&dir) {
+                    let file = dir.join(&entry).join("SKILL.md");
+                    let Ok(content) = std::fs::read_to_string(&file) else { continue };
+                    let (header, _) = header_and_body(&content);
+                    let name = Some(field(&header, "name")).filter(|name| !name.is_empty()).unwrap_or(entry);
+                    if !seen.insert(name.clone()) {
+                        continue;
+                    }
+                    let auto = dir == root() && field(&header, "source") == "auto";
+                    list.push(Skill {
+                        description: field(&header, "description"),
+                        trial: auto && field(&header, "status") == "试用",
+                        auto,
+                        file,
+                        name,
+                    });
+                }
+            }
+            list
+        }
+
+        pub fn find(name: &str) -> Option<Skill> {
+            all().into_iter().find(|skill| skill.name == name)
+        }
+
+        /// 「- 名字（试用）：用途」
+        pub fn line(skill: &Skill) -> String {
+            let name = if skill.trial { format!("{}（试用）", skill.name) } else { skill.name.clone() };
+            let description = truncate(&simplified(&skill.description), 120);
+            if description.is_empty() { format!("- {name}") } else { format!("- {name}：{description}") }
+        }
+
+        pub fn search(query: &str, limit: usize) -> Vec<Skill> {
+            let mut all = all();
+            let documents: Vec<String> =
+                all.iter().map(|skill| format!("{} {}", skill.name.replace(['-', '_'], " "), skill.description)).collect();
+            let order: Vec<usize> = rank(query, &documents).into_iter().take(limit).map(|(index, _)| index).collect();
+            let mut picked: Vec<Option<Skill>> = all.drain(..).map(Some).collect();
+            order.into_iter().filter_map(|index| picked[index].take()).collect()
+        }
+
+        fn yaml(text: &str) -> String {
+            let line = simplified(text);
+            if line.is_empty()
+                || line.contains(": ")
+                || line.starts_with(['"', '\'', '#', '-', '[', '{', '>', '|', '*', '&', '!', '%', '@'])
+            {
+                serde_json::to_string(&line).unwrap_or_default()
+            } else {
+                line
+            }
+        }
+
+        fn compose(name: &str, description: &str, body: &str, trial: bool) -> String {
+            let body = if body.trim_start().starts_with("---") { header_and_body(body.trim()).1 } else { body.to_string() };
+            let status = if trial { "status: 试用\n" } else { "" };
+            format!(
+                "---\nname: {}\ndescription: {}\nsource: auto\n{status}---\n\n{}\n",
+                yaml(name),
+                yaml(description),
+                body.replace("\r\n", "\n").trim()
+            )
+        }
+
+        fn name_problem(name: &str) -> Option<String> {
+            if name.is_empty() {
+                return Some("技能名不能是空的".into());
+            }
+            if name.chars().count() > 64 {
+                return Some("技能名太长".into());
+            }
+            name.chars().any(|c| "/\\:*?\"<>|".contains(c) || c.is_control()).then(|| format!("技能名「{name}」里有不能用的字符"))
+        }
+
+        /// 整理建 / 改的技能：新的标试用；用户写的、别处来的不改。回说明和是不是新建的
+        pub fn save_auto(name: &str, description: &str, content: &str) -> Result<(String, bool), String> {
+            let name = name.trim();
+            if let Some(problem) = name_problem(name) {
+                return Err(problem);
+            }
+            if content.trim().is_empty() {
+                return Err("技能的内容是空的".into());
+            }
+            if let Some(existing) = find(name) {
+                if !existing.auto {
+                    return Err(format!("「{}」是用户自己的技能，自动整理不改它", existing.name));
+                }
+                let description = if description.trim().is_empty() { existing.description.clone() } else { description.to_string() };
+                std::fs::write(&existing.file, compose(&existing.name, &description, content, existing.trial))
+                    .map_err(|error| error.to_string())?;
+                return Ok((format!("改了技能「{}」", existing.name), false));
+            }
+            let file = root().join(name).join("SKILL.md");
+            std::fs::create_dir_all(file.parent().unwrap_or(&file)).map_err(|error| error.to_string())?;
+            std::fs::write(&file, compose(name, description, content, true)).map_err(|error| error.to_string())?;
+            Ok((format!("建了技能「{name}」（试用）"), true))
+        }
+
+        /// 试用的帮上了：转正
+        pub fn promote(name: &str) -> bool {
+            let Some(skill) = find(name).filter(|skill| skill.trial) else { return false };
+            let Ok(content) = std::fs::read_to_string(&skill.file) else { return false };
+            let (_, body) = header_and_body(&content);
+            std::fs::write(&skill.file, compose(&skill.name, &skill.description, &body, false)).is_ok()
+        }
+
+        /// 自动建的：移到回收站
+        pub fn remove(skill: &Skill) -> bool {
+            skill.auto && crate::move_to_trash(skill.file.parent().unwrap_or(&skill.file)).is_ok()
+        }
+    }
+
+    // MARK: - 内置钩子（设置 › 钩子；开关、整理用的模型记在 settings.json 的 builtinHooks）
+
+    fn hook_settings() -> Value {
+        crate::read_json_file(&crate::serve_dir().join("settings.json"))["builtinHooks"].clone()
+    }
+
+    pub fn hook_enabled(key: &str) -> bool {
+        hook_settings()[key].as_bool().unwrap_or(true)
+    }
+
+    fn organize_model() -> String {
+        hook_settings()["organizeModel"].as_str().unwrap_or("").to_string()
+    }
+
+    /// hooks.state 的 builtin：[{key, title, detail, eventTitle, usesModel, model, enabled}]
+    pub fn builtin_list() -> Value {
+        json!([
+            {
+                "key": "catalog", "title": "会话第一条消息：附记忆和技能的目录",
+                "detail": "会话的第一条消息后面附上记忆库里可能相关的：常驻的和把握大的给全文，其余只列开头，再带最相关的几个技能；要看全文由智能体用 search_memory、use_skill 自己找。之后的消息不再附。",
+                "eventTitle": "用户发消息", "usesModel": false, "model": "", "enabled": hook_enabled("catalog"),
+            },
+            {
+                "key": "organize", "title": "一轮结束：整理记忆、经验和技能",
+                "detail": "用户说一句话、智能体（含子智能体）全部做完之后，用选的模型在后台看一遍这一轮：记下新的偏好、事实、纠正和经验，改掉、忘掉记错的；有一套以后还会再做的做法就建成技能（标「试用」，帮上了转正，带偏了或 90 天没用上移到回收站）。",
+                "eventTitle": "一轮结束", "usesModel": true, "model": organize_model(), "enabled": hook_enabled("organize"),
+            },
+        ])
+    }
+
+    /// 选模型的菜单：第一项是「自动」，选的模型不在了留一项说明，后面是全部启用的对话模型
+    fn model_options(automatic: &str, selected: &str) -> Value {
+        let mut list = vec![json!({ "id": "", "title": automatic })];
+        let engines: Vec<Value> = pool().into_iter().filter(|(_, candidate)| candidate.is_chat).map(|(engine, _)| engine).collect();
+        if !selected.is_empty() && !engines.iter().any(|engine| engine["id"] == json!(selected)) {
+            list.push(json!({ "id": selected, "title": "选的模型已经不在了（用自动的）" }));
+        }
+        list.extend(
+            engines
+                .iter()
+                .map(|engine| json!({ "id": engine["id"], "title": format!("{} · {}", text(engine, "title"), text(engine, "model")) })),
+        );
+        Value::Array(list)
+    }
+
+    pub fn builtin_models() -> Value {
+        model_options("自动（子智能体可以用的模型里挑快的）", &organize_model())
+    }
+
+    /// hooks.setBuiltin：开 / 关一个内置钩子、给它选模型（空 = 自动）
+    pub fn set_builtin(params: &Value) -> Result<(), (i64, String)> {
+        let key = params["key"].as_str().unwrap_or("");
+        if !["catalog", "organize"].contains(&key) {
+            return Err((crate::NOT_FOUND, format!("没有内置钩子「{key}」")));
+        }
+        crate::update_serve_settings(|settings| {
+            let hooks = settings.entry("builtinHooks").or_insert_with(|| json!({}));
+            if !hooks.is_object() {
+                *hooks = json!({});
+            }
+            if let Some(enabled) = params["enabled"].as_bool() {
+                hooks[key] = json!(enabled);
+            }
+            if key == "organize"
+                && let Some(model) = params["model"].as_str()
+            {
+                hooks["organizeModel"] = json!(model);
+            }
+        });
+        Ok(())
+    }
+
+    // MARK: - 问模型（整理、判定、打分用快的；改进、作答用强的；设置里选了的用选的）
+
+    /// 这台启用的对话模型（档位、计费没写的按名字推断；不给子智能体用的不算）
+    fn pool() -> Vec<(Value, chooser::Candidate)> {
+        let config = crate::read_json_file(&crate::config_path());
+        let disallowed: Vec<String> = strings(&config, "disallowedSubAgentEngines");
+        crate::engines()
+            .into_iter()
+            .filter(|engine| engine["disabled"] != json!(true))
+            .map(|engine| {
+                let mut candidate = chooser::Candidate::from_json(&engine);
+                let model = text(&engine, "model").to_string();
+                if candidate.tier.is_empty() {
+                    candidate.tier = model_traits::infer_tier(&model).to_string();
+                }
+                if candidate.billing.is_empty() {
+                    candidate.billing = model_traits::infer_billing(text(&engine, "baseURL"), text(&engine, "title"), &model).to_string();
+                }
+                candidate.is_chat = model_traits::is_chat_model(&model);
+                candidate.usable = !disallowed.contains(&candidate.id);
+                (engine, candidate)
+            })
+            .collect()
+    }
+
+    /// 用哪个模型：chosen（设置里选的，还在的）→ 自动（strong：强的一档；不然快的）→ 默认的
+    fn engine(chosen: &str, strong: bool) -> Option<Value> {
+        let pool = pool();
+        if let Some((engine, _)) = pool.iter().find(|(engine, _)| !chosen.is_empty() && engine["id"] == json!(chosen)) {
+            return Some(engine.clone());
+        }
+        let candidates: Vec<chooser::Candidate> = pool.iter().map(|(_, candidate)| candidate.clone()).collect();
+        let index = if strong { chooser::pick(&candidates, "strong", None, false) } else { chooser::pick_light(&candidates) };
+        if let Some(index) = index {
+            return Some(pool[index].0.clone());
+        }
+        let engines = crate::engines();
+        let default = crate::default_engine_id(&engines);
+        engines.into_iter().find(|engine| engine["id"] == json!(default))
+    }
+
+    /// 问一次（不带工具、不流式）：回复的文字
+    fn complete(engine: &Value, system: &str, user: &str) -> Result<String, String> {
+        if user.trim().is_empty() {
+            return Err("这台还没有要用的提示词（EDITH 在这台跑过一次就有）".into());
+        }
+        let field = |key: &str| text(engine, key).to_string();
+        let model = field("model");
+        let mut base = field("baseURL");
+        let mut x_friday = None;
+        let key = if base.starts_with("power://") {
+            let point = crate::models::endpoint(&json!({ "baseURL": base, "model": model }))?;
+            base = text(&point, "baseURL").to_string();
+            x_friday = point["body"].get("x_friday").cloned();
+            text(&point, "apiKey").to_string()
+        } else if field("id") == crate::ENGINE_ID {
+            std::env::var("EDITH_API_KEY")
+                .ok()
+                .filter(|key| !key.is_empty())
+                .unwrap_or_else(|| text(&crate::read_json_file(&crate::config_path()), "apiKey").to_string())
+        } else {
+            let secret = field("apiKeySecret");
+            text(&crate::read_json_file(&crate::edith_home().join("secrets.json")), &secret).to_string()
+        };
+        if base.is_empty() || model.is_empty() {
+            return Err("没有可用的模型".into());
+        }
+        let history = [json!({ "role": "user", "content": user })];
+        let thinking = Some(field("thinking"))
+            .filter(|thinking| !thinking.is_empty())
+            .unwrap_or_else(|| friday_core::engines::inferred_thinking(&base, engine["sendsEnableThinking"] == json!(true)).to_string());
+        let mut body = friday_core::chat_request::request_body(&friday_core::chat_request::BodyOptions {
+            model,
+            instructions: system.to_string(),
+            history: &history,
+            temperature: 0.3,
+            base_url: base.clone(),
+            thinking,
+            extra_body: field("extraBody"),
+            x_friday,
+            ..Default::default()
+        });
+        if let Some(object) = body.as_object_mut() {
+            object.insert("stream".into(), json!(false));
+            object.remove("stream_options");
+        }
+        let url = crate::capnet::endpoint(&base, "chat/completions").map_err(|error| error.message)?;
+        let reply =
+            crate::capnet::json("POST", &url, &crate::capnet::bearer(Some(&key)), Some(&body), 600).map_err(|error| error.message)?;
+        let content = &reply["choices"][0]["message"]["content"];
+        let answer = match content {
+            Value::String(text) => text.clone(),
+            Value::Array(parts) => parts.iter().filter_map(|part| part["text"].as_str()).collect(),
+            _ => String::new(),
+        };
+        // 想的过程混在正文里的（<think>…</think>）去掉
+        let answer = match (answer.find("<think>"), answer.find("</think>")) {
+            (Some(start), Some(end)) if end > start => format!("{}{}", &answer[..start], &answer[end + "</think>".len()..]),
+            _ => answer,
+        };
+        if answer.trim().is_empty() {
+            return Err("模型没回内容".into());
+        }
+        Ok(answer.trim().to_string())
+    }
+
+    fn ask_light(system: &str, user: &str, chosen: &str) -> Result<String, String> {
+        let engine = engine(chosen, false).ok_or("没有可用的模型")?;
+        complete(&engine, system, user)
+    }
+
+    fn ask_strong(system: &str, user: &str) -> Result<String, String> {
+        let engine = engine(&value("improve.engine"), true).ok_or("没有可用的模型")?;
+        complete(&engine, system, user)
+    }
+
+    // MARK: - 每一轮（大脑的事件）
+
+    fn signal_text(signal: &str) -> &str {
+        match signal {
+            "stopped" => "用户按了停止",
+            "edited" => "用户改了这条消息重发",
+            "retried" => "出错后用户点了重试",
+            "failed" => "出错没做完",
+            other => other,
+        }
+    }
+
+    fn has_followup_signal(turn: &Value) -> bool {
+        strings(turn, "signals").iter().any(|signal| ["stopped", "edited", "retried", "failed"].contains(&signal.as_str()))
+    }
+
+    fn is_ask(turn: &Value) -> bool {
+        !text(turn, "request").trim().is_empty()
+    }
+
+    fn turn_mut<'a>(data: &'a mut Value, id: &str) -> Option<&'a mut Value> {
+        data["turns"].as_array_mut()?.iter_mut().rev().find(|turn| text(turn, "id") == id)
+    }
+
+    /// 大脑那边的事件（常驻那份收着全部会话的）
+    pub fn on_event(session: &str, turn: &str, kind: &str, data: &Value) {
+        if session.is_empty() || turn.is_empty() {
+            return;
+        }
+        match kind {
+            "turn.started" => {
+                // 用户说的才算「开口」（定时任务、子智能体交回的不算）；常驻的记忆每轮都在
+                let user = data["origin"]["kind"].as_str().unwrap_or("user") == "user";
+                let request = if user { truncate(data["text"].as_str().unwrap_or(""), 2000) } else { String::new() };
+                let used: Vec<String> = if user {
+                    book::pinned(&project_of(session)).iter().map(|item| text(item, "id").to_string()).collect()
+                } else {
+                    Vec::new()
+                };
+                crate::prompt_files::ensure();
+                let version = prompt_store::state()["version"].as_str().unwrap_or("").to_string();
+                with(|store| {
+                    if turn_mut(store, turn).is_some() {
+                        return;
+                    }
+                    if let Some(turns) = store["turns"].as_array_mut() {
+                        turns.push(json!({
+                            "id": turn, "conversation": session, "agent": "main", "startedAt": stamp(), "request": request,
+                            "promptVersion": version, "signals": [], "used": used, "skills": [], "activity": [],
+                        }));
+                    }
+                });
+            }
+            // 工作时用户补充的话：并进这一轮说的
+            "input" => {
+                if data["origin"]["kind"].as_str().unwrap_or("user") != "user" {
+                    return;
+                }
+                let added = data["text"].as_str().unwrap_or("").trim().to_string();
+                with(|store| {
+                    if let Some(entry) = turn_mut(store, turn).filter(|_| !added.is_empty()) {
+                        let request = text(entry, "request").to_string();
+                        entry["request"] =
+                            json!(truncate(&if request.is_empty() { added } else { format!("{request}\n（补充）{added}") }, 2000));
+                    }
+                });
+            }
+            "tool" => {
+                let name = data["name"].as_str().unwrap_or("");
+                let arguments = &data["arguments"];
+                let brief = ["path", "command", "url", "query", "name", "description"]
+                    .iter()
+                    .find_map(|key| arguments[*key].as_str())
+                    .map(|value| format!("：{}", truncate(&simplified(value), 80)))
+                    .unwrap_or_default();
+                let skill =
+                    (name == "use_skill").then(|| arguments["name"].as_str().unwrap_or("").to_string()).filter(|name| !name.is_empty());
+                with(|store| {
+                    let Some(entry) = turn_mut(store, turn) else { return };
+                    if let Some(skill) = skill
+                        && let Some(list) = entry["skills"].as_array_mut()
+                        && !list.contains(&json!(skill))
+                    {
+                        list.push(json!(skill));
+                    }
+                    if let Some(list) = entry["activity"].as_array_mut()
+                        && list.len() < 40
+                    {
+                        list.push(json!({ "id": data["id"], "line": format!("- {name}{brief}") }));
+                    }
+                });
+            }
+            "result" => {
+                let name = data["name"].as_str().unwrap_or("");
+                let found: Vec<String> = if name == "search_memory" {
+                    let pattern = regex::Regex::new(r"\[(m[0-9a-f]{4})\]").unwrap();
+                    pattern.captures_iter(data["text"].as_str().unwrap_or("")).map(|capture| capture[1].to_string()).collect()
+                } else {
+                    Vec::new()
+                };
+                let failed = data["ok"] == json!(false);
+                let lines = data["lines"].as_object().map(|lines| format!("（+{} −{}）", lines["added"], lines["removed"]));
+                with(|store| {
+                    let Some(entry) = turn_mut(store, turn) else { return };
+                    if let Some(list) = entry["used"].as_array_mut() {
+                        for id in &found {
+                            if !list.contains(&json!(id)) {
+                                list.push(json!(id));
+                            }
+                        }
+                    }
+                    if let Some(row) =
+                        entry["activity"].as_array_mut().and_then(|list| list.iter_mut().rev().find(|row| row["id"] == data["id"]))
+                    {
+                        let line =
+                            text(row, "line").to_string() + lines.as_deref().unwrap_or("") + if failed { "（失败）" } else { "" };
+                        row["line"] = json!(line);
+                    }
+                });
+            }
+            "done" => {
+                let answer = truncate(data["answer"].as_str().unwrap_or(""), 1500);
+                let stopped = data["stopped"] == json!(true);
+                let failed = data["error"].as_str().is_some_and(|error| !error.is_empty());
+                with(|store| {
+                    let Some(entry) = turn_mut(store, turn) else { return };
+                    entry["endedAt"] = json!(stamp());
+                    entry["answer"] = json!(answer);
+                    if let Some(signals) = entry["signals"].as_array_mut() {
+                        if stopped {
+                            signals.push(json!("stopped"));
+                        }
+                        if failed {
+                            signals.push(json!("failed"));
+                        }
+                    }
+                });
+                let session = session.to_string();
+                let turn = turn.to_string();
+                std::thread::spawn(move || {
+                    improve::task_done(&session, &turn, data_answer(&turn));
+                    // 等「做完」的收尾落定，这段会话全部做完了再整理
+                    std::thread::sleep(Duration::from_millis(organize_delay()));
+                    organize(&session);
+                });
+            }
+            _ => {}
+        }
+    }
+
+    fn data_answer(turn: &str) -> String {
+        read(|store| {
+            store["turns"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .rev()
+                .find(|entry| text(entry, "id") == turn)
+                .map(|entry| text(entry, "answer").to_string())
+        })
+        .unwrap_or_default()
+    }
+
+    fn organize_delay() -> u64 {
+        std::env::var("EDITH_FRIDAY_ORGANIZE_DELAY_MS").ok().and_then(|text| text.parse().ok()).unwrap_or(1000)
+    }
+
+    /// 网关报的信号（改了重发、重试）：记在这段会话最近一次开口的那轮
+    pub fn signal(session: &str, signal: &str) {
+        with(|store| {
+            let Some(entry) = store["turns"]
+                .as_array_mut()
+                .and_then(|turns| turns.iter_mut().rev().find(|turn| text(turn, "conversation") == session && is_ask(turn)))
+            else {
+                return;
+            };
+            if let Some(signals) = entry["signals"].as_array_mut()
+                && !signals.contains(&json!(signal))
+            {
+                signals.push(json!(signal));
+            }
+        });
+    }
+
+    /// 内置钩子「会话第一条消息」：这段会话的第一条用户消息时，附上记忆库和技能的目录（回附的话；没有、关着为空）
+    pub fn catalog(session: &str, request: &str) -> String {
+        if !hook_enabled("catalog") || request.trim().is_empty() {
+            return String::new();
+        }
+        let first = crate::find_session(session).is_none_or(|stored| {
+            // 这条还没写进存档（钩子在交给模型之前跑）：之前没有用户说的话就是第一条
+            !stored.history.iter().any(|message| message["role"] == "user")
+        });
+        if !first {
+            return String::new();
+        }
+        let project = project_of(session);
+        let mut full: Vec<Value> = book::pinned(&project);
+        let mut more = Vec::new();
+        let mut full_count = 0;
+        for (item, score) in book::scored(request, &project, false, 0.15) {
+            if full_count < 3 && score >= 0.35 {
+                full.push(item);
+                full_count += 1;
+            } else if more.len() < 10 {
+                more.push(item);
+            }
+        }
+        let skills = skills::search(request, 3);
+        if full.is_empty() && more.is_empty() && skills.is_empty() {
+            return String::new();
+        }
+        // 给了全文的算这一轮放进去过（判定时看它们有没有用）
+        let ids: Vec<String> = full.iter().map(|item| text(item, "id").to_string()).collect();
+        with(|store| {
+            if let Some(entry) = store["turns"]
+                .as_array_mut()
+                .and_then(|turns| turns.iter_mut().rev().find(|turn| text(turn, "conversation") == session && turn["endedAt"].is_null()))
+                && let Some(list) = entry["used"].as_array_mut()
+            {
+                for id in &ids {
+                    if !list.contains(&json!(id)) {
+                        list.push(json!(id));
+                    }
+                }
+            }
+        });
+        book::used(&ids);
+        let none = || "（没有）".to_string();
+        let items = if full.is_empty() { none() } else { book::render(&full) };
+        let more = if more.is_empty() {
+            none()
+        } else {
+            more.iter().map(|item| format!("- {}", book::title(item))).collect::<Vec<_>>().join("\n")
+        };
+        let skills = if skills.is_empty() { none() } else { skills.iter().map(skills::line).collect::<Vec<_>>().join("\n") };
+        prompt("memory.catalog", &[("items", items), ("more", more), ("skills", skills)])
+    }
+
+    // MARK: - 一轮结束的整理（内置钩子 organize）
+
+    static ORGANIZING: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+    static FAILURES: LazyLock<Mutex<HashMap<String, u32>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    fn working(session: &str) -> bool {
+        crate::TURNS.lock().unwrap().iter().any(|(_, id)| id == session)
+    }
+
+    fn mark_organized(ids: &[String]) {
+        with(|store| {
+            for turn in store["turns"].as_array_mut().into_iter().flatten() {
+                if ids.iter().any(|id| id == text(turn, "id")) {
+                    turn["organized"] = json!(true);
+                }
+            }
+        });
+    }
+
+    /// 「#1 用户（10-13 14:02）：…」「信号：…」「做了什么：…」「回答：…」
+    fn transcript(asks: &[Value], with_activity: bool, request_limit: usize, answer_limit: usize) -> String {
+        asks.iter()
+            .enumerate()
+            .map(|(index, turn)| {
+                let mut lines = vec![format!(
+                    "#{} 用户（{}）：{}",
+                    index + 1,
+                    local(time_of(turn, "startedAt")),
+                    truncate(text(turn, "request"), request_limit)
+                )];
+                let raw = strings(turn, "signals");
+                let signals: Vec<&str> = raw.iter().map(|signal| signal_text(signal)).collect();
+                if !signals.is_empty() {
+                    lines.push(format!("信号：{}", signals.join("、")));
+                }
+                if with_activity {
+                    let done: Vec<String> =
+                        turn["activity"].as_array().into_iter().flatten().map(|row| text(row, "line").to_string()).collect();
+                    if !done.is_empty() {
+                        lines.push(format!("做了什么：\n{}", done.join("\n")));
+                    }
+                }
+                let answer = text(turn, "answer");
+                lines
+                    .push(format!("回答：{}", if answer.is_empty() { "（没有回答）".to_string() } else { truncate(answer, answer_limit) }));
+                lines.join("\n")
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    /// 整理这段会话还没整理的轮次（还在做的先不整理，等它做完那一轮结束时再来）
+    pub fn organize(conversation: &str) {
+        if working(conversation) || !ORGANIZING.lock().unwrap().insert(conversation.to_string()) {
+            return;
+        }
+        let outcome = organize_now(conversation);
+        ORGANIZING.lock().unwrap().remove(conversation);
+        if let Some(notes) = outcome {
+            notes_log("整理了一轮", &notes);
+        }
+    }
+
+    fn organize_now(conversation: &str) -> Option<Vec<String>> {
+        let turns: Vec<Value> = list("turns")
+            .into_iter()
+            .filter(|turn| text(turn, "conversation") == conversation && turn["organized"] != json!(true) && turn["endedAt"].is_string())
+            .collect();
+        if turns.is_empty() {
+            return None;
+        }
+        let ids: Vec<String> = turns.iter().map(|turn| text(turn, "id").to_string()).collect();
+        let asks: Vec<Value> = turns.iter().filter(|turn| is_ask(turn)).cloned().collect();
+        if !hook_enabled("organize") || asks.is_empty() {
+            mark_organized(&ids);
+            return None;
+        }
+        let project = project_of(conversation);
+        let said: String = asks.iter().map(|turn| text(turn, "request")).collect::<Vec<_>>().join("\n");
+        // 可能对不上的：这一轮放进去过的、和这几句相关的
+        let mut related: Vec<Value> = Vec::new();
+        let mut seen = HashSet::new();
+        for id in turns.iter().flat_map(|turn| strings(turn, "used")) {
+            if let Some(item) = book::find(&id).filter(book::active)
+                && seen.insert(id)
+            {
+                related.push(item);
+            }
+        }
+        for (item, _) in book::scored(&said, &project, true, 0.0).into_iter().take(20) {
+            if seen.insert(text(&item, "id").to_string()) {
+                related.push(item);
+            }
+        }
+        let mut names = HashSet::new();
+        let mut skill_lines = Vec::new();
+        let used_skills: Vec<skills::Skill> =
+            turns.iter().flat_map(|turn| strings(turn, "skills")).filter_map(|name| skills::find(&name)).collect();
+        for skill in used_skills.into_iter().chain(skills::search(&said, 5)) {
+            if names.insert(skill.name.clone()) {
+                skill_lines.push(skills::line(&skill));
+            }
+        }
+        let none = || "（没有）".to_string();
+        let request = prompt(
+            "memory.organize",
+            &[
+                ("transcript", transcript(&asks, true, 1200, 1500)),
+                ("memories", if related.is_empty() { none() } else { book::render(&related) }),
+                ("skills", if skill_lines.is_empty() { none() } else { skill_lines.join("\n") }),
+                ("project", if project.is_empty() { "（没有项目）".into() } else { project.clone() }),
+            ],
+        );
+        let reply = ask_light("", &request, &organize_model());
+        match reply.as_ref().ok().and_then(|reply| json_in(reply)) {
+            Some(changes) => {
+                FAILURES.lock().unwrap().remove(conversation);
+                let notes = apply_organize(&changes, &project);
+                mark_organized(&ids);
+                Some(notes)
+            }
+            None => {
+                // 没整理成：先不记成整理过（不然用户说的「记住…」就丢了），试满 3 次才放弃
+                let failures = {
+                    let mut all = FAILURES.lock().unwrap();
+                    let count = all.entry(conversation.to_string()).or_default();
+                    *count += 1;
+                    *count
+                };
+                let why = match &reply {
+                    Ok(reply) => format!("没回 JSON：{}", truncate(reply, 120)),
+                    Err(error) => error.clone(),
+                };
+                crate::serve_log(
+                    "learn",
+                    &format!("整理没成（第 {failures} 次{}）：{why}", if failures >= 3 { "，不再试" } else { "，稍后再试" }),
+                );
+                if failures >= 3 {
+                    FAILURES.lock().unwrap().remove(conversation);
+                    mark_organized(&ids);
+                }
+                None
+            }
+        }
+    }
+
+    /// 按整理的结果改：记下 / 改掉 / 忘掉记忆，记经验，建 / 改技能。回说明（一行一条）
+    pub fn apply_organize(changes: &Map<String, Value>, project: &str) -> Vec<String> {
+        let mut notes = Vec::new();
+        for id in changes.get("forget").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+            if let Some(item) = book::find(id)
+                && let Some(words) = book::archive(text(&item, "id"), "和你后来说的对不上")
+            {
+                notes.push(format!("忘掉了记错的：{words}"));
+            }
+        }
+        for fields in changes.get("memories").and_then(Value::as_array).into_iter().flatten() {
+            let words = text(fields, "text").trim().to_string();
+            if words.is_empty() {
+                continue;
+            }
+            let kind = text(fields, "kind");
+            // 只跟这个项目有关的记到这个项目（模型写别的项目键也当成这个项目），其余的是通用的
+            let scope = if text(fields, "project").trim().is_empty() { "" } else { project };
+            if let Some(old) = book::find(text(fields, "replaces")) {
+                if let Some(before) = book::replace(text(&old, "id"), kind, &words, "auto:turn") {
+                    notes.push(format!("改了记错的：「{before}」→「{words}」"));
+                }
+                continue;
+            }
+            if book::add(kind, &words, scope, "auto:turn") {
+                notes.push(format!("记下了{}：{words}", book::label(kind)));
+            }
+        }
+        for experience in changes.get("experiences").and_then(Value::as_array).into_iter().flatten() {
+            let words = experience["text"].as_str().or(experience.as_str()).unwrap_or("").trim().to_string();
+            if !words.is_empty() && book::add("experience", &words, project, "auto:turn") {
+                notes.push(format!("记下了经验：{words}"));
+            }
+        }
+        let skill = changes.get("skill").cloned().unwrap_or_default();
+        let action = text(&skill, "action").trim().to_lowercase();
+        let name = text(&skill, "name").trim().to_string();
+        if (action == "create" || action == "update") && !name.is_empty() {
+            match skills::save_auto(&name, text(&skill, "description"), text(&skill, "content")) {
+                Ok((note, created)) => {
+                    if created {
+                        with(|store| store["skills"][&name] = json!({ "uses": 0, "wins": 0, "losses": 0, "createdAt": stamp() }));
+                    }
+                    notes.push(note);
+                }
+                Err(error) => crate::serve_log("learn", &format!("没建成技能「{name}」：{error}")),
+            }
+        }
+        notes
+    }
+
+    // MARK: - 判定（交付后 12 小时没再说话的一段）
+
+    /// 到点的段：按对话分组、按 12 小时的空档切开；最后一轮结束超过 quiet 秒的才算（在做的不算）
+    fn due_segments(quiet: i64) -> Vec<Vec<Value>> {
+        let now = Utc::now();
+        let mut groups: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+        for turn in list("turns").into_iter().filter(|turn| text(turn, "episode").is_empty()) {
+            groups.entry(text(&turn, "conversation").to_string()).or_default().push(turn);
+        }
+        let mut due = Vec::new();
+        for (conversation, mut turns) in groups {
+            if working(&conversation) {
+                continue;
+            }
+            turns.sort_by_key(|turn| text(turn, "startedAt").to_string());
+            let mut current: Vec<Value> = Vec::new();
+            let mut last_end: Option<DateTime<Utc>> = None;
+            let mut flush = |current: &mut Vec<Value>, last_end: Option<DateTime<Utc>>| {
+                if !current.is_empty()
+                    && last_end.is_some_and(|end| (now - end).num_seconds() >= quiet)
+                    && current.iter().all(|turn| turn["endedAt"].is_string())
+                {
+                    due.push(std::mem::take(current));
+                }
+                current.clear();
+            };
+            for turn in turns {
+                let started = time_of(&turn, "startedAt");
+                if let (Some(end), Some(started)) = (last_end, started)
+                    && (started - end).num_seconds() >= quiet
+                {
+                    flush(&mut current, last_end);
+                }
+                if let Some(ended) = time_of(&turn, "endedAt")
+                    && last_end.is_none_or(|end| ended > end)
+                {
+                    last_end = Some(ended);
+                }
+                current.push(turn);
+            }
+            flush(&mut current, last_end);
+        }
+        due
+    }
+
+    static JUDGING: AtomicBool = AtomicBool::new(false);
+
+    /// 看一次：漏掉的整理补上，到点的段一段一段判，判完遗忘、看要不要自动回滚
+    pub fn check() {
+        if JUDGING.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        // 漏掉的整理（常驻那份退出前没来得及、当时还在做的）：最后一轮结束 2 分钟以上的补上
+        let stale: HashSet<String> = list("turns")
+            .into_iter()
+            .filter(|turn| {
+                turn["organized"] != json!(true) && time_of(turn, "endedAt").is_some_and(|end| (Utc::now() - end).num_seconds() >= 120)
+            })
+            .map(|turn| text(&turn, "conversation").to_string())
+            .collect();
+        for conversation in stale {
+            organize(&conversation);
+        }
+        let mut judged = false;
+        for segment in due_segments(quiet_seconds()) {
+            judge(&segment);
+            judged = true;
+        }
+        let base = baseline();
+        let mut notes = book::forget_stale(base);
+        notes.extend(forget_skills(base));
+        notes_log("遗忘", &notes);
+        prune();
+        if judged {
+            auto_rollback();
+            crate::notify_all_clients("prompts", crate::prompt_files::state());
+        }
+        JUDGING.store(false, Ordering::Relaxed);
+    }
+
+    /// 判过的轮次留 180 天
+    fn prune() {
+        let cutoff = Utc::now() - chrono::Duration::days(180);
+        with(|store| {
+            if let Some(turns) = store["turns"].as_array_mut() {
+                turns.retain(|turn| text(turn, "episode").is_empty() || time_of(turn, "startedAt").is_none_or(|started| started >= cutoff));
+            }
+        });
+    }
+
+    fn judge(segment: &[Value]) {
+        let asks: Vec<Value> = segment.iter().filter(|turn| is_ask(turn)).cloned().collect();
+        // 没有用户开口的（只有定时任务、子智能体交回的）：只按信号记，不花 token
+        let verdict = if asks.is_empty() {
+            Map::new()
+        } else {
+            let mut used = Vec::new();
+            let mut seen = HashSet::new();
+            for id in segment.iter().flat_map(|turn| strings(turn, "used")) {
+                if seen.insert(id.clone())
+                    && let Some(item) = book::find(&id)
+                {
+                    used.push(item);
+                }
+            }
+            let mut names: Vec<String> = Vec::new();
+            for name in segment.iter().flat_map(|turn| strings(turn, "skills")) {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+            let none = || "（没有）".to_string();
+            let request = prompt(
+                "memory.judge",
+                &[
+                    ("transcript", transcript(&asks, false, 600, 800)),
+                    ("memories", if used.is_empty() { none() } else { book::render(&used) }),
+                    (
+                        "skills",
+                        if names.is_empty() { none() } else { names.iter().map(|name| format!("- {name}")).collect::<Vec<_>>().join("\n") },
+                    ),
+                ],
+            );
+            match ask_light("", &request, "") {
+                Ok(reply) => json_in(&reply).unwrap_or_else(|| {
+                    crate::serve_log("learn", &format!("判定没回 JSON，只按信号记：{}", truncate(&reply, 120)));
+                    Map::new()
+                }),
+                Err(error) => {
+                    crate::serve_log("learn", &format!("判定没问成，只按信号记：{error}"));
+                    Map::new()
+                }
+            }
+        };
+        let notes = apply_judge(segment, &asks, &verdict);
+        notes_log("判了一段", &notes);
+    }
+
+    /// 按判定记一段（verdict 空 = 没判成：只按信号算，不学）；回记忆、技能的变动
+    fn apply_judge(segment: &[Value], asks: &[Value], verdict: &Map<String, Value>) -> Vec<String> {
+        // 每个开口的轮次属于哪件事；每件事追问了几次、怎样算做好
+        let mut task_of: Vec<Option<usize>> = vec![None; asks.len()];
+        let mut followups: Vec<i64> = Vec::new();
+        let mut expected: Vec<String> = Vec::new();
+        for task in verdict.get("tasks").and_then(Value::as_array).into_iter().flatten() {
+            let index = followups.len();
+            let mut signals = 0;
+            let mut any = false;
+            for turn in task["turns"].as_array().into_iter().flatten().filter_map(Value::as_i64) {
+                let k = (turn - 1) as usize;
+                if turn < 1 || k >= asks.len() || task_of[k].is_some() {
+                    continue;
+                }
+                task_of[k] = Some(index);
+                any = true;
+                if has_followup_signal(&asks[k]) {
+                    signals += 1;
+                }
+            }
+            if !any {
+                continue;
+            }
+            // 代码记到的停止、改了重发、重试也算追问（模型漏了的补上）
+            followups.push(number(task, "followups").max(0).max(signals));
+            expected.push(text(task, "expected").trim().to_string());
+        }
+        // 判定没覆盖到的：一轮一件事，有信号就算追问了一次
+        for k in 0..asks.len() {
+            if task_of[k].is_none() {
+                task_of[k] = Some(followups.len());
+                followups.push(if has_followup_signal(&asks[k]) { 1 } else { 0 });
+                expected.push(String::new());
+            }
+        }
+        let episode = uuid::Uuid::new_v4().to_string();
+        let started = segment.iter().filter_map(|turn| time_of(turn, "startedAt")).min();
+        let ended = segment.iter().filter_map(|turn| time_of(turn, "endedAt")).max();
+        let version = asks.first().or(segment.first()).map(|turn| text(turn, "promptVersion").to_string()).unwrap_or_default();
+        let conversation = segment.first().map(|turn| text(turn, "conversation").to_string()).unwrap_or_default();
+        // 某一轮属于哪件事：在它之前最近的那次开口
+        let task_at = |turn: &Value| -> Option<usize> {
+            let started = text(turn, "startedAt");
+            let mut task = None;
+            for (k, ask) in asks.iter().enumerate() {
+                if text(ask, "startedAt") <= started {
+                    task = task_of[k];
+                }
+            }
+            task.or_else(|| task_of.first().copied().flatten())
+        };
+        let ids = |key: &str| -> HashSet<String> {
+            verdict
+                .get(key)
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .filter_map(book::find)
+                .map(|item| text(&item, "id").to_string())
+                .collect()
+        };
+        let names = |key: &str| -> HashSet<String> {
+            verdict
+                .get(key)
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .collect()
+        };
+        let (helped, contradicted) = (ids("helped"), ids("contradicted"));
+        // 用过的记忆、读过的技能：所在那件事一次交付算成，被追问算没成（判定说它帮上了的不算它的错）；同一件事里只算一次
+        let mut outcomes: HashMap<String, (i64, i64)> = HashMap::new();
+        let mut skill_outcomes: HashMap<String, (i64, i64)> = HashMap::new();
+        let (skills_helped, skills_misled) = (names("skills_helped"), names("skills_misled"));
+        let mut counted = HashSet::new();
+        for turn in segment {
+            let Some(task) = task_at(turn) else { continue };
+            for id in strings(turn, "used") {
+                if counted.insert((id.clone(), task, false)) {
+                    let entry = outcomes.entry(id.clone()).or_default();
+                    if followups[task] == 0 {
+                        entry.0 += 1;
+                    } else if !helped.contains(&id) {
+                        entry.1 += 1;
+                    }
+                }
+            }
+            for name in strings(turn, "skills") {
+                if counted.insert((name.clone(), task, true)) {
+                    let entry = skill_outcomes.entry(name.clone()).or_default();
+                    if followups[task] == 0 {
+                        entry.0 += 1;
+                    } else if !skills_helped.contains(&name) {
+                        entry.1 += 1;
+                    }
+                }
+            }
+        }
+        book::outcomes(&outcomes);
+        with(|store| {
+            for (name, (wins, losses)) in &skill_outcomes {
+                let stats = &mut store["skills"][name];
+                if !stats.is_object() {
+                    *stats = json!({ "uses": 0, "wins": 0, "losses": 0 });
+                }
+                stats["uses"] = json!(number(stats, "uses") + 1);
+                stats["wins"] = json!(number(stats, "wins") + wins);
+                stats["losses"] = json!(number(stats, "losses") + losses);
+                stats["lastUsedAt"] = json!(stamp());
+            }
+        });
+        let mut notes = Vec::new();
+        if !verdict.is_empty() {
+            // 不学新记忆（一轮结束时整理过了），只改掉对不上的：有新说法的改掉，没有的归档
+            let mut replaced = HashSet::new();
+            for fields in verdict.get("memories").and_then(Value::as_array).into_iter().flatten() {
+                let Some(old) = book::find(text(fields, "replaces")).filter(|old| contradicted.contains(text(old, "id"))) else { continue };
+                replaced.insert(text(&old, "id").to_string());
+                if let Some(before) = book::replace(text(&old, "id"), text(fields, "kind"), text(fields, "text"), "auto:judge") {
+                    notes.push(format!("改了记错的：「{before}」→「{}」", text(fields, "text")));
+                }
+            }
+            for id in contradicted.iter().filter(|id| !replaced.contains(*id)) {
+                if let Some(words) = book::archive(id, "和你后来说的对不上") {
+                    notes.push(format!("忘掉了记错的：{words}"));
+                }
+            }
+            for name in &skills_helped {
+                if skills::promote(name) {
+                    notes.push(format!("技能「{name}」帮上了，转正"));
+                }
+            }
+            for name in &skills_misled {
+                if let Some(skill) = skills::find(name).filter(|skill| skill.auto)
+                    && skills::remove(&skill)
+                {
+                    with(|store| store["skills"].as_object_mut().map(|all| all.remove(name)));
+                    notes.push(format!("技能「{name}」把事带偏了，移到了回收站"));
+                }
+            }
+            // 评测集：写了「怎样算做好」的事收成一道题——被追问过的是 failure，一次做好的是 regression
+            let project = project_of(&conversation);
+            for (task, wanted) in expected.iter().enumerate() {
+                let Some(first) = (0..asks.len()).find(|k| task_of[*k] == Some(task)).filter(|_| !wanted.is_empty()) else { continue };
+                with(|store| {
+                    if let Some(cases) = store["cases"].as_array_mut() {
+                        cases.push(json!({
+                            "id": uuid::Uuid::new_v4().to_string(), "createdAt": stamp(), "episode": episode, "project": project,
+                            "request": text(&asks[first], "request"), "expected": wanted, "previousAnswer": truncate(text(&asks[first], "answer"), 1500),
+                            "kind": if followups[task] > 0 { "failure" } else { "regression" }, "active": true,
+                        }));
+                        // 最多留 200 道（旧的先去）
+                        let extra = cases.len().saturating_sub(200);
+                        cases.drain(..extra);
+                    }
+                });
+            }
+        }
+        let tasks = followups.len() as i64;
+        let first_pass = followups.iter().filter(|count| **count == 0).count() as i64;
+        let turn_ids: Vec<String> = segment.iter().map(|turn| text(turn, "id").to_string()).collect();
+        let summary = verdict.get("summary").and_then(Value::as_str).unwrap_or("").trim().to_string();
+        with(|store| {
+            if let Some(episodes) = store["episodes"].as_array_mut() {
+                episodes.push(json!({
+                    "id": episode, "conversation": conversation, "agent": "main",
+                    "startedAt": started.map(|time| crate::iso(time.into())), "endedAt": ended.map(|time| crate::iso(time.into())),
+                    "judgedAt": stamp(), "promptVersion": version, "tasks": tasks, "firstPass": first_pass, "deliveries": asks.len(),
+                    "followups": followups.iter().sum::<i64>(), "summary": summary,
+                }));
+                let extra = episodes.len().saturating_sub(2000);
+                episodes.drain(..extra);
+            }
+            for turn in store["turns"].as_array_mut().into_iter().flatten() {
+                if turn_ids.iter().any(|id| id == text(turn, "id")) {
+                    turn["episode"] = json!(episode);
+                }
+            }
+        });
+        notes
+    }
+
+    /// 自动建的技能：用了之后追问比平时多、90 天没用上的移到回收站
+    fn forget_skills(base: f64) -> Vec<String> {
+        let now = Utc::now();
+        let stats = read(|store| store["skills"].clone());
+        let mut notes = Vec::new();
+        for skill in skills::all().into_iter().filter(|skill| skill.auto) {
+            let entry = &stats[&skill.name];
+            let (wins, losses) = (number(entry, "wins"), number(entry, "losses"));
+            let last = time_of(entry, "lastUsedAt")
+                .or_else(|| time_of(entry, "createdAt"))
+                .or_else(|| std::fs::metadata(&skill.file).and_then(|meta| meta.modified()).ok().map(DateTime::<Utc>::from));
+            let reason = if wins + losses >= MIN_JUDGED && lift(wins, losses, base) < ARCHIVE_LIFT {
+                "用了之后追问比平时多".to_string()
+            } else if last.is_some_and(|last| (now - last).num_days() >= UNUSED_DAYS) {
+                format!("{UNUSED_DAYS} 天没用上")
+            } else {
+                continue;
+            };
+            if skills::remove(&skill) {
+                with(|store| store["skills"].as_object_mut().map(|all| all.remove(&skill.name)));
+                notes.push(format!("技能「{}」{reason}，移到了回收站", skill.name));
+            }
+        }
+        notes
+    }
+
+    // MARK: - 指标（按判过的段）
+
+    #[derive(Default, Clone, Copy)]
+    struct Metrics {
+        tasks: i64,
+        first_pass: i64,
+        deliveries: i64,
+        followups: i64,
+    }
+
+    impl Metrics {
+        fn first_pass_rate(&self) -> f64 {
+            if self.tasks > 0 { self.first_pass as f64 / self.tasks as f64 } else { -1.0 }
+        }
+
+        fn followup_rate(&self) -> f64 {
+            if self.deliveries > 0 { self.followups as f64 / self.deliveries as f64 } else { -1.0 }
+        }
+
+        fn add(&mut self, episode: &Value) {
+            self.tasks += number(episode, "tasks");
+            self.first_pass += number(episode, "firstPass");
+            self.deliveries += number(episode, "deliveries");
+            self.followups += number(episode, "followups");
+        }
+    }
+
+    fn metrics(since: DateTime<Utc>, version: Option<&str>) -> Metrics {
+        let mut result = Metrics::default();
+        for episode in list("episodes") {
+            if time_of(&episode, "judgedAt").is_some_and(|judged| judged >= since)
+                && version.is_none_or(|version| text(&episode, "promptVersion") == version)
+            {
+                result.add(&episode);
+            }
+        }
+        result
+    }
+
+    fn metrics_by_version(since: DateTime<Utc>) -> Vec<(String, Metrics)> {
+        let mut by: Vec<(String, Metrics)> = Vec::new();
+        for episode in list("episodes").iter().filter(|episode| time_of(episode, "judgedAt").is_some_and(|judged| judged >= since)) {
+            let version = text(episode, "promptVersion").to_string();
+            match by.iter_mut().find(|(name, _)| *name == version) {
+                Some((_, metrics)) => metrics.add(episode),
+                None => {
+                    let mut metrics = Metrics::default();
+                    metrics.add(episode);
+                    by.push((version, metrics));
+                }
+            }
+        }
+        by
+    }
+
+    fn history() -> Vec<prompt_history::Version> {
+        prompt_store::state()["history"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|entry| prompt_history::Version {
+                id: text(entry, "id").to_string(),
+                short_id: text(entry, "shortID").to_string(),
+                time: text(entry, "time").to_string(),
+                message: text(entry, "message").to_string(),
+            })
+            .collect()
+    }
+
+    fn rejected_versions() -> Vec<String> {
+        value("prompts.rejected").split(',').filter(|id| !id.is_empty()).map(str::to_string).collect()
+    }
+
+    /// 判完一段：现在的提示词比上一版明显差了（设置里开着自动回滚）就回滚，记下原因
+    fn auto_rollback() {
+        if !crate::prompt_files::auto_rollback() {
+            return;
+        }
+        let since = Utc::now() - chrono::Duration::days(30);
+        let by: Vec<(String, prompt_history::Metrics)> = metrics_by_version(since)
+            .into_iter()
+            .map(|(version, metrics)| {
+                (
+                    version,
+                    prompt_history::Metrics {
+                        tasks: metrics.tasks,
+                        first_pass: metrics.first_pass,
+                        deliveries: metrics.deliveries,
+                        followups: metrics.followups,
+                    },
+                )
+            })
+            .collect();
+        let rejected = rejected_versions();
+        let Some(found) = prompt_history::regression(&history(), &by, &rejected) else { return };
+        if prompt_store::rollback(&found.good_id, Some(found.message.clone())) {
+            let mut list = rejected;
+            list.push(found.bad.clone());
+            set_value("prompts.rejected", &list.join(","));
+            crate::update_serve_settings(|settings| {
+                let prompts = settings.entry("prompts").or_insert_with(|| json!({}));
+                if !prompts.is_object() {
+                    *prompts = json!({});
+                }
+                prompts["autoRollbackNote"] = json!(found.note);
+            });
+            crate::serve_log("learn", &found.note);
+        }
+    }
+
+    // MARK: - 评测（提示词文件页的「评测现在的和上一版」、改进建议和现在的比）
+
+    #[derive(Default)]
+    struct EvalState {
+        running: bool,
+        progress: String,
+        last_error: String,
+    }
+
+    static EVAL: LazyLock<Mutex<EvalState>> = LazyLock::new(|| Mutex::new(EvalState::default()));
+
+    fn active_cases() -> Vec<Value> {
+        list("cases").into_iter().filter(|item| item["active"] != json!(false)).collect()
+    }
+
+    /// PromptsState 的 eval
+    pub fn eval_state() -> Value {
+        let state = EVAL.lock().unwrap();
+        let runs: Vec<Value> = list("runs")
+            .iter()
+            .rev()
+            .take(10)
+            .map(|run| {
+                json!({
+                    "version": run["version"], "time": local(time_of(run, "startedAt")), "cases": run["cases"], "passed": run["passed"], "score": run["score"],
+                    "text": format!("过 {}/{} · 平均 {:.1} 分", number(run, "passed"), number(run, "cases"), run["score"].as_f64().unwrap_or(0.0)),
+                })
+            })
+            .collect();
+        json!({ "caseCount": active_cases().len(), "running": state.running, "progress": state.progress, "lastError": state.last_error, "runs": runs })
+    }
+
+    pub fn eval_running() -> bool {
+        EVAL.lock().unwrap().running
+    }
+
+    fn eval_changed() {
+        crate::notify_all_clients("prompts", crate::prompt_files::state());
+        improve::changed();
+    }
+
+    /// 照这套段拼主智能体的系统提示（同 EDITH 的 brain::instructions；能力清单不带）
+    fn instructions(sections: &prompts::Sections) -> String {
+        let id = prompts::override_sections(sections.clone());
+        let now = chrono::Local::now();
+        let shell = if cfg!(windows) { "PowerShell" } else { "zsh / bash" };
+        let main = prompts::text(
+            "edith.main",
+            &args(&[
+                ("cwd", crate::default_directory()),
+                ("os", format!("{} {}", std::env::consts::OS, std::env::consts::ARCH)),
+                ("shell", shell.to_string()),
+                ("now", now.format("%Y-%m-%d %H:%M").to_string()),
+                ("capabilities", String::new()),
+            ]),
+            Some(id),
+        );
+        let team = prompts::text("edith.team", &args(&[]), Some(id));
+        prompts::release(id);
+        format!("{main}\n\n{team}")
+    }
+
+    /// 一题打分（读不出来算没过、0 分）
+    fn parse_score(reply: &str) -> (bool, f64, String) {
+        match json_in(reply) {
+            Some(object) => (
+                object.get("pass").and_then(Value::as_bool).unwrap_or(false),
+                object.get("score").and_then(Value::as_f64).unwrap_or(0.0).clamp(0.0, 10.0),
+                object.get("reason").and_then(Value::as_str).unwrap_or("").trim().to_string(),
+            ),
+            None => (false, 0.0, String::new()),
+        }
+    }
+
+    /// 评测几套段（label：记成这次评测的版本名）；回每套的成绩（过了几道、平均分），没跑起来是 Err
+    fn evaluate(targets: Vec<(String, prompts::Sections)>) -> Result<Vec<Value>, String> {
+        let cases = active_cases();
+        if cases.is_empty() {
+            let error = "评测集还是空的：对话判过之后（12 小时没再说话），被追问过的事会收进来".to_string();
+            EVAL.lock().unwrap().last_error = error.clone();
+            eval_changed();
+            return Err(error);
+        }
+        if engine(&value("improve.engine"), true).is_none() {
+            let error = "没有可用的模型，评测不了".to_string();
+            EVAL.lock().unwrap().last_error = error.clone();
+            eval_changed();
+            return Err(error);
+        }
+        {
+            let mut state = EVAL.lock().unwrap();
+            if state.running {
+                return Err("评测正在跑".into());
+            }
+            state.running = true;
+            state.last_error.clear();
+        }
+        let mut runs = Vec::new();
+        for (label, sections) in targets {
+            if sections.is_empty() {
+                EVAL.lock().unwrap().last_error = format!("读不到提示词版本 {label}，跳过");
+                continue;
+            }
+            let system = instructions(&sections);
+            let started = stamp();
+            let mut details = Vec::new();
+            let (mut passed, mut total) = (0, 0.0);
+            for (index, item) in cases.iter().enumerate() {
+                EVAL.lock().unwrap().progress = format!("评测 {label}：{}/{}", index + 1, cases.len());
+                eval_changed();
+                let request = text(item, "request");
+                let answer = ask_strong(&system, &prompt("eval.ask", &[("request", request.to_string())])).unwrap_or_default();
+                let previous = text(item, "previousAnswer");
+                let judged = prompt(
+                    "eval.judge",
+                    &[
+                        ("request", request.to_string()),
+                        ("expected", text(item, "expected").to_string()),
+                        ("previous", if previous.is_empty() { "（没有）".into() } else { previous.to_string() }),
+                        ("answer", if answer.trim().is_empty() { "（没有回答）".into() } else { answer.trim().to_string() }),
+                    ],
+                );
+                let (pass, score, reason) = parse_score(&ask_light("", &judged, "").unwrap_or_default());
+                passed += pass as i64;
+                total += score;
+                details
+                    .push(json!({ "case": item["id"], "pass": pass, "score": score, "reason": reason, "answer": truncate(&answer, 600) }));
+            }
+            let count = details.len() as i64;
+            let run = json!({
+                "id": uuid::Uuid::new_v4().to_string(), "startedAt": started, "finishedAt": stamp(), "version": label,
+                "cases": count, "passed": passed, "score": if count > 0 { total / count as f64 } else { 0.0 }, "details": details,
+            });
+            crate::serve_log(
+                "learn",
+                &format!("评测提示词 {label}：过 {passed}/{count}，平均 {:.1} 分", run["score"].as_f64().unwrap_or(0.0)),
+            );
+            with(|store| {
+                if let Some(all) = store["runs"].as_array_mut() {
+                    all.push(run.clone());
+                    let extra = all.len().saturating_sub(50);
+                    all.drain(..extra);
+                }
+            });
+            runs.push(run);
+        }
+        {
+            let mut state = EVAL.lock().unwrap();
+            state.running = false;
+            state.progress.clear();
+        }
+        eval_changed();
+        Ok(runs)
+    }
+
+    /// prompts.evaluate：评测现在的和上一版（历史里的第二个；没有就只评测现在的）；后台跑
+    pub fn evaluate_current_and_previous() {
+        let history = history();
+        let current = history.first().map(|version| version.short_id.clone()).unwrap_or_else(|| "现在的".into());
+        let previous = history.get(1).map(|version| (version.short_id.clone(), version.id.clone()));
+        std::thread::spawn(move || {
+            let mut targets = vec![(current, prompts::sections(None))];
+            if let Some((short, id)) = previous {
+                targets.push((short, prompt_store::sections_at(&id)));
+            }
+            let _ = evaluate(targets);
+        });
+    }
+
+    // MARK: - 改进（improve.*）
+
+    pub mod improve {
+        use super::*;
+
+        static RUNNING: AtomicBool = AtomicBool::new(false);
+        static STATUS: Mutex<String> = Mutex::new(String::new());
+
+        const MAX_KEYS: usize = 3;
+        const KEEP: usize = 20;
+        const SCORE_SLACK: f64 = 0.5;
+        const META_MIN_TASKS: i64 = 8;
+        const META_WORSE_BY: f64 = 0.15;
+        const SELF_KEYS: [&str; 3] = ["improve.system", "improve.diagnose", "improve.rewrite"];
+
+        /// 受保护清单（同 Friday 的 Prompts/protected.txt，加上 EDITH、edith-friday 的）：判定、评测、回滚、更新退回是改进者的「尺子」和「安全阀」，
+        /// 停下来问用户、密钥是用户定的边界，改进者不能动
+        const PROTECTED: &str = "\
+prompt-file prompts-framework.md
+prompt stops.*
+prompt secrets
+prompt tool.list_secrets
+prompt tool.request_secret
+prompt tool.resolve_approval
+prompt self-prompts
+prompt platform.*
+path prompts/prompts-framework.md
+path src/memory.rs
+path src/mind.rs
+path core/*
+path tools/friday/src/main.rs
+path tools/friday/tests/*
+path Friday/Friday/Prompts/protected.txt
+path Friday/Friday/Prompts/prompts-framework.md
+path qt/src/core/memory/*
+path Friday/Friday/Memory/*
+path qt/src/core/models/PromptStore.*
+path qt/src/core/util/Prompts.*
+path Friday/Friday/Prompts/PromptStore.swift
+path Friday/Friday/Prompts/Prompts.swift
+path qt/src/core/schedule/*
+path Friday/Friday/Schedule/*
+path qt/src/core/update/*
+path Friday/Friday/Update/*
+path qt/installer/*
+path qt/ci/*
+path Friday/Tools/CI/*
+path .github/*
+path qt/src/core/agent/UserStops.*
+path Friday/Friday/Agent/UserStops.swift
+path qt/src/core/secrets/*
+path Friday/Friday/Secrets/*
+path qt/tests/tst_memory.cpp
+path qt/tests/tst_update.cpp
+path qt/tests/tst_loops.cpp
+path *Package.resolved
+path *Cargo.lock
+path CLAUDE.md
+";
+
+        fn protected(kind: &str) -> Vec<&'static str> {
+            PROTECTED.lines().filter_map(|line| line.strip_prefix(kind)?.strip_prefix(' ')).map(str::trim).collect()
+        }
+
+        /// 「*」匹配任意字符（含「/」）
+        fn matches(pattern: &str, value: &str) -> bool {
+            let parts: Vec<&str> = pattern.split('*').collect();
+            if parts.len() == 1 {
+                return pattern == value;
+            }
+            let (first, last) = (parts[0], parts[parts.len() - 1]);
+            if !value.starts_with(first) || !value[first.len()..].ends_with(last) || value.len() < first.len() + last.len() {
+                return false;
+            }
+            let mut rest = &value[first.len()..value.len() - last.len()];
+            for part in &parts[1..parts.len() - 1] {
+                match rest.find(part) {
+                    Some(at) => rest = &rest[at + part.len()..],
+                    None => return false,
+                }
+            }
+            true
+        }
+
+        fn protected_prompt(key: &str) -> bool {
+            protected("prompt-file").iter().any(|file| prompts::bundled_keys(file).iter().any(|item| item == key))
+                || protected("prompt").iter().any(|pattern| matches(pattern, key))
+        }
+
+        pub fn protected_paths(files: &[String]) -> Vec<String> {
+            files
+                .iter()
+                .filter(|file| {
+                    let normalized = file.trim().replace('\\', "/");
+                    let normalized = normalized.trim_start_matches("./");
+                    protected("path").iter().any(|pattern| matches(pattern, normalized))
+                })
+                .cloned()
+                .collect()
+        }
+
+        /// 能改的段：自带的提示词里、受保护清单以外的；工具参数的说明不给
+        pub fn editable(key: &str) -> bool {
+            let bare = key.strip_prefix("edith.").unwrap_or(key);
+            if bare.starts_with("tool.") && bare.matches('.').count() > 1 {
+                return false;
+            }
+            !protected_prompt(key) && prompts::file_names().iter().any(|file| prompts::bundled_keys(file).iter().any(|item| item == key))
+        }
+
+        fn status_label(status: &str) -> &str {
+            match status {
+                "pending" => "等你看",
+                "accepted" => "已采用",
+                "dismissed" => "没用",
+                "rejected" => "评测没过，没交给你",
+                "stale" => "过期了",
+                "working" => "在做",
+                "branch" => "分支好了，等你看",
+                "blocked" => "碰了受保护的文件",
+                "failed" => "没做成",
+                "pushed" => "已推送",
+                "discarded" => "丢掉了",
+                "reverted" => "效果变差，已退回",
+                other => other,
+            }
+        }
+
+        fn eval_text(proposal: &Value) -> String {
+            let note = text(proposal, "note");
+            match text(proposal, "kind") {
+                "self" => {
+                    if note.is_empty() {
+                        "改进者自己的提示词没法用评测集比，看你的判断".into()
+                    } else {
+                        note.to_string()
+                    }
+                }
+                "code" => {
+                    let files = strings(proposal, "files");
+                    if files.is_empty() {
+                        "改代码（在单独的分支上做，你看过才推送）".into()
+                    } else {
+                        format!("分支 {}，改了 {} 个文件", text(proposal, "branch"), files.len())
+                    }
+                }
+                _ if number(proposal, "cases") <= 0 => {
+                    if note.is_empty() {
+                        "没评测".into()
+                    } else {
+                        note.to_string()
+                    }
+                }
+                _ => format!(
+                    "评测 {} 道：现在的过 {} 道、平均 {:.1} 分；建议的过 {} 道、平均 {:.1} 分",
+                    number(proposal, "cases"),
+                    number(proposal, "currentPassed"),
+                    proposal["currentScore"].as_f64().unwrap_or(0.0),
+                    number(proposal, "candidatePassed"),
+                    proposal["candidateScore"].as_f64().unwrap_or(0.0)
+                ),
+            }
+        }
+
+        fn all() -> Vec<Value> {
+            list("proposals")
+        }
+
+        fn find(id: &str) -> Option<Value> {
+            all().into_iter().find(|proposal| text(proposal, "id") == id)
+        }
+
+        fn save(proposal: Value) {
+            with(|store| {
+                let list = store["proposals"].as_array_mut().unwrap();
+                list.retain(|item| item["id"] != proposal["id"]);
+                list.insert(0, proposal);
+                list.truncate(KEEP);
+            });
+            changed();
+        }
+
+        fn update(id: &str, body: impl FnOnce(&mut Value)) {
+            with(|store| {
+                if let Some(proposal) =
+                    store["proposals"].as_array_mut().and_then(|list| list.iter_mut().find(|item| text(item, "id") == id))
+                {
+                    body(proposal);
+                }
+            });
+            changed();
+        }
+
+        pub fn changed() {
+            crate::notify_all_clients("improve", state());
+        }
+
+        pub fn enabled() -> bool {
+            value("improve.enabled") == "1"
+        }
+
+        fn pending_count() -> usize {
+            all().iter().filter(|proposal| ["pending", "branch"].contains(&text(proposal, "status"))).count()
+        }
+
+        fn finish(status: &str) {
+            RUNNING.store(false, Ordering::Relaxed);
+            let line = format!("{}：{status}", local(Some(Utc::now())));
+            *STATUS.lock().unwrap() = line.clone();
+            set_value("improve.lastStatus", &line);
+            crate::serve_log("learn", &format!("[改进] {status}"));
+            changed();
+        }
+
+        fn set_status(status: &str) {
+            *STATUS.lock().unwrap() = status.to_string();
+            changed();
+        }
+
+        fn status() -> String {
+            let status = STATUS.lock().unwrap().clone();
+            if status.is_empty() { value("improve.lastStatus") } else { status }
+        }
+
+        fn git() -> Option<String> {
+            crate::prompt_files::find_git()
+        }
+
+        fn repository() -> String {
+            value("improve.repo")
+        }
+
+        fn can_code() -> bool {
+            let repo = repository();
+            !repo.is_empty() && git().is_some() && Path::new(&repo).join(".git").exists()
+        }
+
+        /// 采用后的效果：improved / worse / rolledBack / neutral / 空（还看不出）
+        fn effect(proposal: &Value, rejected: &[String]) -> &'static str {
+            let applied = text(proposal, "appliedVersion");
+            if text(proposal, "status") != "accepted" || text(proposal, "kind") == "code" || applied.is_empty() {
+                return "";
+            }
+            if rejected.iter().any(|version| version == applied) {
+                return "rolledBack";
+            }
+            let since = Utc::now() - chrono::Duration::days(60);
+            let after = metrics(since, Some(applied));
+            let before = metrics(since, Some(text(proposal, "baseVersion")));
+            if after.tasks < META_MIN_TASKS || before.tasks < META_MIN_TASKS {
+                return "";
+            }
+            let known = after.followup_rate() >= 0.0 && before.followup_rate() >= 0.0;
+            if after.first_pass_rate() < before.first_pass_rate() - META_WORSE_BY
+                || (known && after.followup_rate() > before.followup_rate() + META_WORSE_BY)
+            {
+                return "worse";
+            }
+            if after.first_pass_rate() >= before.first_pass_rate() && (!known || after.followup_rate() <= before.followup_rate()) {
+                return "improved";
+            }
+            "neutral"
+        }
+
+        /// 改进者的成绩：(提了, 决定了, 采用了, 看得出效果的, 见效, 变差, 被回滚, 原因（成绩差时）)
+        struct Meta {
+            proposed: i64,
+            decided: i64,
+            accepted: i64,
+            judged: i64,
+            improved: i64,
+            worse: i64,
+            rolled_back: i64,
+            reason: String,
+        }
+
+        impl Meta {
+            fn text(&self) -> String {
+                if self.proposed == 0 {
+                    return "还没提过建议".into();
+                }
+                let mut result = format!("提了 {} 条", self.proposed);
+                if self.decided > 0 {
+                    result += &format!(
+                        "：你决定了 {} 条，采用 {} 条（{}%）",
+                        self.decided,
+                        self.accepted,
+                        (self.accepted as f64 * 100.0 / self.decided as f64).round() as i64
+                    );
+                } else {
+                    result += "：你还没决定过";
+                }
+                if self.judged > 0 {
+                    result += &format!(
+                        "；采用后看得出效果的 {} 条：见效 {}、变差 {}、被回滚 {}",
+                        self.judged, self.improved, self.worse, self.rolled_back
+                    );
+                }
+                if !self.reason.is_empty() {
+                    result += &format!("。改进者需要改进：{}", self.reason);
+                }
+                result
+            }
+        }
+
+        fn meta() -> Meta {
+            let rejected = rejected_versions();
+            let mut meta =
+                Meta { proposed: 0, decided: 0, accepted: 0, judged: 0, improved: 0, worse: 0, rolled_back: 0, reason: String::new() };
+            for proposal in all().iter().filter(|proposal| text(proposal, "kind") != "self" && text(proposal, "status") != "rejected") {
+                meta.proposed += 1;
+                let status = text(proposal, "status");
+                let accepted = ["accepted", "pushed"].contains(&status);
+                if accepted || ["dismissed", "discarded"].contains(&status) {
+                    meta.decided += 1;
+                }
+                if accepted {
+                    meta.accepted += 1;
+                }
+                match effect(proposal, &rejected) {
+                    "" => {}
+                    outcome => {
+                        meta.judged += 1;
+                        match outcome {
+                            "improved" => meta.improved += 1,
+                            "worse" => meta.worse += 1,
+                            "rolledBack" => meta.rolled_back += 1,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            if meta.decided >= 5 && (meta.accepted as f64) < 0.3 * meta.decided as f64 {
+                meta.reason = "提的建议你采用的不到三成".into();
+            } else if meta.judged >= 3 && (meta.worse + meta.rolled_back) * 2 > meta.judged {
+                meta.reason = "采用后变差、被回滚的超过一半".into();
+            }
+            meta
+        }
+
+        /// ImproveState
+        pub fn state() -> Value {
+            let meta = meta();
+            let proposals: Vec<Value> = all()
+                .into_iter()
+                .map(|mut proposal| {
+                    proposal["time"] = json!(local(time_of(&proposal, "createdAt")));
+                    proposal["statusLabel"] = json!(status_label(text(&proposal, "status")));
+                    proposal["evalText"] = json!(eval_text(&proposal));
+                    if proposal["files"].is_null() {
+                        proposal["files"] = json!([]);
+                    }
+                    if cfg!(windows)
+                        && let Some(worktree) = proposal["worktree"].as_str()
+                    {
+                        proposal["worktree"] = json!(worktree.replace('/', "\\"));
+                    }
+                    proposal
+                })
+                .collect();
+            json!({
+                "running": RUNNING.load(Ordering::Relaxed),
+                "status": status(),
+                "proposals": proposals,
+                "pendingCount": pending_count(),
+                "repository": repository(),
+                "metaText": meta.text(),
+                "metaUnhealthy": !meta.reason.is_empty(),
+                "canImproveSelf": enabled() && !RUNNING.load(Ordering::Relaxed) && meta.decided >= 3,
+                "evalRunning": eval_running(),
+                "enabled": enabled(),
+                "engine": value("improve.engine"),
+                "models": model_options("自动（子智能体可以用的模型里挑强的）", &value("improve.engine")),
+            })
+        }
+
+        // MARK: 找一次
+
+        fn begin(manual: bool) -> bool {
+            if !enabled() {
+                if manual {
+                    finish("自我改进关着，没找");
+                }
+                return false;
+            }
+            if RUNNING.swap(true, Ordering::Relaxed) {
+                return false;
+            }
+            true
+        }
+
+        /// 找一次。manual 为假（每天的）：有等用户看的、在做的、一天内找过、上次之后没有新判过的段就不找
+        pub fn run(manual: bool) {
+            if !manual {
+                if !enabled() || pending_count() > 0 || all().iter().any(|proposal| text(proposal, "status") == "working") {
+                    return;
+                }
+                if let Some(last) = parse_time(&value("improve.lastRun")) {
+                    if (Utc::now() - last).num_hours() < 20 {
+                        return;
+                    }
+                    if !list("episodes").iter().any(|episode| time_of(episode, "judgedAt").is_some_and(|judged| judged > last)) {
+                        return;
+                    }
+                }
+            }
+            if !begin(manual) {
+                return;
+            }
+            set_value("improve.lastRun", &stamp());
+            set_status("在看最近哪里没做好…");
+            std::thread::spawn(diagnose);
+        }
+
+        fn evidence_metrics() -> String {
+            let now = Utc::now();
+            let week = metrics(now - chrono::Duration::days(7), None);
+            let mut lines = vec![format!(
+                "- 最近 7 天：{} 件事，一次交付率 {}，追问率 {}",
+                week.tasks,
+                percent(week.first_pass_rate()),
+                percent(week.followup_rate())
+            )];
+            for (version, metrics) in metrics_by_version(now - chrono::Duration::days(30)) {
+                lines.push(format!(
+                    "- 提示词版本 {}（最近 30 天）：{} 件事，一次交付率 {}，追问率 {}",
+                    if version.is_empty() { "（没记版本）".to_string() } else { version },
+                    metrics.tasks,
+                    percent(metrics.first_pass_rate()),
+                    percent(metrics.followup_rate())
+                ));
+            }
+            lines.join("\n")
+        }
+
+        fn evidence_episodes() -> (String, usize) {
+            let since = Utc::now() - chrono::Duration::days(14);
+            let lines: Vec<String> = list("episodes")
+                .iter()
+                .rev()
+                .filter(|episode| time_of(episode, "judgedAt").is_some_and(|judged| judged >= since))
+                .filter(|episode| number(episode, "followups") > 0 || number(episode, "firstPass") < number(episode, "tasks"))
+                .take(12)
+                .map(|episode| {
+                    let version = text(episode, "promptVersion");
+                    format!(
+                        "- [{} · 主智能体 · 提示词 {}] {} 件事、一次做成 {}、被追问 {}：{}",
+                        time_of(episode, "judgedAt")
+                            .map(|time| time.with_timezone(&chrono::Local).format("%-m-%-d").to_string())
+                            .unwrap_or_default(),
+                        if version.is_empty() { "—" } else { version },
+                        number(episode, "tasks"),
+                        number(episode, "firstPass"),
+                        number(episode, "followups"),
+                        truncate(&simplified(text(episode, "summary")), 300)
+                    )
+                })
+                .collect();
+            let count = lines.len();
+            (if lines.is_empty() { "（没有）".into() } else { lines.join("\n") }, count)
+        }
+
+        fn evidence_cases() -> (String, usize) {
+            let lines: Vec<String> = active_cases()
+                .iter()
+                .filter(|item| text(item, "kind") == "failure")
+                .take(10)
+                .map(|item| {
+                    format!(
+                        "- 用户：{}\n  怎样算做好：{}",
+                        truncate(&simplified(text(item, "request")), 200),
+                        truncate(&simplified(text(item, "expected")), 200)
+                    )
+                })
+                .collect();
+            let count = lines.len();
+            (if lines.is_empty() { "（没有）".into() } else { lines.join("\n") }, count)
+        }
+
+        fn evidence_history() -> String {
+            let lines: Vec<String> = all()
+                .iter()
+                .take(5)
+                .map(|proposal| {
+                    format!(
+                        "- [{}{}] {}（{}）",
+                        if text(proposal, "kind") == "code" { "改代码 · " } else { "" },
+                        status_label(text(proposal, "status")),
+                        text(proposal, "summary"),
+                        truncate(&simplified(text(proposal, "diagnosis")), 120)
+                    )
+                })
+                .collect();
+            if lines.is_empty() { "（没有）".into() } else { lines.join("\n") }
+        }
+
+        fn key_list() -> String {
+            let sections = prompts::sections(None);
+            let mut lines = Vec::new();
+            for file in prompts::file_names() {
+                for key in prompts::bundled_keys(&file) {
+                    if editable(&key) {
+                        let first = sections.get(&key).and_then(|text| text.lines().next()).unwrap_or("");
+                        lines.push(format!("{key}：{}", truncate(&simplified(first), 40)));
+                    }
+                }
+            }
+            lines.join("\n")
+        }
+
+        fn diagnose() {
+            let (episodes, episode_count) = evidence_episodes();
+            let (cases, case_count) = evidence_cases();
+            if episode_count == 0 && case_count == 0 {
+                return finish("最近没有被追问、没做成的事，不用改");
+            }
+            let code = can_code();
+            let request = prompt(
+                "improve.diagnose",
+                &[
+                    ("metrics", evidence_metrics()),
+                    ("episodes", episodes),
+                    ("cases", cases),
+                    ("history", evidence_history()),
+                    ("keys", key_list()),
+                    ("code", prompt(if code { "improve.code.allowed" } else { "improve.code.none" }, &[])),
+                ],
+            );
+            let reply = match ask_strong(&prompt("improve.system", &[]), &request) {
+                Ok(reply) => reply,
+                Err(_) => return finish("没问成模型，这次不改"),
+            };
+            let Some(object) = json_in(&reply) else { return finish("诊断没按格式回，这次不改") };
+            let field = |key: &str| object.get(key).and_then(Value::as_str).unwrap_or("").trim().to_string();
+            let (none, diagnosis, task) = (field("none"), field("diagnosis"), field("code"));
+            let mut keys: Vec<String> = Vec::new();
+            for key in object.get("keys").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+                if !key.trim().is_empty() && !keys.contains(&key.trim().to_string()) {
+                    keys.push(key.trim().to_string());
+                }
+            }
+            if !none.is_empty() {
+                return finish(&format!("看过了，不改：{none}"));
+            }
+            if diagnosis.is_empty() || (keys.is_empty() && task.is_empty()) {
+                return finish("诊断没按格式回，这次不改");
+            }
+            if keys.is_empty() {
+                if !code {
+                    return finish("要改代码才能解决，这台没设源码目录，这次不改");
+                }
+                let proposal = json!({
+                    "id": short_id(), "createdAt": stamp(), "kind": "code", "status": "pending",
+                    "summary": format!("改代码：{}", truncate(&simplified(&task), 60)), "diagnosis": diagnosis, "changes": [], "task": task,
+                    "baseVersion": prompt_store::state()["version"], "cases": 0, "note": "",
+                });
+                return offer(proposal);
+            }
+            let sections = prompts::sections(None);
+            let all_keys = keys.clone();
+            keys.retain(|key| editable(key) && sections.contains_key(key));
+            keys.truncate(MAX_KEYS);
+            if keys.is_empty() {
+                return finish(&format!("诊断选的段不能改（{}），这次不改", all_keys.join("、")));
+            }
+            set_status(&format!("在改：{}", keys.join("、")));
+            rewrite(&diagnosis, &keys);
+        }
+
+        /// 改写的回复 → 要改的（只认 allowed 里的、和现在不一样的、检查得过的）；回改动和问题
+        fn changes_of(reply: &str, allowed: &[String]) -> Option<(String, Vec<Value>, Vec<String>)> {
+            let object = json_in(reply)?;
+            let summary = object.get("summary").and_then(Value::as_str).unwrap_or("").trim().to_string();
+            let current = prompts::sections(None);
+            let mut changes = Vec::new();
+            let mut problems = Vec::new();
+            let mut any = false;
+            for change in object.get("changes").and_then(Value::as_array).into_iter().flatten() {
+                let (key, after, reason) = (
+                    text(change, "key").trim().to_string(),
+                    text(change, "text").trim().to_string(),
+                    text(change, "reason").trim().to_string(),
+                );
+                if key.is_empty() || after.is_empty() {
+                    continue;
+                }
+                any = true;
+                if !allowed.contains(&key) {
+                    problems.push(format!("{key} 不在要改的段里"));
+                    continue;
+                }
+                let before = current.get(&key).map(|text| text.trim().to_string()).unwrap_or_default();
+                if after == before {
+                    continue;
+                }
+                let problem = prompts::check_section(&key, &after);
+                if !problem.is_empty() {
+                    problems.push(format!("{key}：{problem}"));
+                    continue;
+                }
+                changes.push(json!({ "key": key, "before": before, "after": after, "reason": reason }));
+            }
+            any.then_some((summary, changes, problems))
+        }
+
+        fn rewrite(diagnosis: &str, keys: &[String]) {
+            let sections = prompts::sections(None);
+            let blocks: Vec<String> =
+                keys.iter().map(|key| format!("@@ {key}\n{}", sections.get(key).cloned().unwrap_or_default())).collect();
+            let request = prompt("improve.rewrite", &[("diagnosis", diagnosis.to_string()), ("sections", blocks.join("\n\n"))]);
+            let reply = match ask_strong(&prompt("improve.system", &[]), &request) {
+                Ok(reply) => reply,
+                Err(_) => return finish("没问成模型，这次不改"),
+            };
+            let Some((summary, changes, problems)) = changes_of(&reply, keys) else {
+                return finish("改写没按格式回，这次不改");
+            };
+            if changes.is_empty() {
+                return finish(&if problems.is_empty() {
+                    "改写和原来一样，这次不改".to_string()
+                } else {
+                    format!("改写的用不了（{}），这次不改", problems.join("；"))
+                });
+            }
+            let proposal = json!({
+                "id": short_id(), "createdAt": stamp(), "kind": "prompt", "status": "pending",
+                "summary": if summary.is_empty() { format!("改了 {}", keys.join("、")) } else { summary },
+                "diagnosis": diagnosis, "changes": changes, "baseVersion": prompt_store::state()["version"], "cases": 0, "note": "",
+            });
+            evaluate_proposal(proposal);
+        }
+
+        fn offer(mut proposal: Value) {
+            proposal["status"] = json!("pending");
+            let summary = text(&proposal, "summary").to_string();
+            save(proposal);
+            finish(&format!("有一条改进建议等你看：{summary}"));
+        }
+
+        /// 改好的先跑评测和现在的比：没变差才交给用户
+        fn evaluate_proposal(mut proposal: Value) {
+            if active_cases().is_empty() {
+                proposal["note"] = json!("评测集还是空的，没和现在的比过");
+                return offer(proposal);
+            }
+            if eval_running() {
+                return finish("评测正在跑，过会儿再找");
+            }
+            let current = prompts::sections(None);
+            let mut candidate = current.clone();
+            for change in proposal["changes"].as_array().into_iter().flatten() {
+                candidate.insert(text(change, "key").to_string(), text(change, "after").to_string());
+            }
+            set_status("在评测建议的改动…");
+            let label = format!("建议 {}", text(&proposal, "id"));
+            match evaluate(vec![("现在的".into(), current), (label, candidate)]) {
+                Ok(runs) if runs.len() == 2 => {
+                    let (now, next) = (&runs[0], &runs[1]);
+                    proposal["cases"] = next["cases"].clone();
+                    proposal["currentPassed"] = now["passed"].clone();
+                    proposal["currentScore"] = now["score"].clone();
+                    proposal["candidatePassed"] = next["passed"].clone();
+                    proposal["candidateScore"] = next["score"].clone();
+                    let score = |run: &Value| run["score"].as_f64().unwrap_or(0.0);
+                    if number(next, "passed") >= number(now, "passed") && score(next) >= score(now) - SCORE_SLACK {
+                        return offer(proposal);
+                    }
+                    proposal["status"] = json!("rejected");
+                    proposal["note"] = json!("评测比现在的差，没交给你");
+                    let summary = text(&proposal, "summary").to_string();
+                    save(proposal);
+                    finish(&format!("想到一条改法，评测比现在的差，没用：{summary}"));
+                }
+                Ok(_) | Err(_) => {
+                    let error = EVAL.lock().unwrap().last_error.clone();
+                    proposal["note"] = json!(format!("评测没跑起来（{error}），没和现在的比过"));
+                    offer(proposal);
+                }
+            }
+        }
+
+        // MARK: 用户的决定
+
+        /// 采用：改提示词的写进提示词文件；改代码的开工作树、交给会话做。回空 = 好了，否则原因
+        pub fn accept(id: &str) -> String {
+            let Some(proposal) = find(id).filter(|proposal| text(proposal, "status") == "pending") else {
+                return "没有这条等你看的建议".into();
+            };
+            if text(&proposal, "kind") == "code" {
+                return start_code(&proposal);
+            }
+            let current = prompts::sections(None);
+            let mut moved = Vec::new();
+            let mut sections = BTreeMap::new();
+            for change in proposal["changes"].as_array().into_iter().flatten() {
+                let key = text(change, "key").to_string();
+                if current.get(&key).map(|text| text.trim()).unwrap_or("") != text(change, "before") {
+                    moved.push(key.clone());
+                }
+                sections.insert(key, text(change, "after").to_string());
+            }
+            if !moved.is_empty() {
+                update(id, |item| {
+                    item["status"] = json!("stale");
+                    item["decidedAt"] = json!(stamp());
+                    item["note"] = json!(format!("提出之后这几段又改过了：{}", moved.join("、")));
+                });
+                return format!("这条建议过期了：{} 在它提出之后又改过。下次会按新的再找", moved.join("、"));
+            }
+            let message =
+                format!("{}{}", if text(&proposal, "kind") == "self" { "改进者：" } else { "改进：" }, text(&proposal, "summary"));
+            let token = format!("improve:{id}");
+            let error = prompt_store::apply_sections(&sections, &message, Some(token));
+            if !error.is_empty() {
+                return error;
+            }
+            update(id, |item| {
+                item["status"] = json!("accepted");
+                item["decidedAt"] = json!(stamp());
+            });
+            crate::serve_log("learn", &format!("[改进] 采用了：{}", text(&proposal, "summary")));
+            check_self();
+            String::new()
+        }
+
+        /// 提示词提交好了（promptStore.committed）：记下采用后的版本
+        pub fn committed(token: &str, version: &str) {
+            if let Some(id) = token.strip_prefix("improve:").filter(|_| !version.is_empty()) {
+                update(id, |item| item["appliedVersion"] = json!(version));
+            }
+        }
+
+        pub fn dismiss(id: &str) {
+            update(id, |item| {
+                if text(item, "status") == "pending" {
+                    item["status"] = json!("dismissed");
+                    item["decidedAt"] = json!(stamp());
+                }
+            });
+            check_self();
+        }
+
+        // MARK: 改进者自己
+
+        /// 改进者自己。manual 为假（每周的）：成绩不差、一周内找过、有等你看的就不找
+        pub fn run_self(manual: bool) {
+            if all().iter().any(|proposal| text(proposal, "kind") == "self" && text(proposal, "status") == "pending") {
+                if manual {
+                    finish("改进者自己有一条建议还在等你看");
+                }
+                return;
+            }
+            let current = meta();
+            if !manual {
+                if current.reason.is_empty() || !enabled() {
+                    return;
+                }
+                if parse_time(&value("improve.selfLastRun")).is_some_and(|last| (Utc::now() - last).num_days() < 7) {
+                    return;
+                }
+            } else if enabled() && current.decided < 3 {
+                return finish("改进者的建议你还没决定过几条，看不出它哪里不好");
+            }
+            if !begin(manual) {
+                return;
+            }
+            set_value("improve.selfLastRun", &stamp());
+            set_status("在看改进者自己哪里不好…");
+            std::thread::spawn(move || {
+                let rejected = rejected_versions();
+                let lines: Vec<String> = all()
+                    .iter()
+                    .filter(|proposal| text(proposal, "kind") != "self")
+                    .take(12)
+                    .map(|proposal| {
+                        let effect = match effect(proposal, &rejected) {
+                            "improved" => " · 采用后见效",
+                            "worse" => " · 采用后变差",
+                            "rolledBack" => " · 被自动回滚",
+                            _ => "",
+                        };
+                        format!(
+                            "- [{}{}{effect}] {}（诊断：{}）",
+                            if text(proposal, "kind") == "code" { "改代码 · " } else { "" },
+                            status_label(text(proposal, "status")),
+                            text(proposal, "summary"),
+                            truncate(&simplified(text(proposal, "diagnosis")), 160)
+                        )
+                    })
+                    .collect();
+                let sections = prompts::sections(None);
+                let blocks: Vec<String> =
+                    SELF_KEYS.iter().map(|key| format!("@@ {key}\n{}", sections.get(*key).cloned().unwrap_or_default())).collect();
+                let metrics = current.text();
+                let request = prompt(
+                    "improve.self",
+                    &[
+                        ("metrics", metrics.clone()),
+                        ("proposals", if lines.is_empty() { "（没有）".into() } else { lines.join("\n") }),
+                        ("sections", blocks.join("\n\n")),
+                    ],
+                );
+                let reply = match ask_strong(&prompt("improve.system", &[]), &request) {
+                    Ok(reply) => reply,
+                    Err(_) => return finish("没问成模型，这次不改"),
+                };
+                if let Some(none) = json_in(&reply)
+                    .and_then(|object| object.get("none").and_then(Value::as_str).map(str::to_string))
+                    .filter(|none| !none.trim().is_empty())
+                {
+                    return finish(&format!("看过了，改进者先不改：{none}"));
+                }
+                let keys: Vec<String> = SELF_KEYS.iter().map(|key| key.to_string()).collect();
+                let Some((summary, changes, problems)) = changes_of(&reply, &keys) else {
+                    return finish("改进者的改写没按格式回，这次不改");
+                };
+                if changes.is_empty() {
+                    return finish(&if problems.is_empty() {
+                        "改进者的改写和原来一样，这次不改".to_string()
+                    } else {
+                        format!("改进者的改写用不了（{}），这次不改", problems.join("；"))
+                    });
+                }
+                offer(json!({
+                    "id": short_id(), "createdAt": stamp(), "kind": "self", "status": "pending",
+                    "summary": if summary.is_empty() { "改进者改了自己的提示词".to_string() } else { summary },
+                    "diagnosis": metrics, "changes": changes, "baseVersion": prompt_store::state()["version"], "cases": 0, "note": "",
+                }));
+            });
+        }
+
+        /// 采用过的改改进者自己的：采用后你的采用率掉了三成以上就退回
+        fn check_self() {
+            let proposals = all();
+            let mut decisions: Vec<&Value> = proposals
+                .iter()
+                .filter(|proposal| text(proposal, "kind") != "self" && proposal["decidedAt"].is_string())
+                .filter(|proposal| ["accepted", "pushed", "dismissed", "discarded"].contains(&text(proposal, "status")))
+                .collect();
+            decisions.sort_by_key(|proposal| std::cmp::Reverse(text(proposal, "decidedAt").to_string()));
+            let rate = |list: &[&Value]| {
+                let accepted = list.iter().filter(|proposal| ["accepted", "pushed"].contains(&text(proposal, "status"))).count();
+                if list.is_empty() { 0.0 } else { accepted as f64 / list.len() as f64 }
+            };
+            for change in proposals.iter().filter(|proposal| {
+                text(proposal, "kind") == "self" && text(proposal, "status") == "accepted" && text(proposal, "outcome").is_empty()
+            }) {
+                let at = text(change, "decidedAt");
+                let before: Vec<&Value> = decisions.iter().copied().filter(|decision| text(decision, "decidedAt") < at).take(10).collect();
+                let after: Vec<&Value> = decisions.iter().copied().filter(|decision| text(decision, "decidedAt") >= at).collect();
+                if before.len() < 4 || after.len() < 4 {
+                    continue;
+                }
+                let (was, is) = (rate(&before), rate(&after));
+                let compare = format!("采用后你采用的建议 {}% → {}%", (was * 100.0).round() as i64, (is * 100.0).round() as i64);
+                let id = text(change, "id").to_string();
+                if is >= was - 0.3 {
+                    update(&id, |item| {
+                        item["outcome"] = json!("kept");
+                        item["note"] = json!(compare);
+                    });
+                    continue;
+                }
+                let current = prompts::sections(None);
+                let mut restore = BTreeMap::new();
+                let mut moved = false;
+                for item in change["changes"].as_array().into_iter().flatten() {
+                    if current.get(text(item, "key")).map(|text| text.trim()).unwrap_or("") != text(item, "after") {
+                        moved = true;
+                    }
+                    restore.insert(text(item, "key").to_string(), text(item, "before").to_string());
+                }
+                if moved {
+                    update(&id, |item| {
+                        item["outcome"] = json!("kept");
+                        item["note"] = json!(format!("{compare}；那几段之后又改过，没退回"));
+                    });
+                    continue;
+                }
+                let error = prompt_store::apply_sections(&restore, &format!("改进者的提示词效果变差，退回到之前的：{compare}"), None);
+                update(&id, |item| {
+                    item["outcome"] = json!("reverted");
+                    if error.is_empty() {
+                        item["status"] = json!("reverted");
+                    }
+                    item["note"] = json!(if error.is_empty() {
+                        format!("{compare}，已退回")
+                    } else {
+                        format!("{compare}；退回没成：{error}")
+                    });
+                });
+            }
+        }
+
+        // MARK: 改代码
+
+        /// git -C dir args…：退出码（起不来是 -1）和输出
+        fn run_git(dir: &str, arguments: &[&str]) -> (i32, String) {
+            let Some(git) = git() else { return (-1, "没有 git".into()) };
+            match std::process::Command::new(git)
+                .arg("-C")
+                .arg(dir)
+                .args(arguments)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .stdin(std::process::Stdio::null())
+                .output()
+            {
+                Ok(output) => (
+                    output.status.code().unwrap_or(-1),
+                    format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr)).trim().to_string(),
+                ),
+                Err(error) => (-1, error.to_string()),
+            }
+        }
+
+        fn worktree_root() -> PathBuf {
+            crate::serve_dir().join("Improve")
+        }
+
+        fn start_code(proposal: &Value) -> String {
+            if !can_code() {
+                return "改代码要先在下面填好源码目录（git 仓库），并装了 git".into();
+            }
+            let id = text(proposal, "id").to_string();
+            let branch = format!("improve/{id}");
+            let worktree = worktree_root().join(&id).to_string_lossy().into_owned();
+            let _ = std::fs::create_dir_all(worktree_root());
+            update(&id, |item| {
+                item["status"] = json!("working");
+                item["branch"] = json!(branch);
+                item["worktree"] = json!(worktree);
+                item["decidedAt"] = json!(stamp());
+                item["note"] = json!("正在开分支…");
+            });
+            let proposal = proposal.clone();
+            std::thread::spawn(move || {
+                let fail = |why: String| {
+                    update(&id, |item| {
+                        item["status"] = json!("failed");
+                        item["note"] = json!(why);
+                    });
+                };
+                let repo = repository();
+                let (code, output) = run_git(&repo, &["rev-parse", "HEAD"]);
+                if code != 0 {
+                    return fail(format!("读不到源码目录现在的提交：{output}"));
+                }
+                let base = output.trim().to_string();
+                let (code, output) = run_git(&repo, &["worktree", "add", "-b", &branch, &worktree, &base]);
+                if code != 0 {
+                    return fail(format!("开不了工作树：{output}"));
+                }
+                let task = prompt(
+                    "improve.code.task",
+                    &[
+                        ("diagnosis", text(&proposal, "diagnosis").to_string()),
+                        ("task", text(&proposal, "task").to_string()),
+                        ("branch", branch.clone()),
+                        ("base", base.chars().take(7).collect()),
+                        ("protected", protected("path").iter().map(|path| format!("- {path}")).collect::<Vec<_>>().join("\n")),
+                    ],
+                );
+                let started = stamp();
+                let conversation = uuid::Uuid::new_v4().to_string().to_lowercase();
+                let opened = crate::serve_brain_for(&worktree).and_then(|brain| {
+                    brain.request("sessions.create", json!({ "id": conversation, "cwd": worktree }), Duration::from_secs(30))?;
+                    if let Some(path) = crate::stored_session(&conversation).and_then(|stored| stored.path) {
+                        crate::append_title(&path, &format!("改进：{}", truncate(&simplified(text(&proposal, "task")), 20)));
+                    }
+                    let mut request = json!({ "session": conversation, "text": task, "urgency": "queue", "kind": "user" });
+                    crate::with_prefs(&mut request, &conversation, &[]);
+                    brain.request("sense", request, Duration::from_secs(30))
+                });
+                if let Err(error) = opened {
+                    return fail(format!("开不了会话：{error}"));
+                }
+                update(&id, |item| {
+                    item["base"] = json!(base);
+                    item["conversation"] = json!(conversation);
+                    item["startedAt"] = json!(started);
+                    item["note"] = json!(format!("会话在做：编译、跑测试、提交到 {branch}"));
+                });
+            });
+            String::new()
+        }
+
+        /// 一轮结束：是在做改代码的那段会话的话，核对提交了什么
+        pub fn task_done(session: &str, _turn: &str, answer: String) {
+            let Some(proposal) =
+                all().into_iter().find(|proposal| text(proposal, "status") == "working" && text(proposal, "conversation") == session)
+            else {
+                return;
+            };
+            let id = text(&proposal, "id").to_string();
+            let range = format!("{}..HEAD", text(&proposal, "base"));
+            let (code, output) = run_git(text(&proposal, "worktree"), &["diff", "--name-only", &range]);
+            let files: Vec<String> = if code == 0 {
+                output.lines().map(str::trim).filter(|line| !line.is_empty()).map(str::to_string).collect()
+            } else {
+                Vec::new()
+            };
+            let touched = protected_paths(&files);
+            let (status, note) = if code != 0 {
+                ("failed", format!("核对不了提交：{output}"))
+            } else if files.is_empty() {
+                ("failed", "会话做完了，但没有提交改动".to_string())
+            } else if !touched.is_empty() {
+                ("blocked", format!("改了受保护的文件，不交给你推送：{}", touched.join("、")))
+            } else {
+                ("branch", format!("会话做完了，改了 {} 个文件；看过后推送分支或丢掉", files.len()))
+            };
+            update(&id, |item| {
+                item["status"] = json!(status);
+                item["note"] = json!(note);
+                item["files"] = json!(files);
+                item["reply"] = json!(truncate(&answer, 1200));
+            });
+            crate::serve_log("learn", &format!("[改进] 改代码：{note}"));
+            // 没做成的：工作树、分支留着没用，收掉
+            if status == "failed" {
+                discard(&id);
+            }
+        }
+
+        /// 改代码的分支好了：推送到 origin
+        pub fn push(id: &str) {
+            let Some(proposal) = find(id).filter(|proposal| text(proposal, "status") == "branch") else { return };
+            update(id, |item| item["note"] = json!("正在推送…"));
+            let id = id.to_string();
+            std::thread::spawn(move || {
+                let (code, output) = run_git(text(&proposal, "worktree"), &["push", "-u", "origin", text(&proposal, "branch")]);
+                update(&id, |item| {
+                    if code == 0 {
+                        item["status"] = json!("pushed");
+                        item["decidedAt"] = json!(stamp());
+                        item["note"] = json!(format!("推送了 {}；合并由你决定", text(item, "branch")));
+                    } else {
+                        item["note"] = json!(format!("没推送成：{}", truncate(&output, 300)));
+                    }
+                });
+                check_self();
+            });
+        }
+
+        /// 改代码的：删掉工作树和分支
+        pub fn discard(id: &str) {
+            let Some(proposal) = find(id) else { return };
+            let failed = text(&proposal, "status") == "failed";
+            update(id, |item| {
+                if !failed {
+                    item["status"] = json!("discarded");
+                }
+                item["decidedAt"] = json!(stamp());
+            });
+            let (repo, worktree, branch) = (repository(), text(&proposal, "worktree").to_string(), text(&proposal, "branch").to_string());
+            if repo.is_empty() || worktree.is_empty() {
+                return;
+            }
+            std::thread::spawn(move || {
+                run_git(&repo, &["worktree", "remove", "--force", &worktree]);
+                if !branch.is_empty() {
+                    run_git(&repo, &["branch", "-D", &branch]);
+                }
+            });
+        }
+
+        /// improve.*
+        pub fn request(method: &str, params: &Value) -> crate::Reply {
+            let invalid = |message: &str| Err((-32602, message.to_string()));
+            match method {
+                "improve.get" => {}
+                "improve.run" => run(true),
+                "improve.runSelf" => run_self(true),
+                "improve.setEnabled" => {
+                    let Some(enabled) = params["value"].as_bool() else { return invalid("缺少参数 value") };
+                    set_value("improve.enabled", if enabled { "1" } else { "" });
+                }
+                "improve.setEngine" => {
+                    let Some(id) = params["id"].as_str() else { return invalid("缺少参数 id") };
+                    set_value("improve.engine", id);
+                }
+                "improve.setRepository" => {
+                    let Some(path) = params["path"].as_str() else { return invalid("缺少参数 path") };
+                    // 空 = 不提改代码的建议
+                    let path = path.trim().trim_end_matches(['/', '\\']);
+                    let path = if path.is_empty() { String::new() } else { crate::expand_tilde(path).to_string_lossy().into_owned() };
+                    set_value("improve.repo", &path);
+                }
+                _ => {
+                    let id = params["id"].as_str().unwrap_or("");
+                    if id.is_empty() || find(id).is_none() {
+                        return Err((crate::NOT_FOUND, "没有这条改进建议".into()));
+                    }
+                    match method {
+                        "improve.accept" => {
+                            let error = accept(id);
+                            if !error.is_empty() {
+                                return Err((crate::NOT_ALLOWED, error));
+                            }
+                        }
+                        "improve.dismiss" => dismiss(id),
+                        "improve.push" => push(id),
+                        "improve.discard" => discard(id),
+                        other => return Err((-32601, format!("没有这个方法：{other}"))),
+                    }
+                }
+            }
+            changed();
+            Ok(state())
+        }
+    }
+
+    // MARK: - 起来
+
+    /// 常驻那份起来时：每 2 秒写回改过的，每 10 分钟看一次（起来 1 分钟后先看）：补整理、判定、遗忘、每天找一次改进、成绩差时每周改一次改进者自己
+    pub fn start() {
+        std::thread::spawn(|| {
+            loop {
+                std::thread::sleep(Duration::from_secs(2));
+                flush();
+            }
+        });
+        let tick = std::env::var("EDITH_FRIDAY_LEARN_TICK").ok().and_then(|text| text.parse().ok()).unwrap_or(600u64);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(tick.min(60)));
+            loop {
+                check();
+                improve::run(false);
+                improve::run_self(false);
+                std::thread::sleep(Duration::from_secs(tick));
+            }
+        });
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn terms_and_rank() {
+            assert_eq!(terms("提交用 integemjack 身份"), ["提交", "交用", "integemjack", "身份"]);
+            let documents = vec!["提交用 integemjack 身份".to_string(), "这个项目用 cargo test 测".to_string()];
+            let ranked = rank("用什么身份提交", &documents);
+            assert_eq!(ranked.first().map(|(index, _)| *index), Some(0));
+            assert!(rank("", &documents).is_empty());
+        }
+
+        #[test]
+        fn protected_and_editable() {
+            assert!(improve::protected_paths(&["core/src/lib.rs".into(), "src/brain.rs".into(), "./Cargo.lock".into()]).len() == 2);
+            assert!(improve::protected_paths(&["tools/friday/src/main.rs".into()]).len() == 1);
+        }
+
+        #[test]
+        fn json_in_finds_the_object() {
+            assert_eq!(json_in("好的：```json\n{\"a\":1}\n```").unwrap()["a"], json!(1));
+            assert!(json_in("没有").is_none());
+        }
     }
 }
 
