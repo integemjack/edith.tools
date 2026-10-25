@@ -41,7 +41,8 @@ Friday 客户端 ──SSH──▶ edith-friday --attach（一条连接一个�
 - **会话上选的**：权限模式、思考档位、模型、任务模式随每句话交给大脑（`sense` 的 `mode` / `thinking` / `engine` / `team`），附件里的图片单独列出（`images`，模型能看图时给它）。
   任务模式在 EDITH 上只有两种：**原来的**（`delegatesHeavy`，主智能体需要时自己派子智能体）和**工作流**（`ultra` → `team: "workflow"`：主智能体直接有
   `run_workflow`，先定完整流程交给子智能体并联 / 串联做，回来验收、打回）；客户端选「不派子智能体」（还有旧的「只派」）按原来的记。
-  按会话记（`runner.setTeamMode`，特性 `teamModePerConversation`），同时记成新对话的默认。
+  按会话记（`runner.setTeamMode`，特性 `teamModePerConversation`），同时记成新对话的默认。hello 的 `server.teamModes` 报
+  `["delegatesHeavy", "ultra"]`：Friday 2.82 起的客户端任务模式菜单、`/mode` 只列这两项，选着「不派」的显示成需要时派（更早的客户端照旧三项）。
   模型列表读 EDITH 的 `config.json`（顶层那个是 `edith`，`engines` 里的照原样），设置里加改删模型、存删密钥写回 `config.json` / `secrets.json`。
 - **设置页、记忆**：设置 › 智能体（系统提示、要不要批准、新对话的权限模式和模型、默认工作目录）、设置 › 工具（工具开关、技能、MCP 服务）改的是
   EDITH 的 `config.json`、`mcp.json`；工具清单问默认工作目录的大脑（`tools.list`）。设置 › 记忆直接读写 EDITH 的 `memory.json`（模型用 save_memory / search_memory）。

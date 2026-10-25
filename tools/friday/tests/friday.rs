@@ -227,6 +227,7 @@ fn friday_client_through_gateway() {
     assert_eq!(hello["server"]["version"], "0.0.0", "不让客户端自动升级");
     assert!(hello["server"]["features"].as_array().unwrap().contains(&json!("mkdir")));
     assert!(hello["server"]["features"].as_array().unwrap().contains(&json!("teamModePerConversation")), "任务模式跟随会话");
+    assert_eq!(hello["server"]["teamModes"], json!(["delegatesHeavy", "ultra"]), "EDITH 只有需要时派和工作流：客户端菜单只列这两项");
     assert!(has(&hello["state"]["runner"]["generating"], SESSION), "{}", hello["state"]["runner"]);
     let summaries = hello["state"]["summaries"].as_array().unwrap();
     assert_eq!(summaries.len(), 1);

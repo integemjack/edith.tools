@@ -3732,6 +3732,8 @@ fn server_info() -> Value {
         "clientDevices": { "power": false },
         // 选目录时新建文件夹；runner.submit 认 whenBusy；会话的动静（客户端的助手看这台）、助手开没开
         "features": features(),
+        // EDITH 只有原来的（需要时派、能往下派）和工作流：客户端（2.82 起）的任务模式菜单、/mode 只列这两项，选着「不派」的显示成需要时派
+        "teamModes": ["delegatesHeavy", "ultra"],
     })
 }
 
