@@ -2895,6 +2895,22 @@ fn settings_request(method: &str, params: &Value) -> Reply {
             if engines_changed {
                 event("engines", engines_state());
             }
+            // 只听你的声音、声纹的严格程度、说完一句等多久（客户端推过来）：这台的助手的语音、通话照这个
+            let mut voice = Map::new();
+            for key in ["voiceOnlyEnrolled", "voiceprintStrictness", "voicePatience"] {
+                match &params[key] {
+                    Value::Bool(on) => {
+                        voice.insert(key.into(), json!(on));
+                    }
+                    Value::Number(number) => {
+                        voice.insert(key.into(), json!(number.as_i64().unwrap_or(1).clamp(0, 2)));
+                    }
+                    _ => {}
+                }
+            }
+            if !voice.is_empty() {
+                let _ = hub_forward("assistant.settings.update", &Value::Object(voice));
+            }
             config_changed(&["settings"]);
             Ok(settings_state())
         }
@@ -4162,7 +4178,40 @@ fn fork(params: &Value) -> Reply {
     Ok(json!({ "id": upper(&id) }))
 }
 
+/// 常驻那份替 SChat 的远程工作通道起的网关（EDITH_FRIDAY_CHANNEL=work）
+fn work_channel() -> bool {
+    std::env::var("EDITH_FRIDAY_CHANNEL").is_ok_and(|channel| channel == "work")
+}
+
+/// 工作通道进来的不能做的（Friday 仓库 qt/docs/REMOTE.md §2）：管理类、会马上在这台上跑代码的配置、装 / 改插件、会话同步、搬助手的数据
+fn ssh_only(method: &str) -> bool {
+    (method.starts_with("server.") && method != "server.status")
+        || method.starts_with("sync.")
+        || method.starts_with("assistant.export.")
+        || method.starts_with("assistant.import.")
+        || matches!(
+            method,
+            "mcp.update"
+                | "mcp.saveServer"
+                | "mcp.saveConfigText"
+                | "mcp.importText"
+                | "tools.saveScript"
+                | "tools.testScript"
+                | "tools.rollback"
+                | "tools.createScript"
+                | "capabilities.import"
+                | "capabilities.retest"
+                | "plugins.install"
+                | "plugins.update"
+                | "hooks.saveGlobal"
+                | "hooks.trust"
+        )
+}
+
 fn handle(method: &str, params: &Value) -> Reply {
+    if work_channel() && ssh_only(method) {
+        return Err((NOT_ALLOWED, "这个操作只能在登录了这台机器的连接（SSH）里做".into()));
+    }
     if method == "hello" {
         return hello(params);
     }
@@ -20226,6 +20275,287 @@ mod wsclient {
     }
 }
 
+mod voiceprint {
+    //! 声纹（同 Friday 的 Voiceprint，Friday 仓库 qt/docs/ASSISTANT.md §8、§16.2–16.3）：本地语音（voice 0.2 起，CAM++）给每句话算 192 维声纹，
+    //! 实时听写开了 speaker 时每句的 partial / final 带着；这里存「你」的声纹（`~/.edith/friday/voiceprint.json`，同 Friday 的格式），判断一句话是不是你说的。
+    //! - 登记：语音 / 电话里让助手登记（它的 voiceprint 工具），接下来说的三句（每句 1.5 秒以上，不交给助手）取平均；几句不像同一个人就不存。
+    //! - 判断：跟登记的、最近的你、没作废的临时的取最像的；门槛看严格程度（宽松 0.35 / 标准 0.45 / 严格 0.55），不到 1.5 秒的放宽 0.15；
+    //!   电话里是手机麦克风 + 压缩，再松一档。
+    //! - 热更新：交给了助手、≥ 3 秒、跟登记的或最近的你 ≥ 0.6 的，往「最近的你」挪 10%，挪完跟登记的不到 0.5 就不挪；
+    //!   「是我说的」（assistant.voice.confirm）记成临时的，14 天作废、最多 5 个。改之前都重新读文件。
+
+    use std::path::PathBuf;
+
+    use serde_json::{Value, json};
+
+    pub const ADAPT_MIN_MS: i64 = 3000;
+    const ADAPT_MIN_SIMILARITY: f32 = 0.6;
+    const ADAPT_RATE: f32 = 0.1;
+    const ANCHOR_MIN_SIMILARITY: f32 = 0.5;
+    const TEMPORARY_DAYS: i64 = 14;
+    const TEMPORARY_MAX: usize = 5;
+    const SHORT_MS: i64 = 1500;
+    /// 登记要几句、每句至少多长
+    pub const ENROLL_SENTENCES: usize = 3;
+    pub const ENROLL_MIN_MS: i64 = 1500;
+
+    pub struct Temporary {
+        pub vector: Vec<f32>,
+        pub at: String,
+        pub until: chrono::DateTime<chrono::Utc>,
+        pub text: String,
+    }
+
+    pub struct Enrolled {
+        /// 登记的（锚点，单位向量）
+        pub vector: Vec<f32>,
+        pub sentences: i64,
+        pub at: String,
+        /// 最近的你（空 = 还没更新过）
+        pub recent: Vec<f32>,
+        pub updates: i64,
+        pub recent_at: String,
+        /// 临时记住的（读的时候已经去掉作废的）
+        pub temporary: Vec<Temporary>,
+    }
+
+    impl Enrolled {
+        /// 跟你像不像：登记的、最近的你、没作废的临时的，取最像的
+        pub fn matches(&self, heard: &[f32]) -> f32 {
+            let now = chrono::Utc::now();
+            self.temporary
+                .iter()
+                .filter(|item| item.until > now)
+                .fold(self.stable(heard), |best, item| best.max(similarity(heard, &item.vector)))
+        }
+
+        /// 只看登记的和最近的你（能不能拿这句来更新最近的你）
+        fn stable(&self, heard: &[f32]) -> f32 {
+            let anchor = similarity(heard, &self.vector);
+            if self.recent.is_empty() { anchor } else { anchor.max(similarity(heard, &self.recent)) }
+        }
+    }
+
+    fn file() -> PathBuf {
+        crate::serve_dir().join("voiceprint.json")
+    }
+
+    /// 一句的声纹（JSON 数组）
+    pub fn vector_of(value: &Value) -> Vec<f32> {
+        value.as_array().map(|list| list.iter().filter_map(Value::as_f64).map(|x| x as f32).collect()).unwrap_or_default()
+    }
+
+    fn rounded(vector: &[f32]) -> Value {
+        json!(vector.iter().map(|x| ((*x as f64) * 10000.0).round() / 10000.0).collect::<Vec<_>>())
+    }
+
+    pub fn load() -> Option<Enrolled> {
+        let object = crate::read_json_file(&file());
+        let vector = vector_of(&object["vector"]);
+        if vector.is_empty() {
+            return None;
+        }
+        let text = |value: &Value| value.as_str().unwrap_or("").to_string();
+        let mut enrolled = Enrolled {
+            sentences: object["sentences"].as_i64().unwrap_or(0),
+            at: text(&object["at"]),
+            recent: Vec::new(),
+            updates: 0,
+            recent_at: String::new(),
+            temporary: Vec::new(),
+            vector,
+        };
+        // 维度对不上的不要（换了声纹模型）
+        let recent = vector_of(&object["recent"]["vector"]);
+        if recent.len() == enrolled.vector.len() {
+            enrolled.recent = recent;
+            enrolled.updates = object["recent"]["updates"].as_i64().unwrap_or(0);
+            enrolled.recent_at = text(&object["recent"]["at"]);
+        }
+        let now = chrono::Utc::now();
+        for item in object["temporary"].as_array().into_iter().flatten() {
+            let vector = vector_of(&item["vector"]);
+            let until = item["until"]
+                .as_str()
+                .and_then(|until| chrono::DateTime::parse_from_rfc3339(until).ok())
+                .map(|until| until.with_timezone(&chrono::Utc));
+            if let Some(until) = until.filter(|until| *until > now)
+                && vector.len() == enrolled.vector.len()
+            {
+                enrolled.temporary.push(Temporary { vector, at: text(&item["at"]), until, text: text(&item["text"]) });
+            }
+        }
+        Some(enrolled)
+    }
+
+    fn save(enrolled: &Enrolled) -> bool {
+        let mut object =
+            json!({ "vector": rounded(&enrolled.vector), "sentences": enrolled.sentences, "at": enrolled.at, "model": "campplus" });
+        if !enrolled.recent.is_empty() {
+            object["recent"] = json!({ "vector": rounded(&enrolled.recent), "updates": enrolled.updates, "at": enrolled.recent_at });
+        }
+        if !enrolled.temporary.is_empty() {
+            object["temporary"] = Value::Array(
+                enrolled
+                    .temporary
+                    .iter()
+                    .map(|item| json!({ "vector": rounded(&item.vector), "at": item.at, "until": crate::iso(item.until.into()), "text": item.text }))
+                    .collect(),
+            );
+        }
+        crate::write_json_file(&file(), &object).is_ok()
+    }
+
+    /// 余弦相似度
+    pub fn similarity(a: &[f32], b: &[f32]) -> f32 {
+        if a.len() != b.len() || a.is_empty() {
+            return 0.0;
+        }
+        let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+        for (x, y) in a.iter().zip(b) {
+            dot += *x as f64 * *y as f64;
+            na += *x as f64 * *x as f64;
+            nb += *y as f64 * *y as f64;
+        }
+        if na > 0.0 && nb > 0.0 { (dot / (na * nb).sqrt()) as f32 } else { 0.0 }
+    }
+
+    fn normalized(vector: Vec<f64>) -> Vec<f32> {
+        let n = vector.iter().map(|x| x * x).sum::<f64>();
+        let inverse = if n > 0.0 { 1.0 / n.sqrt() } else { 0.0 };
+        vector.into_iter().map(|x| (x * inverse) as f32).collect()
+    }
+
+    /// 几句的声纹各自归一化后取平均、再归一化
+    pub fn average(vectors: &[Vec<f32>]) -> Vec<f32> {
+        let Some(first) = vectors.first() else { return Vec::new() };
+        let dimensions = first.len();
+        let mut sum = vec![0f64; dimensions];
+        for vector in vectors.iter().filter(|vector| vector.len() == dimensions) {
+            let unit = normalized(vector.iter().map(|x| *x as f64).collect());
+            for (total, x) in sum.iter_mut().zip(unit) {
+                *total += x as f64;
+            }
+        }
+        normalized(sum)
+    }
+
+    /// 算你的门槛：严格程度 0–2（宽松 / 标准 / 严格）；不到 1.5 秒（或不知道，-1）放宽 0.15
+    pub fn threshold(strictness: i64, duration_ms: i64) -> f32 {
+        let base = match strictness {
+            i64::MIN..=0 => 0.35,
+            2.. => 0.55,
+            _ => 0.45,
+        };
+        if duration_ms >= SHORT_MS { base } else { base - 0.15 }
+    }
+
+    /// 登记：几句的声纹取平均存起来（换掉原来的，连同最近的你、临时的）；几句不像同一个人就不存
+    pub fn enroll(vectors: &[Vec<f32>]) -> Result<(), String> {
+        let average = average(vectors);
+        let worst = vectors.iter().map(|vector| similarity(vector, &average)).fold(1.0f32, f32::min);
+        if average.is_empty() || worst < 0.5 {
+            return Err("这几句听起来不像同一个人（或者旁边有人在说话），换个安静的地方重新登记".into());
+        }
+        let enrolled = Enrolled {
+            vector: average,
+            sentences: vectors.len() as i64,
+            at: crate::iso(std::time::SystemTime::now()),
+            recent: Vec::new(),
+            updates: 0,
+            recent_at: String::new(),
+            temporary: Vec::new(),
+        };
+        if save(&enrolled) { Ok(()) } else { Err(format!("存不了声纹（{}）", file().display())) }
+    }
+
+    /// 这句交给了助手：够格就把最近的你往它挪一小步并存盘；回挪没挪
+    pub fn adapt(heard: &[f32], duration_ms: i64) -> bool {
+        let Some(mut enrolled) = load() else { return false };
+        if duration_ms < ADAPT_MIN_MS || heard.len() != enrolled.vector.len() || enrolled.stable(heard) < ADAPT_MIN_SIMILARITY {
+            return false;
+        }
+        let base = if enrolled.recent.is_empty() { enrolled.vector.clone() } else { enrolled.recent.clone() };
+        let moved = normalized(
+            base.iter().zip(heard).map(|(old, new)| (1.0 - ADAPT_RATE) as f64 * *old as f64 + ADAPT_RATE as f64 * *new as f64).collect(),
+        );
+        // 离登记的太远就不挪（一步步漂走、被别人带偏）
+        if similarity(&moved, &enrolled.vector) < ANCHOR_MIN_SIMILARITY {
+            return false;
+        }
+        enrolled.recent = moved;
+        enrolled.updates += 1;
+        enrolled.recent_at = crate::iso(std::time::SystemTime::now());
+        save(&enrolled)
+    }
+
+    /// 「是我说的」：记下一份临时的（满了丢最早的）；没登记、存不了回 false
+    pub fn remember(heard: &[f32], text: &str) -> bool {
+        let Some(mut enrolled) = load() else { return false };
+        if heard.len() != enrolled.vector.len() {
+            return false;
+        }
+        let now = chrono::Utc::now();
+        enrolled.temporary.push(Temporary {
+            vector: heard.to_vec(),
+            at: crate::iso(std::time::SystemTime::now()),
+            until: now + chrono::Duration::days(TEMPORARY_DAYS),
+            text: text.chars().take(60).collect(),
+        });
+        if enrolled.temporary.len() > TEMPORARY_MAX {
+            let extra = enrolled.temporary.len() - TEMPORARY_MAX;
+            enrolled.temporary.drain(..extra);
+        }
+        save(&enrolled)
+    }
+
+    /// 恢复成登记时的：去掉最近的你和临时的
+    pub fn reset_adapted() -> bool {
+        let Some(mut enrolled) = load() else { return false };
+        enrolled.recent.clear();
+        enrolled.updates = 0;
+        enrolled.recent_at.clear();
+        enrolled.temporary.clear();
+        save(&enrolled)
+    }
+
+    pub fn clear() {
+        let _ = std::fs::remove_file(file());
+    }
+
+    /// 给人看的一句：「用 3 句话登记，10-24 14:51；自动更新过 12 次；临时记住 1 个」
+    pub fn describe() -> String {
+        let Some(enrolled) = load() else { return "还没登记声纹".into() };
+        let at = chrono::DateTime::parse_from_rfc3339(&enrolled.at)
+            .map(|at| at.with_timezone(&chrono::Local).format("%-m-%-d %H:%M").to_string())
+            .unwrap_or_default();
+        let mut text = format!("用 {} 句话登记，{at}", enrolled.sentences);
+        if !enrolled.recent.is_empty() {
+            text += &format!("；自动更新过 {} 次", enrolled.updates);
+        }
+        if !enrolled.temporary.is_empty() {
+            text += &format!("；临时记住 {} 个", enrolled.temporary.len());
+        }
+        text
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn thresholds_and_average() {
+            assert_eq!(threshold(1, 2000), 0.45);
+            assert!((threshold(0, 1000) - 0.20).abs() < 1e-6);
+            assert_eq!(threshold(2, -1), 0.55 - 0.15);
+            let a = vec![1.0, 0.0, 0.0];
+            let b = vec![0.9, 0.1, 0.0];
+            let average = average(&[a.clone(), b.clone()]);
+            assert!(similarity(&average, &a) > 0.9 && similarity(&a, &[0.0, 1.0, 0.0]) == 0.0);
+        }
+    }
+}
+
 mod voice {
     //! 实时语音（Friday 远程协议的 voice.*，Friday 仓库 qt/docs/REMOTE.md §6「语音」）：客户端只管麦克风和喇叭，听写、交给大脑、边写边念、
     //! 插话都在这台做。说的话交给这台的助手（assistant：EDITH 里那段「助手」会话，同桌面端、渠道说的是同一个助手；助手关着时不能用），
@@ -20233,6 +20563,9 @@ mod voice {
     //! （Friday.Powers 的 docs/voice-protocol.md）。一台同时只有一路：后开的接过来，原来那一路停下、说明被谁接过去了。
     //! 音频一律 16 位小端单声道 PCM，base64。
     //! 助手的通话（calls）用的也是这一路：听的是电话里对方的声音（16 kHz），念的送进通话（48 kHz），说的话记成来源 call:<渠道>；打电话时接过来。
+    //! 只听你的声音（设置 voiceOnlyEnrolled，默认开；登记过声纹、本地语音能算声纹时）：听写带上每句的声纹，不像你的不交、不打断，
+    //! 记一条说明（带那句的声纹，点「是我说的」记成临时的）；电话里门槛松一档。助手在说 / 在想时不到两个实在的字的（附和、杂音）不交。
+    //! 登记声纹（助手的 voiceprint 工具）：接下来说的三句不交给助手，取平均存起来（voiceprint）。
 
     use std::sync::{LazyLock, Mutex};
     use std::time::Duration;
@@ -20283,6 +20616,12 @@ mod voice {
         speaker: Option<wsclient::Writer>,
         /// 用户插话：念着的压低了
         ducked: bool,
+        /// 本地语音能算声纹（听写带 speaker）
+        speaker_supported: bool,
+        /// 正按声纹过滤（voice.state 的 filtering）
+        filtering: bool,
+        /// 正在登记声纹：已经收下的几句
+        enrolling: Option<Vec<Vec<f32>>>,
         /// 这一路的代次：旧连接的读线程看到不是自己的就退出
         generation: u64,
     }
@@ -20310,12 +20649,26 @@ mod voice {
         Ok(())
     }
 
+    /// 本地语音能不能给每句算声纹（voice 0.2 起声明 speakerEmbedding）
+    fn speaker_supported() -> bool {
+        let state = crate::powers::state();
+        state["powers"].as_array().into_iter().flatten().any(|power| {
+            power["id"] == "voice"
+                && power["capabilities"].as_array().is_some_and(|list| list.iter().any(|item| item == "speakerEmbedding"))
+        })
+    }
+
+    /// 按不按声纹过滤：设置开着、登记过、能算
+    fn filtering(supported: bool) -> bool {
+        supported && crate::assistant::config()["voiceOnlyEnrolled"] != json!(false) && crate::voiceprint::load().is_some()
+    }
+
     fn state_of(voice: Option<&Voice>, client: &str) -> Value {
         let ready = available();
         match voice {
             Some(voice) if voice.sink == Sink::Client(client.to_string()) => json!({
                 "available": ready.is_ok(), "active": true, "state": voice.state, "caption": voice.caption, "pending": voice.pending,
-                "error": voice.error, "held": voice.held, "filtering": false,
+                "error": voice.error, "held": voice.held, "filtering": voice.filtering,
             }),
             other => json!({
                 "available": ready.is_ok(), "active": false, "state": "idle", "caption": "", "pending": "",
@@ -20391,8 +20744,16 @@ mod voice {
             }
         }
         let (transcriber, mut transcribe_reader) = wsclient::connect(&format!("ws://{host}/v1/realtime/transcribe?token={token}"))?;
+        // 说完一句等多久（设置 voicePatience：很快交 / 标准 / 边想边说）；能算声纹就每句带上
+        let silence = match crate::assistant::config()["voicePatience"].as_i64().unwrap_or(1) {
+            0 => 300,
+            2 => 800,
+            _ => 450,
+        };
+        let supported = speaker_supported();
         transcriber.text(
-            &json!({ "type": "start", "sample_rate": input_rate, "language": "auto", "end_silence_ms": 450, "partials": true }).to_string(),
+            &json!({ "type": "start", "sample_rate": input_rate, "language": "auto", "end_silence_ms": silence, "partials": true, "speaker": supported })
+                .to_string(),
         );
         let (speaker, mut speak_reader) = wsclient::connect(&format!("ws://{host}/v1/realtime/speak?token={token}"))?;
         speaker.text(&json!({ "type": "start", "sample_rate": output_rate }).to_string());
@@ -20419,6 +20780,9 @@ mod voice {
             transcriber: Some(transcriber),
             speaker: Some(speaker),
             ducked: false,
+            speaker_supported: supported,
+            filtering: filtering(supported),
+            enrolling: None,
             generation,
         });
         // 听写：开口（插话时压低念着的）、实时字幕、定稿交给大脑
@@ -20446,6 +20810,11 @@ mod voice {
                     }
                     Some("final") => {
                         let said = event["text"].as_str().unwrap_or("").trim().to_string();
+                        let vector = crate::voiceprint::vector_of(&event["speaker"]);
+                        let duration = match (event["start_ms"].as_i64(), event["end_ms"].as_i64()) {
+                            (Some(start), Some(end)) if end > start => end - start,
+                            _ => -1,
+                        };
                         let held = with(generation, |voice| {
                             voice.caption.clear();
                             if voice.held && !said.is_empty() {
@@ -20455,7 +20824,7 @@ mod voice {
                         });
                         emit_state();
                         if held == Some(false) && !said.is_empty() {
-                            submit(generation, &said);
+                            heard_sentence(generation, &said, vector, duration);
                         }
                     }
                     Some("speech_end") => {
@@ -20550,8 +20919,127 @@ mod voice {
         crate::assistant::session()
     }
 
-    /// 说完一句：交给大脑（在回话的话就是插话：念着的停下，补充进这一轮）
-    fn submit(generation: u64, said: &str) {
+    /// 实在的字（字母、数字、汉字……）有几个
+    fn meaningful(said: &str) -> usize {
+        said.chars().filter(|c| c.is_alphanumeric()).count()
+    }
+
+    fn round2(value: f32) -> Value {
+        json!(((value as f64) * 100.0).round() / 100.0)
+    }
+
+    /// 听写定稿了一句：在登记就收下；杂音、助手忙时的附和、不像你的不交；交了的带上相似度
+    fn heard_sentence(generation: u64, said: &str, vector: Vec<f32>, duration: i64) {
+        // 登记声纹：这句收下（不交给助手）
+        let enrolling = with(generation, |voice| {
+            let list = voice.enrolling.as_mut()?;
+            let note = if vector.is_empty() {
+                "这句没算出声纹，再说一遍".to_string()
+            } else if (0..crate::voiceprint::ENROLL_MIN_MS).contains(&duration) {
+                "这句太短了，说完整一点".to_string()
+            } else {
+                list.push(vector.clone());
+                String::new()
+            };
+            let done = (list.len() >= crate::voiceprint::ENROLL_SENTENCES).then(|| voice.enrolling.take().unwrap_or_default());
+            Some((note, done, voice.enrolling.as_ref().map(Vec::len).unwrap_or(0), voice.source.clone()))
+        })
+        .flatten();
+        if let Some((note, done, count, source)) = enrolling {
+            let words = match done {
+                Some(vectors) => match crate::voiceprint::enroll(&vectors) {
+                    Ok(()) => {
+                        with(generation, |voice| voice.filtering = filtering(voice.speaker_supported));
+                        crate::assistant::note(&format!("声纹登记好了：{}", crate::voiceprint::describe()), &source);
+                        "声纹登记好了，之后只听你的声音。".to_string()
+                    }
+                    Err(error) => {
+                        crate::assistant::note(&format!("声纹没登记上：{error}"), &source);
+                        format!("没登记上：{error}")
+                    }
+                },
+                None if !note.is_empty() => note,
+                None => format!("好，第 {count} 句，再说一句。"),
+            };
+            say(&words);
+            return;
+        }
+        // 只听出一个字母（「O.」「H.」）：杂音
+        if meaningful(said) <= 1 && said.is_ascii() {
+            return;
+        }
+        let Some((supported, busy, call, source)) = with(generation, |voice| {
+            (voice.speaker_supported, voice.speaking || voice.turn.is_some(), matches!(voice.sink, Sink::Call(_)), voice.source.clone())
+        }) else {
+            return;
+        };
+        // 助手在说 / 在想时：附和、杂音（不到两个实在的字）不交、不打断
+        if busy && meaningful(said) < 2 {
+            return;
+        }
+        let filtering = filtering(supported);
+        with(generation, |voice| voice.filtering = filtering);
+        let mut data = json!({});
+        if filtering {
+            match crate::voiceprint::load() {
+                Some(enrolled) if !vector.is_empty() => {
+                    let strictness = crate::assistant::config()["voiceprintStrictness"].as_i64().unwrap_or(1).clamp(0, 2);
+                    // 电话里是手机麦克风 + 压缩，自己的也低一些：松一档
+                    let threshold = crate::voiceprint::threshold(if call { (strictness - 1).max(0) } else { strictness }, duration);
+                    let similarity = enrolled.matches(&vector);
+                    if similarity < threshold {
+                        crate::assistant::note_with(
+                            &format!("没交给助手（不像你的声音：相似度 {similarity:.2}，要到 {threshold:.2}）：{said}"),
+                            &source,
+                            json!({ "voiceprint": round2(similarity), "voiceprintThreshold": round2(threshold), "durationMs": duration, "voiceprintVector": vector, "heard": said }),
+                        );
+                        return;
+                    }
+                    data["voiceprint"] = round2(similarity);
+                    if !busy && duration >= crate::voiceprint::ADAPT_MIN_MS {
+                        crate::voiceprint::adapt(&vector, duration);
+                    }
+                }
+                // 太短算不出声纹：助手又在说 / 在想时不交（多半是附和、杂音）
+                _ if busy => return,
+                _ => {}
+            }
+        }
+        submit(generation, said, data);
+    }
+
+    /// 开始登记声纹（助手的 voiceprint 工具）：接下来说的三句收下
+    pub fn start_enrollment() -> Result<String, String> {
+        let mut voice = VOICE.lock().unwrap();
+        let Some(voice) = voice.as_mut() else {
+            return Err("现在没有在用语音或电话：要在语音模式或电话里登记声纹".into());
+        };
+        if !voice.speaker_supported {
+            return Err("这台的本地语音算不了声纹：要更新到 0.2 以上（设置 › 能力）".into());
+        }
+        voice.enrolling = Some(Vec::new());
+        Ok(format!(
+            "开始登记声纹：请用户用平常说话的声音接着说 {} 句话，每句一秒半以上（这几句不交给你，登记好了会直接告诉用户）",
+            crate::voiceprint::ENROLL_SENTENCES
+        ))
+    }
+
+    /// 声纹变了（清掉、恢复）：重新看按不按声纹过滤
+    pub fn voiceprint_changed() {
+        let changed = {
+            let mut voice = VOICE.lock().unwrap();
+            voice.as_mut().map(|voice| {
+                let filtering = filtering(voice.speaker_supported);
+                std::mem::replace(&mut voice.filtering, filtering) != filtering
+            })
+        };
+        if changed == Some(true) {
+            emit_state();
+        }
+    }
+
+    /// 说完一句：交给大脑（在回话的话就是插话：念着的停下，补充进这一轮）；data 记在用户那条上（声纹相似度、摄像头的画面）
+    fn submit(generation: u64, said: &str, data: Value) {
         let interrupting = with(generation, |voice| {
             let busy = voice.speaking || voice.turn.is_some();
             voice.muted = voice.turn.is_some() && voice.streaming;
@@ -20579,9 +21067,21 @@ mod voice {
                     voice.source.clone()
                 })
                 .unwrap_or_else(|| "voice".into());
+                // 视频通话：带上对方摄像头最新的一帧
+                let mut data = data;
+                let mut images = Vec::new();
+                if let Some(channel) = source.strip_prefix("call:")
+                    && let Some(picture) = crate::calls::camera_picture(channel)
+                {
+                    let name =
+                        std::path::Path::new(&picture).file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+                    data["attachments"] = json!([{ "path": picture, "name": name }]);
+                    images.push(picture);
+                }
+                data["spoken"] = json!(true);
                 // 记进助手的日志，交给助手（在回话就打断它带上这句重来）
-                crate::assistant::heard(&said, &source);
-                let turn = crate::assistant::submit(&said, &source, "auto")?;
+                crate::assistant::heard(&said, &source, data);
+                let turn = crate::assistant::submit_with(&said, &source, "auto", &images)?;
                 if let Some(turn) = Some(turn).filter(|turn| !turn.is_empty()) {
                     with(generation, |voice| {
                         if voice.turn.is_some() {
@@ -20832,7 +21332,7 @@ mod voice {
                             std::thread::sleep(Duration::from_millis(400));
                             let pending = with(generation, |voice| std::mem::take(&mut voice.pending)).unwrap_or(pending);
                             if !pending.trim().is_empty() {
-                                submit(generation, &pending);
+                                submit(generation, &pending, json!({}));
                             }
                         });
                     }
@@ -23974,7 +24474,8 @@ mod assistant {
     /// 不值得说时大脑回的
     const SILENT: &str = "（不说）";
     /// 管会话的工具
-    const ACTIONS: [&str; 8] = [
+    const ACTIONS: [&str; 9] = [
+        "voiceprint",
         "list_sessions",
         "create_session",
         "send_to_session",
@@ -24040,6 +24541,7 @@ mod assistant {
             "briefWriter": false, "confirmDestructive": true, "approveFromChannels": false, "brainApproves": false, "fullFromChannels": false,
             "voiceReplies": true, "voice": "", "voiceTone": true, "speechSpeed": 1.0, "autoSpeed": false, "autoSpeedMin": 0.9, "autoSpeedMax": 1.3,
             "answerCalls": true, "callPolicy": "important", "quietStart": 0, "quietEnd": 0, "idleMinutes": 30, "name": "Friday 个人助理",
+            "voiceOnlyEnrolled": true, "voiceprintStrictness": 1, "voicePatience": 1,
         })
     }
 
@@ -24162,6 +24664,37 @@ mod assistant {
     /// 记一条说明（通话、P2P 文字的开始结束这些；source 是 call:<渠道> / p2ptext:<渠道>）
     pub fn note(words: &str, source: &str) {
         record(&entry("notice", source, words, json!({})));
+    }
+
+    /// 带数据的说明（声纹拦下的那句：相似度、门槛、那句的声纹）
+    pub fn note_with(words: &str, source: &str, data: Value) {
+        record(&entry("notice", source, words, data));
+    }
+
+    /// assistant.voice.confirm：声纹拦下的那句点了「是我说的」——那句的声纹记成临时的，说明去掉声纹、标 voiceConfirmed
+    fn confirm_voice(id: &str) -> crate::Reply {
+        let found = {
+            let mut journal = JOURNAL.lock().unwrap();
+            ensure_loaded(&mut journal);
+            journal.recent.iter().rev().find(|item| item["id"] == json!(id)).cloned()
+        };
+        let Some(mut item) = found else { return Err((crate::NOT_FOUND, "没有这条".into())) };
+        let vector = crate::voiceprint::vector_of(&item["data"]["voiceprintVector"]);
+        if vector.is_empty() {
+            return Err((crate::NOT_FOUND, "这条没有声纹".into()));
+        }
+        if crate::voiceprint::load().is_none() {
+            return Err((crate::NOT_FOUND, "这台没登记声纹".into()));
+        }
+        if !crate::voiceprint::remember(&vector, text(&item["data"], "heard")) {
+            return Err((crate::NOT_FOUND, "存不了声纹".into()));
+        }
+        if let Some(data) = item["data"].as_object_mut() {
+            data.remove("voiceprintVector");
+            data.insert("voiceConfirmed".into(), json!(true));
+        }
+        record(&item);
+        Ok(json!({}))
     }
 
     fn recent(count: usize) -> Vec<Value> {
@@ -24809,9 +25342,9 @@ mod assistant {
         )
     }
 
-    /// 语音、电话里听到的一句：记进日志（来源 voice / call:<渠道>）
-    pub fn heard(words: &str, source: &str) {
-        record(&entry("user", source, words, json!({})));
+    /// 语音、电话里听到的一句：记进日志（来源 voice / call:<渠道>；data：声纹相似度、摄像头的画面、spoken）
+    pub fn heard(words: &str, source: &str, data: Value) {
+        record(&entry("user", source, words, data));
         BOARD.lock().unwrap().last_user = Some(Instant::now());
     }
 
@@ -24868,6 +25401,11 @@ mod assistant {
 
     /// 交给助手会话：user 是用户说的（urgency 按在不在回话定），receipt 是叫醒的动静（排队）
     pub fn submit(words: &str, source: &str, urgency: &str) -> Result<String, String> {
+        submit_with(words, source, urgency, &[])
+    }
+
+    /// 同 submit，带上图片（这台上的路径：EDITH 在模型能看图时随这段话给它）
+    pub fn submit_with(words: &str, source: &str, urgency: &str, images: &[String]) -> Result<String, String> {
         let (brain, session) = session()?;
         let reacting = crate::TURNS.lock().unwrap().iter().any(|(_, id)| *id == session);
         let urgency = if urgency == "auto" { if reacting { "interrupt" } else { "queue" } } else { urgency };
@@ -24881,6 +25419,9 @@ mod assistant {
         }
         request["thinking"] = json!(if config["brainThinking"] == json!(true) { "medium" } else { "off" });
         request["team"] = json!("default");
+        if !images.is_empty() {
+            request["images"] = json!(images);
+        }
         let reply = brain.request("sense", request, Duration::from_secs(30))?;
         let turn = text(&reply, "turn").to_string();
         // 这一轮从哪来（补充进正在回的那一轮的不算）
@@ -25104,6 +25645,13 @@ mod assistant {
                 true,
             ),
         ];
+        actions.push(define(
+            "voiceprint",
+            "管用户的声纹（只听用户的声音：不像他的话不交给你）：enroll 用接下来他在语音 / 电话里说的三句话登记（要正在语音或电话里）；status 看登记了没有；reset 去掉自动更新和临时记住的；clear 删掉声纹",
+            json!({ "do": { "type": "string", "enum": ["enroll", "status", "reset", "clear"] } }),
+            &["do"],
+            false,
+        ));
         // 编进了通话内核才能打电话
         if crate::calls::compiled() {
             actions.push(define(
@@ -25338,6 +25886,24 @@ mod assistant {
                 }
                 (true, format!("在打了（{}）：接通后会先念那句话；结果会作为说明回来", if video { "视频" } else { "语音" }))
             }
+            "voiceprint" => match argument("do").as_str() {
+                "enroll" => match crate::voice::start_enrollment() {
+                    Ok(words) => (true, words),
+                    Err(error) => (false, format!("没开始：{error}")),
+                },
+                "status" => (true, crate::voiceprint::describe()),
+                "reset" => {
+                    let done = crate::voiceprint::reset_adapted();
+                    crate::voice::voiceprint_changed();
+                    if done { (true, "恢复成登记时的了".into()) } else { (false, "还没登记声纹".into()) }
+                }
+                "clear" => {
+                    crate::voiceprint::clear();
+                    crate::voice::voiceprint_changed();
+                    (true, "声纹删掉了：之后谁说的话都交给你".into())
+                }
+                other => (false, format!("没做：不认识 do「{other}」（enroll / status / reset / clear）")),
+            },
             "set_quiet_hours" => {
                 let hour = |key: &str| {
                     arguments.get(key).and_then(|value| value.as_i64().or_else(|| value.as_str().and_then(|text| text.trim().parse().ok())))
@@ -25448,13 +26014,21 @@ mod assistant {
             notice("助手关着：在设置里打开后才会回话");
             return Ok(item);
         }
+        let images: Vec<String> = attachments
+            .iter()
+            .filter(|path| {
+                let lower = path.to_lowercase();
+                [".png", ".jpg", ".jpeg", ".gif", ".webp"].iter().any(|extension| lower.ends_with(extension))
+            })
+            .cloned()
+            .collect();
         let mut message = words.to_string();
         if !attachments.is_empty() {
             message += &format!("\n\n[附件]\n{}", attachments.iter().map(|path| format!("- {path}")).collect::<Vec<_>>().join("\n"));
         }
         let source = source.to_string();
         std::thread::spawn(move || {
-            if let Err(error) = submit(&message, &source, "auto") {
+            if let Err(error) = submit_with(&message, &source, "auto", &images) {
                 notice(&format!("没交给助手：{error}"));
             }
         });
@@ -25626,7 +26200,8 @@ mod assistant {
                     .collect();
                 Ok(json!({ "items": items }))
             }
-            "assistant.answerQuestion" | "assistant.voice.confirm" => Err((crate::NOT_FOUND, "没有这个问题".into())),
+            "assistant.voice.confirm" => confirm_voice(params["id"].as_str().unwrap_or("")),
+            "assistant.answerQuestion" => Err((crate::NOT_FOUND, "没有这个问题".into())),
             other => Err((-32601, format!("没有这个方法：{other}"))),
         }
     }
@@ -26248,6 +26823,8 @@ mod channels {
         status: String,
         text: String,
         bot: String,
+        /// 建这个机器人的人（SChat /me 的 botOwnerId；工作通道只认他）
+        owner: i64,
     }
 
     static STATUS: LazyLock<Mutex<HashMap<String, Status>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -26268,6 +26845,11 @@ mod channels {
 
     fn set_bot(id: &str, name: &str) {
         STATUS.lock().unwrap().entry(id.to_string()).or_default().bot = name.to_string();
+    }
+
+    /// 建这个机器人的人（不知道是 0）
+    pub fn bot_owner(id: &str) -> i64 {
+        STATUS.lock().unwrap().get(id).map(|status| status.owner).unwrap_or(0)
     }
 
     fn changed_event() {
@@ -26490,6 +27072,11 @@ mod channels {
                         Ok((_, reply)) if reply["error"].is_null() => {
                             let bot = &reply["bot"];
                             set_bot(&self.id, bot["nickname"].as_str().or(bot["name"].as_str()).unwrap_or(""));
+                            let owner = bot["botOwnerId"]
+                                .as_i64()
+                                .or_else(|| bot["botOwnerId"].as_str().and_then(|id| id.parse().ok()))
+                                .unwrap_or(0);
+                            STATUS.lock().unwrap().entry(self.id.clone()).or_default().owner = owner;
                             let commands: Vec<Value> = commands()
                                 .into_iter()
                                 .map(|(command, description)| json!({ "command": command, "description": description }))
@@ -27709,7 +28296,7 @@ mod call_engine {
     //! calls 特性打开时 build.rs 用 CMake 编好静态链进来，C 接口见 call/include/FridayCall.h）的 Rust 封装。
     //! 内核的回调从 libdatachannel 的线程来：除了解出来的声音，都排在内核里、调 wake 叫醒，drain 时才在调 drain 的那条线程上调出来——
     //! 这里收成 Event / TextEvent 交回去。一个进程只建一个 Call（一直用，不放掉）；P2P 文字一段一条 TextPeer。
-    //! 没打开 calls 特性时是空壳：Call::new、TextPeer::new 都回 None。
+    //! 没打开 calls 特性时是空壳：Call::with_video、TextPeer::new 都回 None。
 
     /// 内核的状态（同 schat::CallState）
     pub const IDLE: i32 = 0;
@@ -27856,6 +28443,16 @@ mod call_engine {
             fn friday_text_add_candidate(peer: Ctx, candidate: *const c_char, mid: *const c_char);
             fn friday_text_send(peer: Ctx, text: *const c_char) -> c_int;
             fn friday_text_create_offerer(callbacks: *const TextCallbacks, label: *const c_char) -> Ctx;
+            fn friday_text_create_labeled(
+                callbacks: *const TextCallbacks,
+                label_prefix: *const c_char,
+                urls: *const *const c_char,
+                usernames: *const *const c_char,
+                credentials: *const *const c_char,
+                count: c_int,
+            ) -> Ctx;
+            fn friday_text_send_binary(peer: Ctx, data: *const u8, length: c_int) -> c_int;
+            fn friday_text_buffered(peer: Ctx) -> u64;
             fn friday_text_set_answer(peer: Ctx, sdp: *const c_char) -> c_int;
         }
 
@@ -27878,7 +28475,7 @@ mod call_engine {
 
         type Wake = Box<dyn Fn() + Send + Sync>;
         type AudioTap = Box<dyn Fn(&[i16]) + Send + Sync>;
-        type VideoTap = Box<dyn Fn(i32, i32) + Send + Sync>;
+        type VideoTap = Box<dyn Fn(&[u8], i32, i32) + Send + Sync>;
 
         struct CallContext {
             events: Mutex<Vec<Event>>,
@@ -27937,9 +28534,13 @@ mod call_engine {
                 (call_context(ctx).audio)(unsafe { std::slice::from_raw_parts(pcm, samples as usize) });
             }
         }
-        unsafe extern "C" fn on_video(ctx: Ctx, _i420: *const u8, width: c_int, height: c_int) {
-            if let Some(video) = &call_context(ctx).video {
-                video(width, height);
+        unsafe extern "C" fn on_video(ctx: Ctx, i420: *const u8, width: c_int, height: c_int) {
+            if let Some(video) = &call_context(ctx).video
+                && !i420.is_null()
+                && width > 0
+                && height > 0
+            {
+                video(unsafe { std::slice::from_raw_parts(i420, (width * height * 3 / 2) as usize) }, width, height);
             }
         }
 
@@ -27953,16 +28554,11 @@ mod call_engine {
         unsafe impl Sync for Call {}
 
         impl Call {
-            /// wake：有排着的了（任意线程上调）；audio：解出来的对方声音（48 kHz 单声道，在引擎线程上调）
-            pub fn new(wake: impl Fn() + Send + Sync + 'static, audio: impl Fn(&[i16]) + Send + Sync + 'static) -> Option<&'static Call> {
-                Self::create(Box::new(wake), Box::new(audio), None)
-            }
-
-            /// 同 new，另外解出来的对方画面报一下宽高（测试里的假手机数帧）
+            /// wake：有排着的了（任意线程上调）；audio：解出来的对方声音（48 kHz 单声道）、video：画面（I420、宽、高），都在引擎线程上调
             pub fn with_video(
                 wake: impl Fn() + Send + Sync + 'static,
                 audio: impl Fn(&[i16]) + Send + Sync + 'static,
-                video: impl Fn(i32, i32) + Send + Sync + 'static,
+                video: impl Fn(&[u8], i32, i32) + Send + Sync + 'static,
             ) -> Option<&'static Call> {
                 Self::create(Box::new(wake), Box::new(audio), Some(Box::new(video)))
             }
@@ -28155,6 +28751,39 @@ mod call_engine {
                 (!raw.is_null()).then_some(TextPeer { raw, context })
             }
 
+            /// 同 new，认 label 以 prefix 开头的通道（远程工作通道 friday-work）
+            pub fn labeled(
+                wake: impl Fn() + Send + Sync + 'static,
+                prefix: &str,
+                servers: &[(String, String, String)],
+            ) -> Option<TextPeer> {
+                let (callbacks, context) = Self::callbacks(wake);
+                let [urls, usernames, credentials] = columns(servers);
+                let pointers = |list: &Vec<CString>| list.iter().map(|value| value.as_ptr()).collect::<Vec<_>>();
+                let (urls, usernames, credentials) = (pointers(&urls), pointers(&usernames), pointers(&credentials));
+                let prefix = c(prefix);
+                let raw = unsafe {
+                    friday_text_create_labeled(
+                        &callbacks,
+                        prefix.as_ptr(),
+                        urls.as_ptr(),
+                        usernames.as_ptr(),
+                        credentials.as_ptr(),
+                        urls.len() as c_int,
+                    )
+                };
+                (!raw.is_null()).then_some(TextPeer { raw, context })
+            }
+
+            pub fn send_binary(&self, data: &[u8]) -> bool {
+                unsafe { friday_text_send_binary(self.raw, data.as_ptr(), data.len() as c_int) == 0 }
+            }
+
+            /// 通道上还积着多少字节没发出去
+            pub fn buffered(&self) -> u64 {
+                unsafe { friday_text_buffered(self.raw) }
+            }
+
             /// 主叫那端（测试里扮手机）：只连本机，建通道（label）、出 offer
             pub fn offerer(wake: impl Fn() + Send + Sync + 'static, label: &str) -> Option<TextPeer> {
                 let (callbacks, context) = Self::callbacks(wake);
@@ -28199,13 +28828,10 @@ mod call_engine {
         pub struct Call;
 
         impl Call {
-            pub fn new(_wake: impl Fn() + Send + Sync + 'static, _audio: impl Fn(&[i16]) + Send + Sync + 'static) -> Option<&'static Call> {
-                None
-            }
             pub fn with_video(
                 _wake: impl Fn() + Send + Sync + 'static,
                 _audio: impl Fn(&[i16]) + Send + Sync + 'static,
-                _video: impl Fn(i32, i32) + Send + Sync + 'static,
+                _video: impl Fn(&[u8], i32, i32) + Send + Sync + 'static,
             ) -> Option<&'static Call> {
                 None
             }
@@ -28244,6 +28870,19 @@ mod call_engine {
             pub fn offerer(_wake: impl Fn() + Send + Sync + 'static, _label: &str) -> Option<TextPeer> {
                 None
             }
+            pub fn labeled(
+                _wake: impl Fn() + Send + Sync + 'static,
+                _prefix: &str,
+                _servers: &[(String, String, String)],
+            ) -> Option<TextPeer> {
+                None
+            }
+            pub fn send_binary(&self, _data: &[u8]) -> bool {
+                false
+            }
+            pub fn buffered(&self) -> u64 {
+                0
+            }
             pub fn drain(&self) -> Vec<TextEvent> {
                 Vec::new()
             }
@@ -28274,7 +28913,12 @@ mod calls {
     //! - P2P 文字（callType text）：同一道闸；接了先拿 TURN、建一条只有 DataChannel 的连接，再回 accepted，手机出 offer 这边 answer；
     //!   通道上一帧一条 JSON（iOS / 安卓的 P2PDataMessage），文字交给助手（来源 p2ptext:<渠道>），回复转纯文本发回通道（没开时攒着，
     //!   会话结束了发到普通聊天里）；图片、文件回一句只看得懂文字；要升级成语音回 upgrade_reject。30 秒没连上、通道关了 10 秒没重建就收尾。
-    //! - 远程工作通道（callType work）这里不做，回 error。没打开 calls 特性编的：渠道不声明能打电话，这些都不做。
+    //! - 视频通话时说的每句话带上对方摄像头最新的一帧（PNG，助手的附件目录），模型能看图时一起看。
+    //! - 远程工作通道（callType work，Friday 仓库 qt/docs/REMOTE.md §2）：只认建这个机器人的人（botOwnerId）；每个 requestId 一条 DataChannel
+    //!   friday-work（客户端建、出 offer），上面跑 Friday 的远程协议——这边起一个网关子进程（`--attach`，EDITH_FRIDAY_CHANNEL=work）接着，
+    //!   大于 200 KB 的消息按「FW1」分片（同 Friday 的 WorkFramer），通道积压时先攒着。
+    //!
+    //! 没打开 calls 特性编的：渠道不声明能打电话，这些都不做。
 
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -28577,6 +29221,32 @@ mod calls {
             words: String,
         },
         TextPush(String),
+        WorkIce {
+            request: String,
+            serial: u64,
+            servers: Vec<(String, String, String)>,
+        },
+        WorkDrain {
+            request: String,
+            serial: u64,
+        },
+        WorkTimer {
+            request: String,
+            serial: u64,
+        },
+        WorkLine {
+            request: String,
+            serial: u64,
+            line: String,
+        },
+        WorkExited {
+            request: String,
+            serial: u64,
+        },
+        WorkFlush {
+            request: String,
+            serial: u64,
+        },
     }
 
     static COMMANDS: LazyLock<Mutex<Option<Sender<Command>>>> = LazyLock::new(|| Mutex::new(None));
@@ -28672,10 +29342,23 @@ mod calls {
         current: Current,
         media: Option<Arc<AtomicBool>>,
         text: Text,
+        /// 工作通道（requestId → 那一条）
+        work: HashMap<String, Work>,
+        work_serial: u64,
+        /// 分片的 sid
+        work_sid: u64,
     }
 
     fn run(receiver: Receiver<Command>) {
-        let mut state = Loop { engine: None, current: Current::default(), media: None, text: Text::default() };
+        let mut state = Loop {
+            engine: None,
+            current: Current::default(),
+            media: None,
+            text: Text::default(),
+            work: HashMap::new(),
+            work_serial: 0,
+            work_sid: 0,
+        };
         while let Ok(command) = receiver.recv() {
             state.handle(command);
         }
@@ -28803,7 +29486,7 @@ mod calls {
     impl Loop {
         fn engine(&mut self) -> Option<&'static call_engine::Call> {
             if self.engine.is_none() {
-                self.engine = call_engine::Call::new(
+                self.engine = call_engine::Call::with_video(
                     || send(Command::Drain),
                     |pcm| {
                         if MEDIA_ON.load(Ordering::Relaxed) {
@@ -28814,6 +29497,7 @@ mod calls {
                             }
                         }
                     },
+                    keep_camera,
                 );
             }
             self.engine
@@ -28844,6 +29528,11 @@ mod calls {
                     }
                     if !self.text.request.is_empty() && self.text.channel == channel {
                         self.text_end(true, "渠道断了");
+                    }
+                    let gone: Vec<String> =
+                        self.work.iter().filter(|(_, work)| work.channel == channel).map(|(request, _)| request.clone()).collect();
+                    for request in gone {
+                        self.work_end(&request, true, "渠道断了");
                     }
                 }
                 Command::Drain => {
@@ -28939,6 +29628,39 @@ mod calls {
                         self.text_deliver(&words);
                     }
                 }
+                Command::WorkIce { request, serial, servers } => self.work_create(&request, serial, &servers),
+                Command::WorkDrain { request, serial } => {
+                    let events = match self.work.get(&request).filter(|work| work.serial == serial) {
+                        Some(work) => work.connection.as_ref().map(|connection| connection.drain()).unwrap_or_default(),
+                        None => return,
+                    };
+                    for event in events {
+                        if self.work.get(&request).is_some_and(|work| work.serial == serial) {
+                            self.work_event(&request, event);
+                        }
+                    }
+                }
+                Command::WorkTimer { request, serial } => {
+                    if self.work.get(&request).is_some_and(|work| work.serial == serial && work.opened_at.is_none()) {
+                        self.work_end(&request, true, "30 秒没连上");
+                    }
+                }
+                Command::WorkLine { request, serial, line } => {
+                    if self.work.get(&request).is_some_and(|work| work.serial == serial) {
+                        self.work_line(&request, &line);
+                    }
+                }
+                Command::WorkExited { request, serial } => {
+                    if self.work.get(&request).is_some_and(|work| work.serial == serial) {
+                        self.work_end(&request, true, "网关退出了");
+                    }
+                }
+                Command::WorkFlush { request, serial } => {
+                    if let Some(work) = self.work.get_mut(&request).filter(|work| work.serial == serial) {
+                        work.flushing = false;
+                        self.work_flush(&request);
+                    }
+                }
             }
         }
 
@@ -28982,9 +29704,15 @@ mod calls {
             if event == "p2p_request" && call_type == "text" {
                 return self.text_request(channel, from, &request);
             }
-            // 远程工作通道：这里不做（客户端显示「机器人那头没有工作服务」），不进状态机
+            // 远程工作通道：自己的一套（Work），信令按 requestId 分给它
             if event == "p2p_request" && call_type == "work" {
-                return self.decline(channel, from, &request, "error");
+                return self.work_request(channel, from, &request);
+            }
+            if self.work.get(&request).is_some_and(|work| work.channel == channel && work.peer == from) {
+                if event == "p2p_signaling" {
+                    self.work_signal(&request, text(data, "type"), text(data, "payload"));
+                }
+                return;
             }
             if !self.text.request.is_empty() && self.text.channel == channel && self.text.peer == from && self.text.request == request {
                 if event == "p2p_signaling" {
@@ -29203,6 +29931,8 @@ mod calls {
             });
             MEDIA_ON.store(true, Ordering::Relaxed);
             let video = self.current.video;
+            CAMERA.lock().unwrap().take();
+            *VIDEO_CHANNEL.lock().unwrap() = if video { self.current.channel.clone() } else { String::new() };
             if video {
                 engine.set_video_encoding(600_000, 16.0, 1);
             }
@@ -29217,6 +29947,8 @@ mod calls {
                 stop.store(true, Ordering::Relaxed);
             }
             MEDIA_ON.store(false, Ordering::Relaxed);
+            VIDEO_CHANNEL.lock().unwrap().clear();
+            CAMERA.lock().unwrap().take();
             HEARD.lock().unwrap().clear();
             PLAYBACK.lock().unwrap().queue.clear();
             crate::voice::stop_call();
@@ -29459,6 +30191,451 @@ mod calls {
         }
     }
 
+    // MARK: - 摄像头的画面（视频通话时交给助手）
+
+    /// 一帧画面：I420、宽、高、什么时候存的
+    type Picture = (Vec<u8>, i32, i32, Instant);
+
+    /// 视频通话时对方摄像头最新的一帧：解码线程上 0.4 秒最多存一张
+    static CAMERA: LazyLock<Mutex<Option<Picture>>> = LazyLock::new(|| Mutex::new(None));
+    /// 接通了、是视频通话（存不存画面）；值是渠道
+    static VIDEO_CHANNEL: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
+
+    fn keep_camera(i420: &[u8], width: i32, height: i32) {
+        if !MEDIA_ON.load(Ordering::Relaxed) || VIDEO_CHANNEL.lock().unwrap().is_empty() {
+            return;
+        }
+        let mut camera = CAMERA.lock().unwrap();
+        if camera.as_ref().is_none_or(|(_, _, _, at)| at.elapsed() >= Duration::from_millis(400)) {
+            *camera = Some((i420.to_vec(), width, height, Instant::now()));
+        }
+    }
+
+    /// I420 → PNG（RGB，长边缩到 640 以内）
+    pub fn png_from_i420(i420: &[u8], width: usize, height: usize) -> Option<Vec<u8>> {
+        use std::io::Write;
+        if width < 2 || height < 2 || i420.len() < width * height * 3 / 2 {
+            return None;
+        }
+        let step = width.max(height).div_ceil(640).max(1);
+        let (w, h) = (width / step, height / step);
+        let (u_plane, v_plane) = (width * height, width * height + (width / 2) * (height / 2));
+        let mut raw = Vec::with_capacity((w * 3 + 1) * h);
+        for y in 0..h {
+            raw.push(0);
+            for x in 0..w {
+                let (sx, sy) = (x * step, y * step);
+                let luma = i420[sy * width + sx] as f32 - 16.0;
+                let chroma = (sy / 2) * (width / 2) + sx / 2;
+                let (u, v) = (i420[u_plane + chroma] as f32 - 128.0, i420[v_plane + chroma] as f32 - 128.0);
+                let clamp = |value: f32| value.round().clamp(0.0, 255.0) as u8;
+                raw.push(clamp(1.164 * luma + 1.596 * v));
+                raw.push(clamp(1.164 * luma - 0.392 * u - 0.813 * v));
+                raw.push(clamp(1.164 * luma + 2.017 * u));
+            }
+        }
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&raw).ok()?;
+        let compressed = encoder.finish().ok()?;
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut chunk = |kind: &[u8], data: &[u8]| {
+            png.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            let mut crc = flate2::Crc::new();
+            crc.update(kind);
+            crc.update(data);
+            png.extend_from_slice(kind);
+            png.extend_from_slice(data);
+            png.extend_from_slice(&crc.sum().to_be_bytes());
+        };
+        let mut header = Vec::new();
+        header.extend_from_slice(&(w as u32).to_be_bytes());
+        header.extend_from_slice(&(h as u32).to_be_bytes());
+        header.extend_from_slice(&[8, 2, 0, 0, 0]);
+        chunk(b"IHDR", &header);
+        chunk(b"IDAT", &compressed);
+        chunk(b"IEND", &[]);
+        Some(png)
+    }
+
+    /// 这个渠道正在视频通话：对方摄像头最新的一帧存成 PNG（助手的附件目录），回路径；不在视频通话、5 秒内没收到画面回 None
+    pub fn camera_picture(channel: &str) -> Option<String> {
+        if *VIDEO_CHANNEL.lock().unwrap() != channel {
+            return None;
+        }
+        let (i420, width, height, at) = CAMERA.lock().unwrap().clone()?;
+        if at.elapsed() > Duration::from_secs(5) {
+            return None;
+        }
+        let png = png_from_i420(&i420, width as usize, height as usize)?;
+        let directory = crate::serve_dir().join("assistant").join("attachments");
+        std::fs::create_dir_all(&directory).ok()?;
+        let path = directory.join(format!("摄像头 {}.png", chrono::Local::now().format("%H.%M.%S")));
+        std::fs::write(&path, png).ok()?;
+        Some(path.to_string_lossy().into_owned())
+    }
+
+    // MARK: - 远程工作通道（callType work，Friday 仓库 qt/docs/REMOTE.md §2「WebRTC 工作通道」）
+
+    /// 一条 JSON-RPC 消息 ≤ 这个字节数整条一条文本帧；更大的切成 ≤ CHUNK 的二进制片（同 Friday 的 WorkFramer）
+    const WHOLE_LIMIT: usize = 200 * 1024;
+    const CHUNK: usize = 128 * 1024;
+    const MESSAGE_LIMIT: usize = 64 * 1024 * 1024;
+    /// 分片头：'F' 'W' '1' + 8 字节大端 sid + 4 字节 seq + 4 字节 total
+    const FRAGMENT_HEADER: usize = 19;
+    /// 通道上积着这么多还没发出去时先攒着（同 socket 欠着不发）
+    const BACKLOG_LIMIT: u64 = 4 * 1024 * 1024;
+
+    /// 拆：小消息一条文本帧（false），大消息若干二进制片（true）
+    pub fn work_encode(message: &[u8], sid: u64) -> Vec<(bool, Vec<u8>)> {
+        if message.len() <= WHOLE_LIMIT {
+            return vec![(false, message.to_vec())];
+        }
+        let total = message.len().div_ceil(CHUNK);
+        (0..total)
+            .map(|seq| {
+                let part = &message[seq * CHUNK..((seq + 1) * CHUNK).min(message.len())];
+                let mut frame = Vec::with_capacity(FRAGMENT_HEADER + part.len());
+                frame.extend_from_slice(b"FW1");
+                frame.extend_from_slice(&sid.to_be_bytes());
+                frame.extend_from_slice(&(seq as u32).to_be_bytes());
+                frame.extend_from_slice(&(total as u32).to_be_bytes());
+                frame.extend_from_slice(part);
+                (true, frame)
+            })
+            .collect()
+    }
+
+    pub enum Feed {
+        NeedMore,
+        Ready(Vec<u8>),
+        Invalid,
+    }
+
+    /// 收：按 sid 拼回大消息（magic、重复片、total 对不上、超过上限 = 协议错）
+    /// 收到一半的一条大消息：(一共几片, 收到的片, 收到的字节数)
+    type Parts = (u32, HashMap<u32, Vec<u8>>, usize);
+
+    #[derive(Default)]
+    pub struct Framer {
+        pending: HashMap<u64, Parts>,
+        pending_bytes: usize,
+    }
+
+    impl Framer {
+        /// 一帧：以「FW1」开头的是分片，别的是一条完整消息（JSON 不会这样开头）
+        pub fn feed(&mut self, frame: &[u8]) -> Feed {
+            if !frame.starts_with(b"FW1") {
+                return Feed::Ready(frame.to_vec());
+            }
+            if frame.len() < FRAGMENT_HEADER {
+                return Feed::Invalid;
+            }
+            let sid = u64::from_be_bytes(frame[3..11].try_into().unwrap());
+            let seq = u32::from_be_bytes(frame[11..15].try_into().unwrap());
+            let total = u32::from_be_bytes(frame[15..19].try_into().unwrap());
+            if total == 0 || seq >= total || total as usize * CHUNK > MESSAGE_LIMIT {
+                return Feed::Invalid;
+            }
+            let parts = self.pending.entry(sid).or_insert_with(|| (total, HashMap::new(), 0));
+            if parts.0 != total || parts.1.contains_key(&seq) {
+                return Feed::Invalid;
+            }
+            let payload = frame[FRAGMENT_HEADER..].to_vec();
+            parts.2 += payload.len();
+            self.pending_bytes += payload.len();
+            if parts.2 > MESSAGE_LIMIT || self.pending_bytes > MESSAGE_LIMIT {
+                return Feed::Invalid;
+            }
+            parts.1.insert(seq, payload);
+            if parts.1.len() != total as usize {
+                return Feed::NeedMore;
+            }
+            let (_, mut chunks, size) = self.pending.remove(&sid).unwrap();
+            self.pending_bytes -= size;
+            let mut message = Vec::with_capacity(size);
+            for index in 0..total {
+                message.extend(chunks.remove(&index).unwrap_or_default());
+            }
+            Feed::Ready(message)
+        }
+    }
+
+    /// 一条工作通道：手机 / 桌面客户端建 DataChannel friday-work、出 offer，这边 answer；通道上跑 Friday 的远程协议——
+    /// 这边起一个网关（`edith-friday --attach`，环境变量 EDITH_FRIDAY_CHANNEL=work：只认 SSH 的方法回错误 4），通道的消息一条一行进它的标准输入，
+    /// 它标准输出的一行一条发回去
+    struct Work {
+        channel: String,
+        peer: i64,
+        serial: u64,
+        connection: Option<call_engine::TextPeer>,
+        remote_offer: String,
+        remote_set: bool,
+        pending: Vec<(String, String)>,
+        opened_at: Option<Instant>,
+        child: Option<std::process::Child>,
+        stdin: Option<std::process::ChildStdin>,
+        backlog: VecDeque<(bool, Vec<u8>)>,
+        flushing: bool,
+        framer: Framer,
+    }
+
+    impl Loop {
+        // MARK: 远程工作通道
+
+        /// 呼进来的工作通道：只认建这个机器人的人（/bot/v1/me 的 botOwnerId，还得是绑定的主人）；每个 requestId 一条，同一个人的几台可以同时连
+        fn work_request(&mut self, channel: &str, from: i64, request: &str) {
+            // 重连后服务端补投的同一个：不理
+            if self.work.contains_key(request) {
+                return;
+            }
+            let creator = crate::channels::bot_owner(channel);
+            if creator <= 0 || creator != from || !crate::channels::is_owner_of(channel, &from.to_string()) {
+                return self.decline(channel, from, request, "user_rejected");
+            }
+            self.work_serial += 1;
+            let serial = self.work_serial;
+            self.work.insert(
+                request.to_string(),
+                Work {
+                    channel: channel.into(),
+                    peer: from,
+                    serial,
+                    connection: None,
+                    remote_offer: String::new(),
+                    remote_set: false,
+                    pending: Vec::new(),
+                    opened_at: None,
+                    child: None,
+                    stdin: None,
+                    backlog: VecDeque::new(),
+                    flushing: false,
+                    framer: Framer::default(),
+                },
+            );
+            after(Duration::from_secs(TEXT_CONNECT_SECONDS), Command::WorkTimer { request: request.into(), serial });
+            crate::serve_log("calls", &format!("{channel} 的用户 {from} 呼工作通道（{request}）"));
+            let Some(link) = link(channel) else { return self.work_end(request, false, "渠道没了") };
+            // 先拿 TURN、建好连接，再回 accepted —— 客户端收到才建通道、出 offer
+            let request = request.to_string();
+            std::thread::spawn(move || {
+                let servers = link.ice_servers();
+                send(Command::WorkIce { request, serial, servers });
+            });
+        }
+
+        fn work_signal_out(&self, request: &str, kind: &str, payload: &str, extra: Value) {
+            let Some(work) = self.work.get(request) else { return };
+            let mut data = json!({ "toUserId": work.peer, "targetUserId": work.peer, "requestId": request, "type": kind, "payload": payload, "timestamp": now_ms() });
+            if let Some(extra) = extra.as_object() {
+                for (key, value) in extra {
+                    data[key] = value.clone();
+                }
+            }
+            self.frame_on(&work.channel, "p2p_signaling", data);
+        }
+
+        fn work_create(&mut self, request: &str, serial: u64, servers: &[(String, String, String)]) {
+            let Some(work) = self.work.get_mut(request).filter(|work| work.serial == serial) else { return };
+            let wake = {
+                let request = request.to_string();
+                move || send(Command::WorkDrain { request: request.clone(), serial })
+            };
+            let Some(connection) = call_engine::TextPeer::labeled(wake, "friday-work", servers) else {
+                let (channel, peer) = (work.channel.clone(), work.peer);
+                self.frame_on(
+                    &channel,
+                    "p2p_response",
+                    json!({ "targetUserId": peer, "requestId": request, "accepted": false, "reason": "error", "timestamp": now_ms() }),
+                );
+                return self.work_end(request, false, "建不了连接");
+            };
+            work.connection = Some(connection);
+            let (channel, peer) = (work.channel.clone(), work.peer);
+            let offer = std::mem::take(&mut work.remote_offer);
+            self.frame_on(
+                &channel,
+                "p2p_response",
+                json!({ "targetUserId": peer, "requestId": request, "accepted": true, "timestamp": now_ms() }),
+            );
+            if !offer.is_empty() {
+                self.work_signal(request, "offer", &offer);
+            }
+        }
+
+        fn work_signal(&mut self, request: &str, kind: &str, payload: &str) {
+            let Some(work) = self.work.get_mut(request) else { return };
+            match kind {
+                "hangup" | "request_cancel" => self.work_end(request, false, "对方挂了"),
+                "offer" => {
+                    let Some(connection) = &work.connection else {
+                        work.remote_offer = payload.into();
+                        return;
+                    };
+                    if work.remote_set && payload == work.remote_offer {
+                        return;
+                    }
+                    if !connection.set_offer(payload) {
+                        crate::serve_log("calls", "工作通道的 offer 用不了");
+                        return;
+                    }
+                    work.remote_set = true;
+                    work.remote_offer = payload.into();
+                    for (candidate, mid) in std::mem::take(&mut work.pending) {
+                        connection.add_candidate(&candidate, &mid);
+                    }
+                }
+                "ice_candidate" => {
+                    let (candidate, mid) = candidate_and_mid(payload);
+                    if candidate.is_empty() || useless_candidate(&candidate) {
+                        return;
+                    }
+                    match &work.connection {
+                        Some(connection) if work.remote_set => connection.add_candidate(&candidate, &mid),
+                        _ => work.pending.push((candidate, mid)),
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        fn work_event(&mut self, request: &str, event: TextEvent) {
+            match event {
+                TextEvent::Description { kind, sdp } => self.work_signal_out(request, &kind, &sdp, json!({})),
+                TextEvent::Candidate { candidate, mid } => {
+                    if !useless_candidate(&candidate) {
+                        let payload = json!({ "candidate": candidate, "sdpMLineIndex": 0, "sdpMid": if mid.is_empty() { "0".to_string() } else { mid } });
+                        self.work_signal_out(request, "ice_candidate", &payload.to_string(), json!({}));
+                    }
+                }
+                TextEvent::Failed => self.work_end(request, true, "连接断了"),
+                TextEvent::Closed => self.work_end(request, true, "通道关了"),
+                TextEvent::Open => {
+                    if let Err(error) = self.work_open(request) {
+                        crate::serve_log("calls", &format!("工作通道起不了网关：{error}"));
+                        self.work_end(request, true, "起不了网关");
+                    }
+                }
+                TextEvent::Message(frame) => {
+                    let Some(work) = self.work.get_mut(request) else { return };
+                    match work.framer.feed(&frame) {
+                        Feed::NeedMore => {}
+                        Feed::Invalid => self.work_end(request, true, "分帧不对"),
+                        Feed::Ready(mut message) => {
+                            use std::io::Write;
+                            // 一条一行（JSON 里的换行都是转义过的）
+                            message.retain(|byte| *byte != b'\n' && *byte != b'\r');
+                            message.push(b'\n');
+                            let written =
+                                work.stdin.as_mut().is_some_and(|stdin| stdin.write_all(&message).and_then(|_| stdin.flush()).is_ok());
+                            if !written {
+                                self.work_end(request, true, "网关不在了");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        /// 通道开了：起网关，它的输出一行一条排回这条线程
+        fn work_open(&mut self, request: &str) -> Result<(), String> {
+            let Some(work) = self.work.get_mut(request) else { return Ok(()) };
+            if work.opened_at.is_none() {
+                work.opened_at = Some(Instant::now());
+            }
+            if work.child.is_some() {
+                return Ok(());
+            }
+            let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+            let mut child = std::process::Command::new(executable)
+                .arg("--attach")
+                .env("EDITH_FRIDAY_CHANNEL", "work")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|error| error.to_string())?;
+            let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+            work.stdin = child.stdin.take();
+            work.child = Some(child);
+            let serial = work.serial;
+            crate::serve_log("calls", &format!("工作通道连上了（{} 的用户 {}，{request}）", work.channel, work.peer));
+            if let Some(stdout) = stdout {
+                let request = request.to_string();
+                std::thread::spawn(move || {
+                    use std::io::BufRead;
+                    for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+                        if !line.trim().is_empty() {
+                            send(Command::WorkLine { request: request.clone(), serial, line });
+                        }
+                    }
+                    send(Command::WorkExited { request, serial });
+                });
+            }
+            if let Some(stderr) = stderr {
+                std::thread::spawn(move || {
+                    use std::io::BufRead;
+                    for line in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
+                        crate::serve_log("work", &line);
+                    }
+                });
+            }
+            Ok(())
+        }
+
+        /// 网关的一行：分好帧发出去；通道上积太多时先攒着，过一会儿再补
+        fn work_line(&mut self, request: &str, line: &str) {
+            self.work_sid += 1;
+            let frames = work_encode(line.as_bytes(), self.work_sid);
+            let Some(work) = self.work.get_mut(request) else { return };
+            work.backlog.extend(frames);
+            self.work_flush(request);
+        }
+
+        fn work_flush(&mut self, request: &str) {
+            let Some(work) = self.work.get_mut(request) else { return };
+            let Some(connection) = &work.connection else { return };
+            while let Some((binary, bytes)) = work.backlog.front() {
+                if connection.buffered() > BACKLOG_LIMIT {
+                    break;
+                }
+                let sent = if *binary { connection.send_binary(bytes) } else { connection.send(&String::from_utf8_lossy(bytes)) };
+                if !sent {
+                    crate::serve_log("calls", "工作通道发不出去");
+                }
+                work.backlog.pop_front();
+            }
+            if !work.backlog.is_empty() && !work.flushing {
+                work.flushing = true;
+                after(Duration::from_millis(50), Command::WorkFlush { request: request.into(), serial: work.serial });
+            }
+        }
+
+        /// 收尾：notify = 线上发 hangup（连上过的带秒数）；关连接、网关
+        fn work_end(&mut self, request: &str, notify: bool, why: &str) {
+            if notify {
+                let seconds = self.work.get(request).and_then(|work| work.opened_at).map(|at| at.elapsed().as_secs()).unwrap_or(0);
+                self.work_signal_out(request, "hangup", "", json!({ "durationSec": seconds }));
+            }
+            let Some(mut work) = self.work.remove(request) else { return };
+            crate::serve_log("calls", &format!("工作通道结束（{request}）：{why}"));
+            work.connection.take();
+            // 关了标准输入网关自己退；一会儿还在就杀掉
+            work.stdin.take();
+            if let Some(mut child) = work.child.take() {
+                std::thread::spawn(move || {
+                    for _ in 0..30 {
+                        if child.try_wait().ok().flatten().is_some() {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    let _ = child.kill();
+                    let _ = child.wait();
+                });
+            }
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -29489,6 +30666,25 @@ mod calls {
             halo(0.5, 0.0, &mut picture);
             assert_eq!(picture.len(), 360 * 640 * 3 / 2);
             assert!(picture[320 * 360 + 180] == 24 && picture.iter().take(360 * 640).any(|&luma| luma > 150));
+            let png = png_from_i420(&picture, 360, 640).unwrap();
+            assert!(png.starts_with(b"\x89PNG") && png.len() > 100);
+            // 分帧：小的一条文本帧；大的切片，拼回来一样；重复片是协议错
+            assert_eq!(work_encode(b"{}", 1), vec![(false, b"{}".to_vec())]);
+            let big: Vec<u8> = (0..300 * 1024).map(|index| b'a' + (index % 26) as u8).collect();
+            let frames = work_encode(&big, 7);
+            assert_eq!(frames.len(), 3);
+            let mut framer = Framer::default();
+            assert!(matches!(framer.feed(&frames[0].1), Feed::NeedMore));
+            assert!(matches!(framer.feed(&frames[0].1), Feed::Invalid));
+            let mut framer = Framer::default();
+            let mut whole = None;
+            for (binary, frame) in &frames {
+                assert!(*binary);
+                if let Feed::Ready(message) = framer.feed(frame) {
+                    whole = Some(message);
+                }
+            }
+            assert_eq!(whole.unwrap(), big);
         }
     }
 }
@@ -29497,10 +30693,12 @@ mod calls {
 mod call_phone {
     //! 测试用的假手机（`edith-friday __call-phone <ws 地址> <用户 token>`，不在 --help 里）：另一部通话内核，经 SChat 的 /ws 以用户身份连上，
     //! 打给机器人 / 接机器人打来的、开 P2P 文字，媒体真的走本机的 WebRTC。标准输入一行一个命令，标准输出一行一个事件（都是 JSON）：
-    //! - 命令：{"cmd":"call","to":机器人 id,"video":false}、{"cmd":"talk","seconds":1.2}（送 220 Hz 的声音）、{"cmd":"hangup"}、
-    //!   {"cmd":"text","to":机器人 id}（开 P2P 文字）、{"cmd":"say","text":"…"}（通道上发一条）、{"cmd":"raw","e":"p2p_request","d":{…}}、{"cmd":"quit"}
+    //! - 命令：{"cmd":"call","to":机器人 id,"video":false}、{"cmd":"talk","seconds":1.2,"freq":220}（送这个音高的声音，默认 220 Hz）、{"cmd":"hangup"}、
+    //!   {"cmd":"text","to":机器人 id}（开 P2P 文字）、{"cmd":"say","text":"…"}（通道上发一条）、{"cmd":"raw","e":"p2p_request","d":{…}}、{"cmd":"quit"}、
+    //!   {"cmd":"work","to":机器人 id}（开远程工作通道）、{"cmd":"work-send","message":{…}}（通道上发一条 JSON-RPC，大的分片）、{"cmd":"work-hangup"}
     //! - 事件：ready {id}、frame {e,d}（机器人发来的信令原样）、state {state}、incoming {video}、rejected {reason}、
-    //!   loud {samples}（听到的大声采样数，变了就报）、pictures {count, width, height}（解出来的画面）、text-open、text {text}
+    //!   loud {samples}（听到的大声采样数，变了就报）、pictures {count, width, height}（解出来的画面）、text-open、text {text}、
+    //!   work-open、work {message}（工作通道上收到的一条，拼好的）、work-closed
 
     use std::io::BufRead;
     use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
@@ -29517,6 +30715,7 @@ mod call_phone {
         Frame(String, Value),
         Drain,
         TextDrain,
+        WorkDrain,
         Closed,
     }
 
@@ -29588,7 +30787,7 @@ mod call_phone {
                 move |pcm| {
                     loud.fetch_add(pcm.iter().filter(|sample| sample.unsigned_abs() > 2000).count(), Ordering::Relaxed);
                 },
-                move |width, height| {
+                move |_, width, height| {
                     pictures.fetch_add(1, Ordering::Relaxed);
                     *size.lock().unwrap() = (width, height);
                 },
@@ -29600,9 +30799,11 @@ mod call_phone {
         };
         // 节拍：每 20 毫秒送一帧（talk 时是 220 Hz 的声音），视频通话每 100 毫秒一张灰图；听到的变了就报
         let talking = Arc::new(AtomicI64::new(0));
+        let pitch = Arc::new(AtomicI64::new(220));
         let connected = Arc::new(AtomicBool::new(false));
         {
-            let (talking, connected, loud, pictures) = (talking.clone(), connected.clone(), loud.clone(), pictures.clone());
+            let (talking, connected, loud, pictures, pitch) =
+                (talking.clone(), connected.clone(), loud.clone(), pictures.clone(), pitch.clone());
             std::thread::spawn(move || {
                 let start = Instant::now();
                 let mut phase = 0f64;
@@ -29622,7 +30823,7 @@ mod call_phone {
                             talking.fetch_sub(1, Ordering::Relaxed);
                             for sample in frame.iter_mut() {
                                 *sample = (phase.sin() * 0.3 * 32767.0) as i16;
-                                phase += 2.0 * std::f64::consts::PI * 220.0 / 48000.0;
+                                phase += 2.0 * std::f64::consts::PI * pitch.load(Ordering::Relaxed) as f64 / 48000.0;
                             }
                         }
                         engine.feed(&frame);
@@ -29654,6 +30855,13 @@ mod call_phone {
         let mut text_to = 0i64;
         let mut remote_set = false;
         let mut pending: Vec<(String, String)> = Vec::new();
+        let mut work_peer: Option<call_engine::TextPeer> = None;
+        let mut work_request = String::new();
+        let mut work_to = 0i64;
+        let mut work_remote_set = false;
+        let mut work_pending: Vec<(String, String)> = Vec::new();
+        let mut work_framer = crate::calls::Framer::default();
+        let mut work_sid = 0u64;
         while let Ok(input) = receiver.recv() {
             match input {
                 Input::Closed => {
@@ -29662,7 +30870,10 @@ mod call_phone {
                 }
                 Input::Command(command) => match command["cmd"].as_str().unwrap_or("") {
                     "call" => engine.start(command["to"].as_i64().unwrap_or(0), command["video"] == json!(true)),
-                    "talk" => talking.store((command["seconds"].as_f64().unwrap_or(1.0) * 50.0) as i64, Ordering::Relaxed),
+                    "talk" => {
+                        pitch.store(command["freq"].as_i64().unwrap_or(220), Ordering::Relaxed);
+                        talking.store((command["seconds"].as_f64().unwrap_or(1.0) * 50.0) as i64, Ordering::Relaxed);
+                    }
                     "hangup" => engine.hangup(),
                     "raw" => send_frame(command["e"].as_str().unwrap_or(""), command["d"].clone()),
                     "text" => {
@@ -29678,6 +30889,35 @@ mod call_phone {
                             let frame = json!({ "id": uuid::Uuid::new_v4().to_string(), "type": command["type"].as_str().unwrap_or("text"), "senderId": me, "receiverId": text_to, "timestamp": now_ms(), "textContent": command["text"], "isComplete": true });
                             peer.send(&frame.to_string());
                         }
+                    }
+                    "work" => {
+                        work_to = command["to"].as_i64().unwrap_or(0);
+                        work_request = uuid::Uuid::new_v4().to_string();
+                        work_peer = None;
+                        work_remote_set = false;
+                        send_frame(
+                            "p2p_request",
+                            json!({ "toUserId": work_to, "requestId": work_request, "callType": "work", "timestamp": now_ms(), "expiresAt": now_ms() + 30000 }),
+                        );
+                    }
+                    "work-send" => {
+                        if let Some(peer) = &work_peer {
+                            work_sid += 1;
+                            for (binary, frame) in crate::calls::work_encode(command["message"].to_string().as_bytes(), work_sid) {
+                                if binary {
+                                    peer.send_binary(&frame);
+                                } else {
+                                    peer.send(&String::from_utf8_lossy(&frame));
+                                }
+                            }
+                        }
+                    }
+                    "work-hangup" => {
+                        send_frame(
+                            "p2p_signaling",
+                            json!({ "toUserId": work_to, "targetUserId": work_to, "requestId": work_request, "type": "hangup", "payload": "", "timestamp": now_ms() }),
+                        );
+                        work_peer = None;
                     }
                     "quit" => {
                         engine.hangup();
@@ -29701,6 +30941,39 @@ mod call_phone {
                     let from = data["fromUserId"].as_i64().unwrap_or(0);
                     let request = data["requestId"].as_str().unwrap_or("").to_string();
                     let payload = data["payload"].as_str().unwrap_or("").to_string();
+                    // 工作通道：这边是主叫（同 P2P 文字，通道叫 friday-work）
+                    if !work_request.is_empty() && request == work_request {
+                        if event == "p2p_response" && data["accepted"] == json!(true) && work_peer.is_none() {
+                            let sender = Mutex::new(sender.clone());
+                            work_peer = call_engine::TextPeer::offerer(
+                                move || {
+                                    let _ = sender.lock().unwrap().send(Input::WorkDrain);
+                                },
+                                "friday-work",
+                            );
+                        } else if event == "p2p_signaling"
+                            && let Some(peer) = &work_peer
+                        {
+                            match data["type"].as_str().unwrap_or("") {
+                                "answer" => {
+                                    work_remote_set = peer.set_answer(&payload);
+                                    for (candidate, mid) in work_pending.drain(..) {
+                                        peer.add_candidate(&candidate, &mid);
+                                    }
+                                }
+                                "ice_candidate" => {
+                                    let (candidate, mid) = crate::calls::candidate_and_mid(&payload);
+                                    if work_remote_set { peer.add_candidate(&candidate, &mid) } else { work_pending.push((candidate, mid)) }
+                                }
+                                "hangup" => {
+                                    work_peer = None;
+                                    out("work-closed", json!({}));
+                                }
+                                _ => {}
+                            }
+                        }
+                        continue;
+                    }
                     // P2P 文字：这边是主叫
                     if !text_request.is_empty() && request == text_request {
                         if event == "p2p_response" && data["accepted"] == json!(true) && text_peer.is_none() {
@@ -29770,6 +31043,31 @@ mod call_phone {
                                     json!({ "toUserId": to, "targetUserId": to, "requestId": request, "type": kind, "payload": payload, "timestamp": now_ms() }),
                                 );
                             }
+                        }
+                    }
+                }
+                Input::WorkDrain => {
+                    let events = work_peer.as_ref().map(|peer| peer.drain()).unwrap_or_default();
+                    for event in events {
+                        match event {
+                            TextEvent::Description { kind, sdp } => send_frame(
+                                "p2p_signaling",
+                                json!({ "toUserId": work_to, "targetUserId": work_to, "requestId": work_request, "type": kind, "payload": sdp, "timestamp": now_ms() }),
+                            ),
+                            TextEvent::Candidate { candidate, mid } => send_frame(
+                                "p2p_signaling",
+                                json!({ "toUserId": work_to, "targetUserId": work_to, "requestId": work_request, "type": "ice_candidate", "payload": json!({ "candidate": candidate, "sdpMid": mid, "sdpMLineIndex": 0 }).to_string(), "timestamp": now_ms() }),
+                            ),
+                            TextEvent::Open => out("work-open", json!({})),
+                            TextEvent::Closed | TextEvent::Failed => out("work-closed", json!({})),
+                            TextEvent::Message(frame) => match work_framer.feed(&frame) {
+                                crate::calls::Feed::Ready(message) => {
+                                    let message: Value = serde_json::from_slice(&message).unwrap_or_default();
+                                    out("work", json!({ "message": message, "bytes": frame.len() }));
+                                }
+                                crate::calls::Feed::NeedMore => {}
+                                crate::calls::Feed::Invalid => out("work-invalid", json!({})),
+                            },
                         }
                     }
                 }

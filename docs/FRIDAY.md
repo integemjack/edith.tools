@@ -139,8 +139,26 @@ Friday 客户端 ──SSH──▶ edith-friday --attach（一条连接一个�
     48 kHz 每 20 毫秒一帧送进通话（用户开口时压低、插话打断照语音那样），`post_detail` 的长内容发到那个聊天里；视频通话时助手的画面是一个跟着音量起伏的光环
     （360×640）。挂断记通话时长。助手的 `call_user` 打给最近跟它说话的主人（按设置「主动打电话」`callPolicy`：never / asked / important——没人让打的一刻钟最多一次；
     免打扰 `quietStart` / `quietEnd`，`set_quiet_hours` 设），接通后先念打电话的理由，30 秒没人接发 `request_cancel`。
+    视频通话时说的每句话带上对方摄像头最新的一帧（PNG，存在 `assistant/attachments/`，用户那条的 `data.attachments`），随这句话交给 EDITH 的 `images`
+    （模型标了 `supportsVision` 才看得到）。
     P2P 文字（`callType: "text"`）：同一道闸，建一条只有 DataChannel 的连接（手机出 offer），打的字交给助手（来源 `p2ptext:<渠道>`），回复转纯文本发回通道
-    （没开时攒着，会话结束了发到普通聊天里）；图片、文件回一句只看得懂文字，要升级成语音回 `upgrade_reject`。远程工作通道（`callType: "work"`）回 `error`。
+    （没开时攒着，会话结束了发到普通聊天里）；图片、文件回一句只看得懂文字，要升级成语音回 `upgrade_reject`。
+  - **只听你的声音**（同 Friday 的 Voiceprint，ASSISTANT.md §16.2–16.3；语音模式和通话都管）：本地语音能算声纹（清单里有 `speakerEmbedding`）时实时听写带上
+    每句的声纹（`speaker: true`），声纹存在 `~/.edith/friday/voiceprint.json`（同 Friday 的格式：登记的 + 最近的你 + 临时的）。设置「只听你的声音」
+    （`voiceOnlyEnrolled`，默认开）、登记过声纹时：不像你的不交、不打断，记一条说明「没交给助手（不像你的声音：相似度 0.12，要到 0.35）：…」（`data` 带
+    `voiceprint`、`voiceprintThreshold`、`durationMs`、`voiceprintVector`、`heard`），点「是我说的」（`assistant.voice.confirm`）记成临时的（14 天、最多 5 个）；
+    交了的那句带 `data.voiceprint`（相似度），够长（≥ 3 秒）、很像的往「最近的你」挪一小步。门槛按严格程度（`voiceprintStrictness` 0–2：0.35 / 0.45 / 0.55，
+    不到 1.5 秒的放宽 0.15），通话里松一档。助手在说 / 在想时不到两个实在的字（附和、杂音）不交；只听出一个字母的不交。说完一句等多久（`voicePatience` 0–2）
+    是听写的断句静音（0.3 / 0.45 / 0.8 秒）。这三项客户端用 `settings.update` 推过来（网关转给这台的助手）。登记：助手的 `voiceprint` 工具（`enroll`）——
+    正在语音或电话里时，接下来说的三句（每句 1.5 秒以上）不交给助手，取平均存起来，几句不像同一个人就不存；`status` / `reset`（去掉自动更新和临时的）/ `clear`。
+  - **远程工作通道**（`callType: "work"`，Friday 仓库 qt/docs/REMOTE.md §2「WebRTC 工作通道」；SChat 桌面客户端扫码登录后这样连这台）：只认建这个机器人的人
+    （`/bot/v1/me` 的 `botOwnerId`，还得是绑定的主人），别的回 `user_rejected`；每个 requestId 一条，同一个人的几台可以同时连。先拿 TURN、建好连接再回 accepted，
+    客户端建 DataChannel `friday-work`、出 offer；通道开了这边起一个网关子进程（`edith-friday --attach`，环境变量 `EDITH_FRIDAY_CHANNEL=work`），通道上的消息
+    一条一行进它的标准输入、它的输出一行一条发回去——协议、方法和 SSH 上的完全一样，只是只认 SSH 的回错误 `4`（`server.*` 除 `server.status`、`mcp.update` /
+    `saveServer` / `saveConfigText` / `importText`、`tools.saveScript` / `testScript` / `rollback` / `createScript`、`capabilities.import` / `retest`、
+    `plugins.install` / `update`、`hooks.saveGlobal` / `trust`、`sync.*`、`assistant.export.*` / `import.*`）。一条 JSON-RPC 消息大于 200 KB 时切成 ≤ 128 KB 的
+    二进制片（`'F''W''1'` + 8 字节大端 sid + 4 字节 seq + 4 字节 total + 分片，同 Friday 的 WorkFramer，单条上限 64 MB，协议错就断开）；通道上积着 4 MB 以上时先攒着。
+    对端 hangup、通道关了、ICE 断了、30 秒没连上、网关退出都收尾（发 hangup，关网关）。
   - 日志在 `~/.edith/friday/assistant/journal/<日期>.jsonl`（只追加，同一个 id 后写的算），设置在 `settings.json`；`assistant.history` 按页取，`assistant.clear`
     清空并换一段新的助手会话。开着助手时常驻那份不闲退；`activity.subscribe` 的快照报 `assistant: true`（客户端的助手对这台的会话只上状态板）。
 
@@ -214,14 +232,14 @@ cp edith ~/.friday-server/bin/                            # 或者 edith 在 PAT
 | 客户端的助手看这台的会话（特性 `activity`） | `activity.subscribe` / `unsubscribe`、`activity` / `activity.assistant` 事件 |
 | 助手（特性 `assistant`） | `assistant.status` / `subscribe` / `unsubscribe` / `history` / `say` / `stop` / `settings.update` / `presence` / `resolveApproval` / `clear` / `memory.list`、`assistant.entry` / `board` / `state` / `push` / `reset` 事件 |
 | 助手的聊天工具 | `assistant.channels.list` / `add` / `update` / `remove` / `removeOwner` / `removeGroup` / `bindCode`、`assistant.channels` 事件 |
-| 助手的通话（SChat 渠道的语音 / 视频电话、P2P 文字） | 渠道列表的 `calls` / `callsReady`、`options.calls`；设置的 `answerCalls` / `callPolicy` / `quietStart` / `quietEnd` |
+| 助手的通话（SChat 渠道的语音 / 视频电话、P2P 文字、远程工作通道） | 渠道列表的 `calls` / `callsReady`、`options.calls`；设置的 `answerCalls` / `callPolicy` / `quietStart` / `quietEnd` |
+| 只听你的声音（声纹） | `settings.update` 的 `voiceOnlyEnrolled` / `voiceprintStrictness` / `voicePatience`、`assistant.voice.confirm`、`voice.state` 的 `filtering` |
 
 还不行的（回 `-32601` 没有，或错误 `4` 说明原因；`server.features` 不报，客户端就不显示）：
 
 - 渠道里批准工具调用（`approveFromChannels`）、流式回复（SChat streams、Telegram 草稿）、发文件和语音回复、问题卡片还没有；
-  助手回答会话的 `ask_user` 问题、附件读取还没有。通话里「只听我的声音」（声纹过滤）、视频通话时把对方摄像头的画面交给助手看、
-  SChat 的远程工作通道（`callType: "work"`，在 DataChannel 上跑远程协议）还没有；不带 `calls` 特性的包（Linux 的 x86、armv7、armv6、riscv64、loong64、
-  ppc64le、s390x）不能打电话（渠道列表 `calls: false`）。
+  助手回答会话的 `ask_user` 问题、附件读取还没有。工作通道上的客户端设备（`friday-serial:` / `friday-tcp:` 通道、`device.*` 反向请求）没有；
+  不带 `calls` 特性的包（Linux 的 x86、armv7、armv6、riscv64、loong64、ppc64le、s390x）不能打电话、不能连工作通道（渠道列表 `calls: false`）。
 - 任务模式「不派子智能体」：EDITH 上没有这一档，按原来的（需要时派）做。
 - 要批准的事：没有客户端连着时大脑等能批准的连上来（最多 10 分钟，过了就不做）；要无人值守就选「完全」权限模式，
   或在 `~/.edith/config.json` 的 `permissions.allow` 里放开、用 `edith --auto`。
@@ -258,5 +276,6 @@ cd tools/friday && cargo test
 助手的开关、说话（藏起来的助手会话、人设、附状态板）、回执、派活（create_session）、做完叫醒助手、直达会话、不说、历史、等确认和在助手页拒绝；
 渠道（假的 SChat、Telegram 服务器、脚本渠道）的绑定、只听主人、说话回到那个聊天、命令、回执推送和引用回复直达、图片附件、自签证书的指纹、关助手渠道停；
 通话（假的 SChat 服务器转信令，假手机 `edith-friday __call-phone <ws 地址> <用户 token>` 是另一部通话内核、媒体真走本机 WebRTC；假的本地语音按音量断句、
-合成回一段音调）的通话连接、不是主人和工作通道直接拒、打进来自动接和先应一声、说一句交给助手、回复念回去、视频通话收到光环画面、挂断记时长、
-call_user 打给主人、关掉主动打电话不打、P2P 文字收发和媒体回一句。
+合成回一段音调，带 speaker 时按音高给一个假声纹）的通话连接、不是主人直接拒、打进来自动接和先应一声、说一句交给助手、回复念回去、视频通话收到光环画面、
+视频里说的话带上摄像头的画面（模型收到图）、挂断记时长、电话里登记声纹、不像你的不交和「是我说的」、设置关掉过滤、call_user 打给主人、
+关掉主动打电话不打、P2P 文字收发和媒体回一句、工作通道（非创建者拒、通道上 hello、只认 SSH 的回 4、400 KB 回复和 300 KB 请求分片）。

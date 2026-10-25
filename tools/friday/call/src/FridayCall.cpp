@@ -221,6 +221,8 @@ struct TextPeer {
     std::shared_ptr<rtc::PeerConnection> pc;
     /// 主线程上：现在用的通道
     std::shared_ptr<rtc::DataChannel> channel;
+    /// 认哪种通道（label 以它开头的）：P2P 文字是 p2p-text，远程工作通道是 friday-work（edith-friday 加的）
+    std::string labelPrefix = "p2p-text";
 
     explicit TextPeer(const friday_text_callbacks& callbacks)
         : cb(callbacks)
@@ -286,7 +288,7 @@ struct TextPeer {
         });
         // 通道是主叫建的（label p2p-text；手机重建时是 p2p-text-<时间>）：到这里时已经开了
         pc->onDataChannel([this](std::shared_ptr<rtc::DataChannel> incoming) {
-            if (incoming->label().rfind("p2p-text", 0) != 0)
+            if (incoming->label().rfind(labelPrefix, 0) != 0)
                 return;
             // 先排「换上这条通道」，再接消息：主线程上一定先换好、再处理消息
             inbox.post([this, incoming] {
@@ -460,9 +462,17 @@ void friday_call_request_id(friday_call* call, char* out, int cap)
 friday_text_peer* friday_text_create(const friday_text_callbacks* callbacks, const char* const* urls, const char* const* usernames,
                                      const char* const* credentials, int count)
 {
+    return friday_text_create_labeled(callbacks, "p2p-text", urls, usernames, credentials, count);
+}
+
+friday_text_peer* friday_text_create_labeled(const friday_text_callbacks* callbacks, const char* label_prefix, const char* const* urls,
+                                             const char* const* usernames, const char* const* credentials, int count)
+{
     if (!callbacks)
         return nullptr;
     auto peer = std::make_unique<TextPeer>(*callbacks);
+    if (label_prefix && *label_prefix)
+        peer->labelPrefix = label_prefix;
     try {
         peer->pc = std::make_shared<rtc::PeerConnection>(textConfiguration(iceServers(urls, usernames, credentials, count)));
     } catch (const std::exception&) {
@@ -540,6 +550,29 @@ int friday_text_set_answer(friday_text_peer* peer, const char* sdp)
         return 1;
     }
     return 0;
+}
+
+int friday_text_send_binary(friday_text_peer* peer, const uint8_t* data, int length)
+{
+    if (!peer || !textPeer(peer)->channel || !data || length < 0)
+        return 1;
+    try {
+        textPeer(peer)->channel->send(reinterpret_cast<const std::byte*>(data), static_cast<size_t>(length));
+        return 0;
+    } catch (const std::exception&) {
+        return 1;
+    }
+}
+
+uint64_t friday_text_buffered(friday_text_peer* peer)
+{
+    if (!peer || !textPeer(peer)->channel)
+        return 0;
+    try {
+        return static_cast<uint64_t>(textPeer(peer)->channel->bufferedAmount());
+    } catch (...) {
+        return 0;
+    }
 }
 
 int friday_text_send(friday_text_peer* peer, const char* message)

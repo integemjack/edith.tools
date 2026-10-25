@@ -108,6 +108,16 @@ void friday_text_add_candidate(friday_text_peer* peer, const char* candidate, co
 /// 在通道上发一条文字；发不出去返回非 0
 int friday_text_send(friday_text_peer* peer, const char* text);
 
+// ---- edith-friday 加的：别的 label 的通道（远程工作通道 friday-work）、二进制消息、积压 ----
+
+/// 同 friday_text_create，认 label 以 label_prefix 开头的通道（空 = p2p-text）
+friday_text_peer* friday_text_create_labeled(const friday_text_callbacks* callbacks, const char* label_prefix, const char* const* urls,
+                                             const char* const* usernames, const char* const* credentials, int count);
+/// 在通道上发一条二进制消息；发不出去返回非 0
+int friday_text_send_binary(friday_text_peer* peer, const uint8_t* data, int length);
+/// 通道上还积着多少字节没发出去
+uint64_t friday_text_buffered(friday_text_peer* peer);
+
 // ---- 测试用：主叫那端（建通道、出 offer），在自检里扮手机开 P2P 文字 ----
 
 /// 建一条只连本机的连接（不要 STUN）、建通道（label）、出 offer（on_local_description）；通道开了调 on_channel_open

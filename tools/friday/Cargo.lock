@@ -147,11 +147,12 @@ dependencies = [
 
 [[package]]
 name = "edith-friday"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "base64",
  "chrono",
  "edith-tools-support",
+ "flate2",
  "friday-core",
  "libc",
  "regex",
