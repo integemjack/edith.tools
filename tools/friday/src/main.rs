@@ -339,6 +339,27 @@ impl Meta {
         });
     }
 
+    /// 用户打的命令：发给模型的展开后的那段 → 用户打的原文（按展开后的那段的指纹记，每段会话最多留 50 条）
+    fn note_command(&self, id: &str, expanded: &str, typed: &str) {
+        let key = command_key(expanded);
+        self.update(|value| {
+            let entry = Self::object(value, "commands").entry(lower(id)).or_insert_with(|| json!({}));
+            if !entry.is_object() {
+                *entry = json!({});
+            }
+            let map = entry.as_object_mut().unwrap();
+            map.insert(key, json!(typed));
+            while map.len() > 50 {
+                let first = map.keys().next().cloned().unwrap_or_default();
+                map.remove(&first);
+            }
+        });
+    }
+
+    fn typed_command(&self, id: &str, expanded: &str) -> Option<String> {
+        self.value()["commands"][lower(id)][command_key(expanded)].as_str().map(str::to_string)
+    }
+
     fn setting(&self, id: &str, key: &str) -> Option<String> {
         self.value()["settings"][lower(id)][key].as_str().map(str::to_string)
     }
@@ -751,6 +772,12 @@ fn is_framework(text: &str) -> bool {
 }
 
 /// 用户消息给人看的样子：去掉大脑给模型标的来源（「（…在你工作时补充了下面这段…）」这类第一行）
+/// 展开后的命令那段的指纹（friday.json 里按它找用户打的原文）
+fn command_key(expanded: &str) -> String {
+    let digest = sha2::Sha256::digest(expanded.trim().as_bytes());
+    digest.iter().take(12).map(|byte| format!("{byte:02x}")).collect()
+}
+
 fn shown_user_text(text: &str) -> String {
     if let Some((first, rest)) = text.split_once('\n')
         && first.starts_with('（')
@@ -816,6 +843,8 @@ struct Node {
     interjected: bool,
     /// 定时任务到点发来的：「定时任务 #n」（Friday 消息上的 sentBy）
     sent_by: Option<String>,
+    /// 用户打的是命令：发给模型的展开后的那段（Friday 消息上的 commandPrompt；正文是用户打的原文）
+    command_prompt: Option<String>,
     /// 这条消息到历史的第几条为止（不含）：截短、分叉按它
     end: usize,
     /// 这一轮出错了 / 被用户停下（存档里不记，网关记在 friday.json）
@@ -877,10 +906,13 @@ fn group_in(session: &str, owner: &str, history: &[Value], team: &Team) -> Vec<N
                     nodes.last_mut().unwrap().end = index + 1;
                     continue;
                 }
-                let blocks = vec![text_block(session, &format!("{index}"), "text", &shown)];
+                // 用户打的命令：显示原文，展开后的那段挂在 commandPrompt 上
+                let typed = META.typed_command(owner, &shown);
+                let blocks = vec![text_block(session, &format!("{index}"), "text", typed.as_deref().unwrap_or(&shown))];
                 let (from_agent, interjected) = (report_from(&text), is_interjection(&text));
                 let sent_by = loop_number(&shown).map(|number| format!("定时任务 #{number}"));
-                nodes.push(Node { role: "user", blocks, from_agent, interjected, sent_by, ..Default::default() });
+                let command_prompt = typed.map(|_| shown.clone());
+                nodes.push(Node { role: "user", blocks, from_agent, interjected, sent_by, command_prompt, ..Default::default() });
             }
             Some("assistant") => {
                 if nodes.last().is_none_or(|node| node.role != "assistant") {
@@ -968,6 +1000,9 @@ fn message_with(id: &str, parent: Option<&str>, node: Node, created: &str) -> Va
     }
     if let Some(sent_by) = node.sent_by {
         message["sentBy"] = json!(sent_by);
+    }
+    if let Some(prompt) = node.command_prompt {
+        message["commandPrompt"] = json!(prompt);
     }
     message
 }
@@ -1320,9 +1355,16 @@ impl Live {
         let mut out = Vec::new();
         for (segment, part) in self.segments.iter().enumerate() {
             let text = if part.text.is_empty() { "（连上之前开始的这一轮）" } else { &part.text };
-            let blocks = vec![text_block(session, &format!("live.{}.{segment}", self.turn), "text", text)];
-            let node =
-                Node { role: "user", blocks, from_agent: part.from_agent.clone(), interjected: part.interjected, ..Default::default() };
+            let typed = META.typed_command(session, text);
+            let blocks = vec![text_block(session, &format!("live.{}.{segment}", self.turn), "text", typed.as_deref().unwrap_or(text))];
+            let node = Node {
+                role: "user",
+                blocks,
+                from_agent: part.from_agent.clone(),
+                interjected: part.interjected,
+                command_prompt: typed.map(|_| text.to_string()),
+                ..Default::default()
+            };
             out.push(message_json(session, self.node + 2 * segment, node, &created));
             out.push(self.assistant(session, segment, &created, team));
         }
@@ -3662,7 +3704,7 @@ fn server_info() -> Value {
 
 /// 做了的（客户端只用报了的）；本地能力、本地模型、用户音色在常驻的那份里
 fn features() -> Vec<&'static str> {
-    let mut list = vec!["mkdir", "submitFrom", "activity", "assistant", "config", "memory", "memorySearch"];
+    let mut list = vec!["mkdir", "submitFrom", "activity", "assistant", "config", "memory", "memorySearch", "commands"];
     if serve_mode() != "off" {
         list.extend(["powers", "models", "userVoices", "loops", "hooks", "plugins", "prompts"]);
     }
@@ -3751,6 +3793,56 @@ fn with_prefs(request: &mut Value, session: &str, attachments: &[&str]) {
     }
 }
 
+/// 命令头里的 model 对上的模型：id、模型名、名字（「名字 · 模型」也认）；haiku / sonnet / opus（look / change / hard）按档挑，
+/// 这段会话的模型就在这档时不换。对不上回 None（用这段会话的）
+fn command_engine(wanted: &str, session: &str) -> Option<String> {
+    let wanted = wanted.trim();
+    let all = engines();
+    let lower = wanted.to_lowercase();
+    if let Some(engine) = all.iter().find(|engine| {
+        let text = |key: &str| engine[key].as_str().unwrap_or("").to_string();
+        text("id") == wanted
+            || text("model").eq_ignore_ascii_case(wanted)
+            || text("title").eq_ignore_ascii_case(wanted)
+            || format!("{} · {}", text("title"), text("model")).eq_ignore_ascii_case(wanted)
+    }) {
+        return engine["id"].as_str().map(str::to_string);
+    }
+    let tier = if lower.contains("haiku") || lower == "look" {
+        "fast"
+    } else if lower.contains("sonnet") || lower == "change" {
+        "balanced"
+    } else if lower.contains("opus") || lower == "hard" {
+        "strong"
+    } else {
+        return None;
+    };
+    let pool: Vec<friday_core::chooser::Candidate> = all.iter().map(friday_core::chooser::Candidate::from_json).collect();
+    let current = engine_for(session)["id"].as_str().unwrap_or("").to_string();
+    let index = friday_core::chooser::pick(&pool, tier, Some(&current), false)?;
+    Some(pool[index].id.clone()).filter(|id| *id != current)
+}
+
+/// 用户打的「/命令 参数」：展开成命令的内容（command.prompt）发给模型；!`命令` 按权限模式能直接跑的先跑；
+/// 头里的 allowed-tools 交给常驻那份（这一轮 PreToolUse 说 allow），model 换成这一轮用的模型
+fn expand_command(session: &Stored, text: &str) -> Option<(String, Option<String>)> {
+    let directory = if session.cwd.is_empty() { default_directory() } else { session.cwd.clone() };
+    let (command, arguments) = commands::matched(text, &directory)?;
+    let grants = commands::grants(&command.allowed_tools);
+    let mode = permission_mode(&session.id);
+    let prompt = commands::prompt(&command, &arguments, &mut |line| commands::shell(line, &directory, &mode, &grants, &session.id))?;
+    if !command.allowed_tools.is_empty()
+        && serve_mode() != "off"
+        && let Ok(hub) = hub()
+    {
+        let params = json!({ "session": session.id, "cwd": directory, "rules": command.allowed_tools });
+        let _ = hub.request("commands.grant", params, Duration::from_secs(10));
+    }
+    let engine = (!command.model.is_empty()).then(|| command_engine(&command.model, &session.id)).flatten();
+    log(&format!("命令 /{}（{}）展开了", command.name, command.file.display()));
+    Some((prompt, engine))
+}
+
 fn submit(params: &Value) -> Reply {
     let session = session_param(params, "conversationID")?;
     let mut text = params["text"].as_str().unwrap_or("").trim().to_string();
@@ -3777,12 +3869,27 @@ fn submit(params: &Value) -> Reply {
         let _ = hub.request("loops.tick", json!({}), Duration::from_secs(10));
         return Ok(json!({}));
     }
+    // 「/命令 参数」：发给模型的是展开后的命令内容（对话里照旧显示用户打的原文，记在 friday.json）
+    let typed = text.clone();
+    let mut command_engine = None;
+    if let Some((prompt, engine)) = expand_command(&session, &text) {
+        text = prompt;
+        command_engine = engine;
+    }
     let attachments: Vec<&str> = params["attachments"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
     if !attachments.is_empty() {
         text.push_str(&format!("\n\n（附件，在这台机器上：{}）", attachments.join("、")));
     }
     if text.trim().is_empty() {
         return Err((-32602, "text 是空的".into()));
+    }
+    if text != typed && !typed.is_empty() {
+        let attached = if attachments.is_empty() {
+            typed.clone()
+        } else {
+            format!("{typed}\n\n（附件，在这台机器上：{}）", attachments.join("、"))
+        };
+        META.note_command(&session.id, &text, &attached);
     }
     let (brain, session) = materialize(&session)?;
     // 改了一条重发：这段先整个存成另一支，截到那条之前
@@ -3794,6 +3901,9 @@ fn submit(params: &Value) -> Reply {
     let urgency = if queue { "queue" } else { "interject" };
     let mut request = json!({ "session": session.id, "text": text, "urgency": urgency, "kind": "user" });
     with_prefs(&mut request, &session.id, &attachments);
+    if let Some(engine) = command_engine {
+        request["engine"] = json!(engine);
+    }
     let reply = brain.request("sense", request, Duration::from_secs(30)).map_err(|error| (NOT_ALLOWED, error))?;
     META.set_draft(&session.id, "");
     if reply["disposition"] == "queued" {
@@ -4273,6 +4383,12 @@ fn handle(method: &str, params: &Value) -> Reply {
             settings_request(method, params)
         }
         method if method.starts_with("memory.") => memory_request(method, params),
+        // 这台的命令、现成的子智能体（输入框打「/」的菜单、设置 › 工具；directory：会话的工作目录，没给用默认的）
+        "commands.list" => {
+            let directory =
+                params["directory"].as_str().filter(|dir| !dir.is_empty()).map(str::to_string).unwrap_or_else(default_directory);
+            Ok(commands::list(&directory))
+        }
         "runner.retry" => retry(&session_param(params, "conversationID")?),
         "runner.selectBranch" => select_branch(&session_param(params, "conversationID")?, &upper(&text_param(params, "child")?)),
         // Friday 丢掉缓存的模型会话、下一轮按存档重建：EDITH 每轮本来就按存档来
@@ -4375,6 +4491,76 @@ fn serve_dir() -> PathBuf {
     edith_home().join("friday")
 }
 
+/// ~ 开头的路径换成家目录
+fn expand_tilde(path: &str) -> PathBuf {
+    match path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
+        Some(rest) => user_home().join(rest),
+        None if path == "~" => user_home(),
+        None => PathBuf::from(path),
+    }
+}
+
+/// 移到回收站（macOS 的废纸篓、Linux 的 XDG 回收站、Windows 的回收站）；都不行时挪进 ~/.edith/friday/trash
+fn move_to_trash(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Err(format!("{} 不在了", path.display()));
+    }
+    let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let unique = |dir: &Path| {
+        let first = dir.join(&name);
+        if first.exists() { dir.join(format!("{name} {stamp}")) } else { first }
+    };
+    if cfg!(target_os = "macos") {
+        let bin = user_home().join(".Trash");
+        if bin.is_dir() && std::fs::rename(path, unique(&bin)).is_ok() {
+            return Ok(());
+        }
+    } else if cfg!(windows) {
+        let quoted = path.to_string_lossy().replace('\'', "''");
+        let script = format!(
+            "Add-Type -AssemblyName Microsoft.VisualBasic;[Microsoft.VisualBasic.FileIO.FileSystem]::{}('{quoted}','OnlyErrorDialogs','SendToRecycleBin')",
+            if path.is_dir() { "DeleteDirectory" } else { "DeleteFile" }
+        );
+        let done = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .status()
+            .is_ok_and(|status| status.success());
+        if done && !path.exists() {
+            return Ok(());
+        }
+    } else {
+        let base = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).unwrap_or_else(|| user_home().join(".local/share")).join("Trash");
+        let (files, info) = (base.join("files"), base.join("info"));
+        if std::fs::create_dir_all(&files).is_ok() && std::fs::create_dir_all(&info).is_ok() {
+            let target = unique(&files);
+            let absolute = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            if std::fs::rename(path, &target).is_ok() {
+                let encoded: String = absolute
+                    .to_string_lossy()
+                    .bytes()
+                    .map(|byte| {
+                        if byte.is_ascii_alphanumeric() || b"/-_.~".contains(&byte) {
+                            (byte as char).to_string()
+                        } else {
+                            format!("%{byte:02X}")
+                        }
+                    })
+                    .collect();
+                let label = target.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+                let _ = std::fs::write(
+                    info.join(format!("{label}.trashinfo")),
+                    format!("[Trash Info]\nPath={encoded}\nDeletionDate={}\n", chrono::Local::now().format("%Y-%m-%dT%H:%M:%S")),
+                );
+                return Ok(());
+            }
+        }
+    }
+    let bin = serve_dir().join("trash");
+    std::fs::create_dir_all(&bin).map_err(|error| error.to_string())?;
+    std::fs::rename(path, unique(&bin)).map_err(|error| format!("{} 移不走：{error}", path.display()))
+}
+
 fn serve_registry() -> PathBuf {
     serve_dir().join("serve.json")
 }
@@ -4459,6 +4645,8 @@ fn serve_actions() -> Vec<Value> {
     actions.extend(scripts::meta_actions());
     actions.extend(caps::actions());
     actions.extend(scripts::actions());
+    // 命令和现成子智能体的工具（use_command 只在有模型能自己调的命令时给）
+    actions.extend(commands::actions());
     actions
 }
 
@@ -4496,7 +4684,7 @@ fn serve_initialize() -> Value {
 fn own_action(tool: &str) -> Option<&str> {
     let (owner, action) = tool.split_once("__")?;
     let own = owner.starts_with("friday") && !owner.starts_with("friday-client");
-    (own && (browser_tools::is_tool(action) || action == "loop")).then_some(action)
+    (own && (browser_tools::is_tool(action) || action == "loop" || commands::is_action(action))).then_some(action)
 }
 
 fn serve_hook(params: &Value) -> Value {
@@ -4510,7 +4698,11 @@ fn serve_hook(params: &Value) -> Value {
         return json!({ "need": false });
     }
     let arguments = params["tool_input"].as_object().cloned().unwrap_or_default();
-    json!({ "need": browser_tools::need(tool, action, &arguments, params["session_id"].as_str().unwrap_or("")) })
+    let session = params["session_id"].as_str().unwrap_or("");
+    if commands::is_action(action) {
+        return json!({ "need": commands::need(action, &arguments, session) });
+    }
+    json!({ "need": browser_tools::need(tool, action, &arguments, session) })
 }
 
 fn serve_act(params: &Value, brain: &Brain) -> Value {
@@ -4524,6 +4716,14 @@ fn serve_act(params: &Value, brain: &Brain) -> Value {
         let command = arguments.get("command").and_then(Value::as_str).unwrap_or("").trim();
         let command = if loops::is_command(command) { command.to_string() } else { format!("/loop {command}") };
         return json!({ "text": loops::handle(&command, session, "agent", true), "ok": true });
+    }
+    if commands::is_action(action) {
+        let (ok, text) = commands::act(action, &arguments, session);
+        if ok && action != "use_command" {
+            // 命令变了：use_command 的清单跟着换
+            std::thread::spawn(serve_update_actions);
+        }
+        return json!({ "text": text, "ok": ok });
     }
     // 能力（本机的提供方）、脚本工具、扩展自己的能力：参数里的相对路径按这段会话的工作目录
     if caps::is_action(action) || scripts::is_meta(action) || scripts::is_script(action) {
@@ -4589,6 +4789,15 @@ fn serve_brain_message(brain: &Arc<Brain>, message: Value, ready: &mut Option<Se
                 let params = &message["params"];
                 let event = params["hook_event_name"].as_str().unwrap_or("");
                 let mut reply = hooks::run(params).reply(event);
+                // 用户这一轮打的命令（allowed-tools）放开了的：免确认（钩子自己有主意的照钩子的）
+                if event == "PreToolUse"
+                    && reply.get("permissionDecision").is_none()
+                    && reply.get("decision").is_none()
+                    && commands::hook_allows(params)
+                {
+                    reply["permissionDecision"] = json!("allow");
+                    reply["permissionDecisionReason"] = json!("用户用的命令（allowed-tools）放开了这个调用");
+                }
                 // 自己的动作怎么批准（钩子拦下了就不用说了）
                 if reply.get("permissionDecision").is_none_or(|decision| decision != "deny")
                     && let Some(need) = serve_hook(params).get("need")
@@ -4617,6 +4826,7 @@ fn serve_brain_message(brain: &Arc<Brain>, message: Value, ready: &mut Option<Se
                 }
                 Some("done") => {
                     TURNS.lock().unwrap().remove(&(brain.workspace.clone(), session.clone()));
+                    commands::clear_grants(&session);
                     loops::on_done(&session, params["turn"].as_str().unwrap_or(""), &params["data"]);
                     // 智能体这一轮开的网页：关掉（带 keep 的、正交给用户的留着）
                     std::thread::spawn(move || browser::close_agent_tabs(&session));
@@ -4753,6 +4963,13 @@ fn serve_request(client: &str, method: &str, params: &Value) -> Reply {
         method if method.starts_with("capabilities.") => caps::request(method, params),
         method if method.starts_with("plugins.") => plugins::request(method, params),
         method if method.starts_with("prompts.") => prompt_files::request(method, params),
+        // 用户这一轮打的命令放开的调用（allowed-tools）：一轮结束撤掉
+        "commands.grant" => {
+            let rules: Vec<String> =
+                params["rules"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect();
+            commands::set_grants(params["session"].as_str().unwrap_or(""), params["cwd"].as_str().unwrap_or(""), commands::grants(&rules));
+            Ok(json!({}))
+        }
         other => Err((-32601, format!("常驻的那份没有 {other}"))),
     }
 }
@@ -4908,8 +5125,17 @@ fn serve() -> Result<(), String> {
     });
     let idle = Duration::from_secs(std::env::var("EDITH_FRIDAY_HUB_IDLE").ok().and_then(|text| text.parse().ok()).unwrap_or(1800));
     let mut idle_since = Instant::now();
+    let mut commands_seen = (Instant::now(), commands::signature());
     loop {
         std::thread::sleep(Duration::from_secs(1));
+        // 命令文件加了、改了、删了：大脑那边 use_command 的清单跟着换
+        if commands_seen.0.elapsed() >= Duration::from_secs(5) {
+            let now = commands::signature();
+            if now != commands_seen.1 {
+                serve_update_actions();
+            }
+            commands_seen = (Instant::now(), now);
+        }
         if !CLIENTS.lock().unwrap().is_empty()
             || pty::any_running()
             || !TURNS.lock().unwrap().is_empty()
@@ -10590,13 +10816,13 @@ mod hooks {
         }
     }
 
-    struct Ran {
-        started: bool,
-        error: String,
-        exit_code: i64,
-        timed_out: bool,
-        stdout: String,
-        stderr: String,
+    pub struct Ran {
+        pub started: bool,
+        pub error: String,
+        pub exit_code: i64,
+        pub timed_out: bool,
+        pub stdout: String,
+        pub stderr: String,
     }
 
     /// 按 Claude Code 的规矩认一个钩子的结果；回运行记录里的「结果」
@@ -10684,7 +10910,7 @@ mod hooks {
     }
 
     /// 跑一条命令（这台的 shell：Windows PowerShell，其他 sh）
-    fn execute(command: &str, directory: &Path, input: &[u8], environment: &[(String, String)], timeout: Duration) -> Ran {
+    pub fn execute(command: &str, directory: &Path, input: &[u8], environment: &[(String, String)], timeout: Duration) -> Ran {
         let mut process = if cfg!(windows) {
             let mut process = Command::new("powershell");
             process.args(["-NoProfile", "-NonInteractive", "-Command", &format!("try{{[Console]::InputEncoding=[Text.UTF8Encoding]::new($false)}}catch{{}};[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);{command}")]);
@@ -11483,6 +11709,40 @@ mod plugins {
         if !links.is_empty() || !previous.is_empty() {
             let _ = crate::write_json_file(&record_path, &json!({ "links": links }));
         }
+        // 子智能体：~/.edith/agents/<插件>/（.friday-plugin 里记着插件文件夹，EDITH 按它起「插件:名字」、换 ${CLAUDE_PLUGIN_ROOT}）
+        let agents_root = crate::edith_home().join("agents");
+        let mut kept = Vec::new();
+        for (name, directory) in &wanted {
+            let Some(agents) = sub(directory, "agents") else { continue };
+            let files = crate::commands::markdown_files(&agents);
+            if files.is_empty() {
+                continue;
+            }
+            let target = agents_root.join(name);
+            if target.exists() && !target.join(".friday-plugin").is_file() {
+                // 用户自己的同名文件夹：不动
+                continue;
+            }
+            let _ = std::fs::remove_dir_all(&target);
+            let _ = std::fs::create_dir_all(&target);
+            let _ = std::fs::write(target.join(".friday-plugin"), directory.to_string_lossy().as_bytes());
+            for (relative, file) in files {
+                let link = target.join(format!("{relative}.md"));
+                if let Some(parent) = link.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                #[cfg(unix)]
+                let _ = std::os::unix::fs::symlink(&file, &link);
+                #[cfg(windows)]
+                let _ = std::fs::copy(&file, &link);
+            }
+            kept.push(name.clone());
+        }
+        for stale in crate::sorted_names(&agents_root) {
+            if !kept.contains(&stale) && agents_root.join(&stale).join(".friday-plugin").is_file() {
+                let _ = std::fs::remove_dir_all(agents_root.join(&stale));
+            }
+        }
         // MCP：并进 ~/.edith/mcp.json，带 fridayPlugin 标记；${CLAUDE_PLUGIN_ROOT} 换成插件文件夹
         let path = mcp_path();
         let mut config = crate::read_json_file(&path);
@@ -11639,7 +11899,9 @@ mod prompt_files {
             .iter()
             .filter_map(|(name, _, _)| Some((name.clone(), std::fs::read_to_string(dir.join(".upstream").join(name)).ok()?)))
             .collect();
-        prompts::setup(bundled, dir.is_dir().then_some(dir), Vec::new());
+        // 平台参数只用到这一个（命令、子智能体的工具说明里的「移到{{trash}}」）
+        let trash = if cfg!(target_os = "macos") { "废纸篓" } else { "回收站" };
+        prompts::setup(bundled, dir.is_dir().then_some(dir), vec![("trash".to_string(), prompts::Platform::Value(trash.to_string()))]);
         *last = Some(now);
         true
     }
@@ -11808,6 +12070,1032 @@ mod prompt_files {
             prompt_store::settle(Duration::from_secs(10));
         }
         Ok(state())
+    }
+}
+
+mod commands {
+    //! 命令（照 Friday 的 Commands，Friday 仓库的 docs/COMMANDS.md；格式同 Claude Code 的 slash commands）：Markdown 文件，
+    //! 用户在输入框里打「/名字 参数」，发给模型的是展开后的命令内容（对话里照旧显示用户打的原文）。
+    //! - 放在哪：会话工作目录的 `.friday/commands/`、`.claude/commands/`，Claude Code 的 `~/.claude/commands/`（CLAUDE_CONFIG_DIR 指了用它），
+    //!   这台的 `~/.edith/friday/commands/`（「我的」）、这台装着 Friday 时它数据目录的 `Commands/`，启用的插件的 `commands/`（/插件名:名字；
+    //!   短名字不撞时 /名字 也认）；同名的先找到的算；子文件夹是命名空间（frontend/test.md → /frontend:test）。
+    //! - 头：description、argument-hint、model（那一轮换成这个模型）、allowed-tools（那一轮这些调用免确认：常驻那份的 PreToolUse 说 allow）、
+    //!   disable-model-invocation（模型不能用 use_command 自己调）；正文 $ARGUMENTS / $1…$99 换成参数，都没有又带了参数时末尾加「ARGUMENTS: 参数」，
+    //!   插件的 ${CLAUDE_PLUGIN_ROOT} 换成插件文件夹，!`命令` 展开时按权限模式能直接跑的跑了换成输出，要确认的换成「先用 run_shell 运行」交给模型。
+    //! - 现成的子智能体是大脑的（EDITH 派活时认 subagent_type）：列表问 `edith agents --json`；插件带的链到 `~/.edith/agents/<插件>/`。
+
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{LazyLock, Mutex};
+
+    use serde_json::{Map, Value, json};
+
+    /// 列表里每个用途最多几个字
+    const MAX_DESCRIPTION: usize = 200;
+    /// !`命令` 的输出最多几个字（多的留头尾）
+    const MAX_SHELL_OUTPUT: usize = 20000;
+
+    /// 读出来的 Markdown：头里的项（键小写）、正文、用途（头里没写用正文第一句）
+    pub struct Parsed {
+        pub fields: HashMap<String, String>,
+        pub body: String,
+        pub description: String,
+    }
+
+    fn first_sentence(body: &str) -> String {
+        let mut fence = false;
+        for raw in body.lines() {
+            let line = raw.trim();
+            if line.starts_with("```") {
+                fence = !fence;
+                continue;
+            }
+            if fence || line.is_empty() || line.starts_with('#') || line == "---" {
+                continue;
+            }
+            return line.trim_start_matches(['>', '-', '*', ' ']).to_string();
+        }
+        String::new()
+    }
+
+    /// YAML 头（同 Friday 的 Skills::parse：`key: value`、带引号的、`|` / `>` 和缩进的多行、下一行起的列表）
+    pub fn parse(content: &str) -> Parsed {
+        let text = content.trim_start_matches('\u{feff}').replace("\r\n", "\n");
+        let lines: Vec<&str> = text.split('\n').collect();
+        let end = (lines.first().map(|line| line.trim()) == Some("---"))
+            .then(|| lines.iter().enumerate().skip(1).find(|(_, line)| matches!(line.trim(), "---" | "...")).map(|(index, _)| index))
+            .flatten();
+        let Some(end) = end else {
+            let body = text.trim().to_string();
+            return Parsed { fields: HashMap::new(), description: first_sentence(&body), body };
+        };
+        let header = &lines[1..end];
+        let mut fields = HashMap::new();
+        let mut index = 0;
+        while index < header.len() {
+            let line = header[index];
+            index += 1;
+            if line.trim().is_empty() || line.starts_with([' ', '\t']) || line.starts_with('#') {
+                continue;
+            }
+            let Some((key, rest)) = line.split_once(':') else { continue };
+            let rest = rest.trim();
+            let mut block = Vec::new();
+            while index < header.len() && (header[index].trim().is_empty() || header[index].starts_with([' ', '\t'])) {
+                block.push(header[index].trim());
+                index += 1;
+            }
+            while block.last().is_some_and(|line| line.is_empty()) {
+                block.pop();
+            }
+            let value = if rest == "|" || rest == "|-" {
+                block.join("\n")
+            } else if rest.is_empty() || rest.starts_with('>') {
+                block.iter().filter(|line| !line.is_empty()).copied().collect::<Vec<_>>().join(if rest.is_empty() { "\n" } else { " " })
+            } else {
+                let quoted = (rest.starts_with('"') && rest.ends_with('"') && rest.len() >= 2)
+                    || (rest.starts_with('\'') && rest.ends_with('\'') && rest.len() >= 2);
+                if quoted { rest[1..rest.len() - 1].replace("\\\"", "\"").replace("''", "'") } else { rest.to_string() }
+            };
+            fields.insert(key.trim().to_lowercase(), value);
+        }
+        let body = lines[end + 1..].join("\n").trim().to_string();
+        let description = fields.get("description").cloned().filter(|text| !text.is_empty()).unwrap_or_else(|| first_sentence(&body));
+        Parsed { fields, body, description }
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct Command {
+        /// 打的名字（不带 /）：review、frontend:test、插件名:review
+        pub name: String,
+        pub description: String,
+        pub argument_hint: String,
+        pub file: PathBuf,
+        /// project / claude / user / plugin
+        pub source: &'static str,
+        pub plugin: String,
+        pub plugin_dir: Option<PathBuf>,
+        /// 插件的去掉「插件名:」的名字
+        pub short_name: String,
+        /// 头里的 model（inherit 或没写为空）
+        pub model: String,
+        pub allowed_tools: Vec<String>,
+        pub model_invocable: bool,
+    }
+
+    /// 这台「我的」命令（~/.edith/friday/commands，没有就建上）
+    pub fn root() -> PathBuf {
+        let dir = crate::serve_dir().join("commands");
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// Claude Code 的配置文件夹：CLAUDE_CONFIG_DIR，没指时 ~/.claude
+    pub fn claude_dir() -> PathBuf {
+        match std::env::var("CLAUDE_CONFIG_DIR").ok().map(|dir| dir.trim().to_string()).filter(|dir| !dir.is_empty()) {
+            Some(dir) => crate::expand_tilde(&dir),
+            None => crate::user_home().join(".claude"),
+        }
+    }
+
+    /// 这台装着 Friday 时它的数据目录
+    pub fn friday_data_dir() -> Option<PathBuf> {
+        let home = crate::user_home();
+        let dir = if cfg!(target_os = "macos") {
+            home.join("Library/Application Support/Friday")
+        } else if cfg!(windows) {
+            PathBuf::from(std::env::var_os("APPDATA")?).join("Friday")
+        } else {
+            std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".local/share")).join("Friday")
+        };
+        Some(dir).filter(|dir| dir.is_dir())
+    }
+
+    fn project_dirs(directory: &str) -> Vec<PathBuf> {
+        if directory.is_empty() {
+            return Vec::new();
+        }
+        [".friday", ".claude"].iter().map(|name| Path::new(directory).join(name).join("commands")).filter(|dir| dir.is_dir()).collect()
+    }
+
+    /// 文件夹下的 .md（含子文件夹，跳过点开头的）：(相对路径去掉 .md、正斜杠, 完整路径)，按路径排
+    pub fn markdown_files(dir: &Path) -> Vec<(String, PathBuf)> {
+        fn walk(dir: &Path, prefix: &str, out: &mut Vec<(String, PathBuf)>, depth: usize) {
+            let Ok(entries) = std::fs::read_dir(dir) else { return };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') {
+                    continue;
+                }
+                let path = entry.path();
+                let relative = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
+                if path.is_dir() {
+                    if depth < 8 {
+                        walk(&path, &relative, out, depth + 1);
+                    }
+                } else if relative.to_lowercase().ends_with(".md") {
+                    out.push((relative[..relative.len() - 3].to_string(), path));
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(dir, "", &mut files, 0);
+        files.sort();
+        files
+    }
+
+    fn truthy(value: Option<&String>) -> bool {
+        value.is_some_and(|value| matches!(value.trim().to_lowercase().as_str(), "true" | "yes" | "1"))
+    }
+
+    fn make(name: String, file: &Path, source: &'static str, plugin: &str, plugin_dir: Option<PathBuf>) -> Command {
+        let parsed = std::fs::read_to_string(file).ok().map(|text| parse(&text));
+        let field = |key: &str| {
+            parsed
+                .as_ref()
+                .and_then(|parsed| parsed.fields.get(key))
+                .map(|value| value.split_whitespace().collect::<Vec<_>>().join(" "))
+                .unwrap_or_default()
+        };
+        let model = field("model");
+        let short_name = if plugin.is_empty() { name.clone() } else { name[plugin.len() + 1..].to_string() };
+        Command {
+            description: parsed
+                .as_ref()
+                .map(|parsed| parsed.description.split_whitespace().collect::<Vec<_>>().join(" "))
+                .unwrap_or_default(),
+            argument_hint: field("argument-hint"),
+            allowed_tools: split_rules(&parsed.as_ref().and_then(|parsed| parsed.fields.get("allowed-tools").cloned()).unwrap_or_default()),
+            model_invocable: !truthy(parsed.as_ref().and_then(|parsed| parsed.fields.get("disable-model-invocation"))),
+            model: if model.eq_ignore_ascii_case("inherit") { String::new() } else { model },
+            name,
+            file: file.to_path_buf(),
+            source,
+            plugin: plugin.to_string(),
+            plugin_dir,
+            short_name,
+        }
+    }
+
+    /// 全部命令：项目的、~/.claude 的、我的、Friday 的、插件的；同名的只留先找到的；按名字排
+    pub fn all(directory: &str) -> Vec<Command> {
+        let mut commands: Vec<Command> = Vec::new();
+        let mut add = |command: Command| {
+            if !commands.iter().any(|existing| existing.name.eq_ignore_ascii_case(&command.name)) {
+                commands.push(command);
+            }
+        };
+        let colon = |relative: &str| relative.replace('/', ":");
+        for dir in project_dirs(directory) {
+            for (relative, file) in markdown_files(&dir) {
+                add(make(colon(&relative), &file, "project", "", None));
+            }
+        }
+        for (relative, file) in markdown_files(&claude_dir().join("commands")) {
+            add(make(colon(&relative), &file, "claude", "", None));
+        }
+        for (relative, file) in markdown_files(&root()) {
+            add(make(colon(&relative), &file, "user", "", None));
+        }
+        if let Some(dir) = friday_data_dir() {
+            for (relative, file) in markdown_files(&dir.join("Commands")) {
+                add(make(colon(&relative), &file, "user", "", None));
+            }
+        }
+        for (plugin, dir) in crate::plugins::enabled() {
+            for (relative, file) in markdown_files(&dir.join("commands")) {
+                add(make(format!("{plugin}:{}", colon(&relative)), &file, "plugin", &plugin, Some(dir.clone())));
+            }
+        }
+        commands.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()).then(a.name.cmp(&b.name)));
+        commands
+    }
+
+    /// 按名字找（不分大小写；插件的短名字只有一个对得上时也认）
+    pub fn find(name: &str, directory: &str) -> Option<Command> {
+        let wanted = name.trim().trim_start_matches('/');
+        if wanted.is_empty() {
+            return None;
+        }
+        let commands = all(directory);
+        if let Some(command) = commands.iter().find(|command| command.name.eq_ignore_ascii_case(wanted)) {
+            return Some(command.clone());
+        }
+        let mut found = commands.iter().filter(|command| !command.plugin.is_empty() && command.short_name.eq_ignore_ascii_case(wanted));
+        let first = found.next()?;
+        if found.next().is_some() { None } else { Some(first.clone()) }
+    }
+
+    /// 文字是不是「/命令 参数」：(命令, 参数)
+    pub fn matched(text: &str, directory: &str) -> Option<(Command, String)> {
+        let trimmed = text.trim();
+        let rest = trimmed.strip_prefix('/')?;
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let name = &rest[..end];
+        // 路径（/Users/…）不是命令
+        if name.is_empty() || name.contains(['/', '\\']) {
+            return None;
+        }
+        Some((find(name, directory)?, rest[end..].trim().to_string()))
+    }
+
+    /// 按空白拆参数，认单双引号
+    pub fn split_arguments(arguments: &str) -> Vec<String> {
+        let mut parts = Vec::new();
+        let mut current = String::new();
+        let (mut token, mut quote) = (false, None::<char>);
+        for c in arguments.chars() {
+            if let Some(open) = quote {
+                if c == open {
+                    quote = None;
+                } else {
+                    current.push(c);
+                }
+                continue;
+            }
+            if c == '"' || c == '\'' {
+                quote = Some(c);
+                token = true;
+            } else if c.is_whitespace() {
+                if token {
+                    parts.push(std::mem::take(&mut current));
+                }
+                token = false;
+            } else {
+                current.push(c);
+                token = true;
+            }
+        }
+        if token {
+            parts.push(current);
+        }
+        parts
+    }
+
+    static ARGUMENTS: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"\$ARGUMENTS|\$([1-9][0-9]?)").unwrap());
+    static BANG: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"!`([^`\n]+)`").unwrap());
+
+    /// 展开正文；shell 回 Some 换成它（跑了的输出、没跑的原因），None 换成「先用 run_shell 运行」
+    pub fn expand(body: &str, arguments: &str, plugin_dir: Option<&Path>, shell: &mut dyn FnMut(&str) -> Option<String>) -> String {
+        let mut text = body.to_string();
+        if let Some(dir) = plugin_dir {
+            let root = dir.to_string_lossy();
+            text = text.replace("${CLAUDE_PLUGIN_ROOT}", &root).replace("${FRIDAY_PLUGIN_ROOT}", &root);
+        }
+        let positional = split_arguments(arguments);
+        let mut used = false;
+        let replaced = ARGUMENTS.replace_all(&text, |captures: &regex::Captures| {
+            used = true;
+            match captures.get(1) {
+                None => arguments.to_string(),
+                Some(index) => positional.get(index.as_str().parse::<usize>().unwrap_or(1) - 1).cloned().unwrap_or_default(),
+            }
+        });
+        let replaced = replaced.into_owned();
+        let mut expanded = String::new();
+        let mut last = 0;
+        for captures in BANG.captures_iter(&replaced) {
+            let whole = captures.get(0).unwrap();
+            expanded.push_str(&replaced[last..whole.start()]);
+            let command = &captures[1];
+            expanded.push_str(&shell(command).unwrap_or_else(|| format!("（先用 run_shell 运行 `{command}`，用它的输出）")));
+            last = whole.end();
+        }
+        expanded.push_str(&replaced[last..]);
+        if !used && !arguments.is_empty() {
+            expanded = format!("{}\n\nARGUMENTS: {arguments}", expanded.trim());
+        }
+        expanded.trim().to_string()
+    }
+
+    /// !`命令` 跑完的输出换进正文的样子：一行的原样，多行的放进代码块（「退出码 0」那行去掉）
+    pub fn shell_output_text(output: &str) -> String {
+        let mut text = output.strip_prefix("退出码 0\n").unwrap_or(output).trim().to_string();
+        let count = text.chars().count();
+        if count > MAX_SHELL_OUTPUT {
+            let half = MAX_SHELL_OUTPUT / 2;
+            let head: String = text.chars().take(half).collect();
+            let tail: String = text.chars().skip(count - half).collect();
+            text = format!("{head}\n…（中间省略 {} 字）…\n{tail}", count - 2 * half);
+        }
+        if !text.contains('\n') && text.chars().count() <= 200 { text } else { format!("\n```\n{text}\n```\n") }
+    }
+
+    fn native(path: &Path) -> String {
+        let text = path.to_string_lossy().into_owned();
+        if cfg!(windows) { text.replace('/', "\\") } else { text }
+    }
+
+    fn render(key: &str, command: &Command, arguments: &str, body: String) -> String {
+        let args: friday_core::prompts::Args = [
+            ("name".to_string(), command.name.clone()),
+            ("arguments".to_string(), if arguments.is_empty() { "（没有）".to_string() } else { arguments.to_string() }),
+            ("file".to_string(), native(&command.file)),
+            ("body".to_string(), body.clone()),
+        ]
+        .into_iter()
+        .collect();
+        let text = friday_core::prompts::text(key, &args, None);
+        // EDITH 还没在这台跑过（没有它的提示词）：照自带的写法
+        if text.starts_with("【缺提示词") {
+            let lead =
+                if key == "command.tool" { format!("命令 /{}", command.name) } else { format!("用户用了命令 /{}", command.name) };
+            return format!("{lead}（参数：{}）的内容（{}），照着做：\n\n{body}", args["arguments"], args["file"]);
+        }
+        text
+    }
+
+    /// 用户打的是命令时，发给模型的那段（command.prompt）；不是命令为 None
+    pub fn prompt(command: &Command, arguments: &str, shell: &mut dyn FnMut(&str) -> Option<String>) -> Option<String> {
+        let parsed = parse(&std::fs::read_to_string(&command.file).ok()?);
+        let body = expand(&parsed.body, arguments, command.plugin_dir.as_deref(), shell);
+        Some(render("command.prompt", command, arguments, body))
+    }
+
+    // MARK: allowed-tools
+
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct Grant {
+        pub tool: String,
+        pub pattern: String,
+    }
+
+    /// allowed-tools 头的值拆开：逗号、空白、YAML 列表的「- 」、方括号、引号都认，括号里的不拆（Bash(git add:*)）
+    pub fn split_rules(value: &str) -> Vec<String> {
+        let mut rules: Vec<String> = Vec::new();
+        let mut current = String::new();
+        let mut depth = 0usize;
+        let flush = |current: &mut String, rules: &mut Vec<String>| {
+            let rule = current.trim().trim_start_matches(['"', '\'', '[']).trim_end_matches(['"', '\'', ']']).trim().to_string();
+            current.clear();
+            if !rule.is_empty() && rule != "-" && !rules.contains(&rule) {
+                rules.push(rule);
+            }
+        };
+        for c in value.chars() {
+            if c == '(' {
+                depth += 1;
+            } else if c == ')' {
+                depth = depth.saturating_sub(1);
+            }
+            if depth == 0 && (c == ',' || c == '，' || c.is_whitespace()) {
+                flush(&mut current, &mut rules);
+                continue;
+            }
+            current.push(c);
+        }
+        flush(&mut current, &mut rules);
+        rules
+    }
+
+    /// 拆开的规则换成 EDITH 的工具名（Bash → run_shell、Read → read_file…）
+    pub fn grants(rules: &[String]) -> Vec<Grant> {
+        let mut list = Vec::new();
+        for rule in rules {
+            let (tool, pattern) = match rule.split_once('(') {
+                Some((tool, rest)) => (tool.trim(), rest.trim_end_matches(')').trim()),
+                None => (rule.trim(), ""),
+            };
+            let grant = Grant {
+                tool: friday_core::tool_aliases::canonical_name(tool),
+                pattern: if pattern == "*" { String::new() } else { pattern.to_string() },
+            };
+            if !list.contains(&grant) {
+                list.push(grant);
+            }
+        }
+        list
+    }
+
+    /// 通配（* 不跨 /，** 跨，? 一个字）整段对得上
+    fn wildcard(pattern: &str, text: &str, slashes: bool) -> bool {
+        let mut regex = String::from("^(?s:");
+        let chars: Vec<char> = pattern.chars().collect();
+        let mut index = 0;
+        while index < chars.len() {
+            match chars[index] {
+                '*' if chars.get(index + 1) == Some(&'*') => {
+                    regex.push_str(".*");
+                    index += 1;
+                    if chars.get(index + 1) == Some(&'/') {
+                        regex.push_str("/?");
+                        index += 1;
+                    }
+                }
+                '*' => regex.push_str(if slashes { "[^/]*" } else { ".*" }),
+                '?' => regex.push_str(if slashes { "[^/]" } else { "." }),
+                c => regex.push_str(&regex::escape(&c.to_string())),
+            }
+            index += 1;
+        }
+        regex.push_str(")$");
+        regex::Regex::new(&regex).is_ok_and(|regex| regex.is_match(text))
+    }
+
+    /// run_shell 的一段对不对得上：「前缀:*」= 这个前缀开头，带 * ? 的按通配，其余整句一样
+    fn command_matches(pattern: &str, command: &str) -> bool {
+        let wanted = pattern.trim();
+        if let Some(prefix) = wanted.strip_suffix(":*") {
+            let prefix = prefix.trim();
+            return command == prefix || (command.starts_with(prefix) && command[prefix.len()..].starts_with(char::is_whitespace));
+        }
+        if wanted.contains(['*', '?']) { wildcard(wanted, command, false) } else { command == wanted }
+    }
+
+    /// 按 && || ; | 换行拆成几段（引号里的不拆）；带 `…`、$( 的不认
+    fn segments(command: &str) -> Vec<String> {
+        if command.contains('`') || command.contains("$(") {
+            return Vec::new();
+        }
+        let mut parts = Vec::new();
+        let mut current = String::new();
+        let mut quote: Option<char> = None;
+        let chars: Vec<char> = command.chars().collect();
+        let mut index = 0;
+        while index < chars.len() {
+            let c = chars[index];
+            if let Some(open) = quote {
+                current.push(c);
+                if c == open {
+                    quote = None;
+                }
+            } else if c == '"' || c == '\'' {
+                quote = Some(c);
+                current.push(c);
+            } else if matches!(c, ';' | '\n' | '|' | '&') {
+                if (c == '|' || c == '&') && chars.get(index + 1) == Some(&c) {
+                    index += 1;
+                }
+                if !current.trim().is_empty() {
+                    parts.push(current.trim().to_string());
+                }
+                current.clear();
+            } else {
+                current.push(c);
+            }
+            index += 1;
+        }
+        if quote.is_some() {
+            return Vec::new();
+        }
+        if !current.trim().is_empty() {
+            parts.push(current.trim().to_string());
+        }
+        parts
+    }
+
+    fn absolute(path: &str, cwd: &str) -> String {
+        let expanded = crate::expand_tilde(path.trim()).to_string_lossy().replace('\\', "/");
+        let joined =
+            if Path::new(&expanded).is_absolute() || cwd.is_empty() { expanded } else { format!("{}/{expanded}", cwd.replace('\\', "/")) };
+        let mut parts: Vec<&str> = Vec::new();
+        for part in joined.split('/') {
+            match part {
+                "" | "." if !parts.is_empty() => {}
+                ".." => {
+                    parts.pop();
+                }
+                other => parts.push(other),
+            }
+        }
+        parts.join("/")
+    }
+
+    /// 这个调用在不在 grants 里（同 Friday 的 Commands::granted）
+    pub fn granted(grants: &[Grant], tool: &str, arguments: &Map<String, Value>, cwd: &str, destructive: bool) -> bool {
+        let mine: Vec<&Grant> = grants.iter().filter(|grant| grant.tool == tool).collect();
+        if mine.is_empty() {
+            return false;
+        }
+        if !destructive && mine.iter().any(|grant| grant.pattern.is_empty()) {
+            return true;
+        }
+        let text = |key: &str| arguments.get(key).and_then(Value::as_str).unwrap_or("").to_string();
+        match tool {
+            "run_shell" => {
+                let parts = segments(&text("command"));
+                !parts.is_empty()
+                    && parts.iter().all(|part| mine.iter().any(|grant| !grant.pattern.is_empty() && command_matches(&grant.pattern, part)))
+            }
+            "read_file" | "write_file" | "edit_file" | "list_directory" | "find_files" | "search_files" | "search_keywords" => {
+                let path = text("path");
+                if path.trim().is_empty() {
+                    return false;
+                }
+                let target = absolute(&path, cwd);
+                let insensitive = cfg!(any(windows, target_os = "macos"));
+                mine.iter().any(|grant| {
+                    if grant.pattern.is_empty() {
+                        return false;
+                    }
+                    let pattern = grant.pattern.strip_prefix("//").map(|rest| format!("/{rest}")).unwrap_or_else(|| grant.pattern.clone());
+                    let wanted = absolute(&pattern, cwd);
+                    if insensitive {
+                        wildcard(&wanted.to_lowercase(), &target.to_lowercase(), true)
+                    } else {
+                        wildcard(&wanted, &target, true)
+                    }
+                })
+            }
+            "fetch_url" => {
+                let url = text("url");
+                let host = url
+                    .trim()
+                    .split("://")
+                    .nth(1)
+                    .unwrap_or("")
+                    .split(['/', '?', '#'])
+                    .next()
+                    .unwrap_or("")
+                    .rsplit('@')
+                    .next()
+                    .unwrap_or("")
+                    .split(':')
+                    .next()
+                    .unwrap_or("")
+                    .to_lowercase();
+                !host.is_empty()
+                    && mine.iter().any(|grant| {
+                        grant.pattern.strip_prefix("domain:").is_some_and(|domain| {
+                            let domain = domain.trim().to_lowercase();
+                            host == domain || host.ends_with(&format!(".{domain}"))
+                        })
+                    })
+            }
+            _ => false,
+        }
+    }
+
+    /// 用户用了命令的那几段会话：这一轮免确认的（一轮结束时撤掉）
+    /// 会话 → (工作目录, 放开的)
+    type Granted = HashMap<String, (String, Vec<Grant>)>;
+    static GRANTS: LazyLock<Mutex<Granted>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    pub fn set_grants(session: &str, cwd: &str, grants: Vec<Grant>) {
+        let mut all = GRANTS.lock().unwrap();
+        if grants.is_empty() {
+            all.remove(&session.to_lowercase());
+        } else {
+            all.insert(session.to_lowercase(), (cwd.to_string(), grants));
+        }
+    }
+
+    pub fn clear_grants(session: &str) {
+        GRANTS.lock().unwrap().remove(&session.to_lowercase());
+    }
+
+    /// PreToolUse：这一轮用户用的命令放开了这个调用
+    pub fn hook_allows(params: &Value) -> bool {
+        let session = params["session_id"].as_str().unwrap_or("").to_lowercase();
+        let Some((cwd, grants)) = GRANTS.lock().unwrap().get(&session).cloned() else { return false };
+        let tool = friday_core::tool_aliases::canonical_name(params["tool_name"].as_str().unwrap_or(""));
+        let arguments = params["tool_input"].as_object().cloned().unwrap_or_default();
+        let command = arguments.get("command").and_then(Value::as_str).unwrap_or("");
+        let destructive = friday_core::approval::is_destructive(&tool, Some(command).filter(|command| !command.is_empty()), cfg!(windows));
+        granted(&grants, &tool, &arguments, &cwd, destructive)
+    }
+
+    // MARK: !`命令`
+
+    /// 能不能直接跑：完全模式都能；自动模式不是删除类、改系统的能；放开了的（allowed-tools）能
+    fn may_run(command: &str, mode: &str, grants: &[Grant], cwd: &str) -> bool {
+        let destructive = friday_core::approval::is_destructive("run_shell", Some(command), cfg!(windows))
+            || friday_core::approval::is_system_change("run_shell", Some(command), None);
+        let arguments: Map<String, Value> = [("command".to_string(), json!(command))].into_iter().collect();
+        mode == "full" || (mode == "auto" && !destructive) || granted(grants, "run_shell", &arguments, cwd, destructive)
+    }
+
+    /// !`命令` 怎么办：能直接跑的跑了回输出（用户配的 PreToolUse 钩子照样管），其余 None（交给模型照常走确认）
+    pub fn shell(command: &str, cwd: &str, mode: &str, grants: &[Grant], session: &str) -> Option<String> {
+        if !may_run(command, mode, grants, cwd) {
+            return None;
+        }
+        let input = json!({ "hook_event_name": "PreToolUse", "session_id": session, "cwd": cwd, "permission_mode": mode,
+            "tool_name": "run_shell", "tool_input": { "command": command } });
+        let reply = crate::hooks::run(&input).reply("PreToolUse");
+        if reply["permissionDecision"] == "deny" || reply["decision"] == "block" {
+            let reason = reply["permissionDecisionReason"].as_str().or_else(|| reply["reason"].as_str()).unwrap_or("");
+            return Some(format!("（没有运行 `{command}`：用户配的钩子拦下了——{reason}）"));
+        }
+        if reply["permissionDecision"] == "ask" || reply.get("updatedInput").is_some() {
+            return None;
+        }
+        let ran = crate::hooks::execute(command, Path::new(cwd), b"", &[], std::time::Duration::from_secs(60));
+        let output = if !ran.started {
+            format!("运行失败：{}", ran.error)
+        } else if ran.timed_out {
+            format!("运行超时（60 秒）：{}{}", ran.stdout, ran.stderr)
+        } else {
+            let both =
+                [ran.stdout.trim_end(), ran.stderr.trim_end()].into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join("\n");
+            format!("退出码 {}\n{both}", ran.exit_code)
+        };
+        Some(shell_output_text(&output))
+    }
+
+    // MARK: 列表
+
+    fn source_title(command: &Command) -> String {
+        match command.source {
+            "project" => "项目".into(),
+            "plugin" => format!("插件 {}", command.plugin),
+            "claude" => "Claude Code".into(),
+            _ => "我的".into(),
+        }
+    }
+
+    fn clipped(text: &str, limit: usize) -> String {
+        if text.chars().count() <= limit { text.to_string() } else { format!("{}…", text.chars().take(limit).collect::<String>()) }
+    }
+
+    fn command_json(command: &Command) -> Value {
+        json!({
+            "name": command.name, "description": clipped(&command.description, MAX_DESCRIPTION), "argumentHint": command.argument_hint,
+            "file": native(&command.file), "source": command.source, "sourceTitle": source_title(command), "plugin": command.plugin,
+            "model": command.model, "allowedTools": command.allowed_tools, "modelInvocable": command.model_invocable,
+            // 远程的详情就是这一项（Friday 的 CommandsModel::details）：带上原文
+            "content": std::fs::read_to_string(&command.file).unwrap_or_default(),
+        })
+    }
+
+    /// 这台「我的」子智能体放在哪（EDITH 的 ~/.edith/agents）
+    pub fn agents_root() -> PathBuf {
+        let dir = crate::edith_home().join("agents");
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// 现成的子智能体（EDITH 的：edith agents --json，在会话的工作目录里问）
+    pub fn agents(directory: &str) -> Vec<Value> {
+        let cwd = if directory.is_empty() || !Path::new(directory).is_dir() { crate::user_home() } else { PathBuf::from(directory) };
+        let Ok(output) = std::process::Command::new(crate::edith_program())
+            .args(["agents", "--json"])
+            .current_dir(&cwd)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+        else {
+            return Vec::new();
+        };
+        let list: Vec<Value> =
+            serde_json::from_slice::<Value>(&output.stdout).ok().and_then(|value| value.as_array().cloned()).unwrap_or_default();
+        list.into_iter()
+            .map(|agent| {
+                let source = agent["source"].as_str().unwrap_or("user");
+                let source = if source == "friday" { "user" } else { source };
+                let title = match source {
+                    "project" => "项目".to_string(),
+                    "plugin" => format!("插件 {}", agent["plugin"].as_str().unwrap_or("")),
+                    "claude" => "Claude Code".to_string(),
+                    _ => "我的".to_string(),
+                };
+                let file = agent["file"].as_str().unwrap_or("").to_string();
+                json!({
+                    "name": agent["name"], "description": clipped(agent["description"].as_str().unwrap_or(""), 300), "tools": agent["tools"],
+                    "model": agent["model"], "file": native(Path::new(&file)), "source": source, "sourceTitle": title, "plugin": agent["plugin"],
+                    "content": std::fs::read_to_string(&file).unwrap_or_default(),
+                })
+            })
+            .collect()
+    }
+
+    /// commands.list：这台的命令、现成的子智能体（输入框打「/」时的菜单、设置 › 工具）
+    pub fn list(directory: &str) -> Value {
+        json!({
+            "commands": all(directory).iter().map(command_json).collect::<Vec<_>>(),
+            "agents": agents(directory),
+            "commandsDirectory": native(&root()),
+            "agentsDirectory": native(&agents_root()),
+        })
+    }
+
+    // MARK: 智能体的工具（常驻那份的动作）
+
+    pub const ACTIONS: [&str; 5] = ["use_command", "save_command", "delete_command", "save_subagent", "delete_subagent"];
+
+    pub fn is_action(name: &str) -> bool {
+        ACTIONS.contains(&name)
+    }
+
+    /// 模型能自己调的命令变没变（名字、用途、参数提示）
+    pub fn signature() -> String {
+        all("")
+            .iter()
+            .filter(|command| command.model_invocable)
+            .map(|command| format!("{}\u{1f}{}\u{1f}{}", command.name, command.description, command.argument_hint))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn describe(key: &str) -> String {
+        let text = friday_core::prompts::text(key, &Default::default(), None);
+        if text.starts_with("【缺提示词") { String::new() } else { text }
+    }
+
+    fn property(key: &str, kind: &str) -> Value {
+        json!({ "type": kind, "description": describe(key) })
+    }
+
+    /// 动作的定义：模型能自己调的命令列在 use_command 的说明里（没有时不给 use_command）
+    pub fn actions() -> Vec<Value> {
+        let invocable: Vec<Command> =
+            all("").into_iter().filter(|command| command.model_invocable && !command.description.is_empty()).collect();
+        let mut actions = Vec::new();
+        if !invocable.is_empty() {
+            let names: Vec<String> = invocable.iter().take(6).map(|command| format!("/{}", command.name)).collect();
+            let lines: Vec<String> = invocable
+                .iter()
+                .map(|command| {
+                    let hint = if command.argument_hint.is_empty() { String::new() } else { format!(" {}", command.argument_hint) };
+                    format!("- /{}{hint}：{}", command.name, clipped(&command.description, MAX_DESCRIPTION))
+                })
+                .collect();
+            actions.push(json!({
+                "name": "use_command",
+                // 第一句进系统提示的按需工具清单：带上几个名字，模型才知道有哪些
+                "description": format!("用配好的命令（{}{}）。{}\n能用的命令：\n{}", names.join("、"), if invocable.len() > 6 { " 等" } else { "" }, describe("tool.use_command"), lines.join("\n")),
+                "parameters": { "type": "object", "properties": { "command": property("tool.use_command.command", "string"), "arguments": property("tool.use_command.arguments", "string") }, "required": ["command"] },
+                "readOnly": true, "timeoutSeconds": 120,
+            }));
+        }
+        let field = |tool: &str, name: &str, kind: &str| (name.to_string(), property(&format!("tool.{tool}.{name}"), kind));
+        let object = |pairs: Vec<(String, Value)>| Value::Object(pairs.into_iter().collect());
+        actions.push(json!({ "name": "save_command", "description": describe("tool.save_command"),
+            "parameters": { "type": "object", "properties": object(vec![field("save_command", "name", "string"), field("save_command", "description", "string"), field("save_command", "content", "string"),
+                field("save_command", "argument_hint", "string"), field("save_command", "model", "string"), field("save_command", "allowed_tools", "string"),
+                field("save_command", "disable_model_invocation", "boolean"), field("save_command", "scope", "string")]), "required": ["name", "description", "content"] } }));
+        actions.push(json!({ "name": "delete_command", "description": describe("tool.delete_command"),
+            "parameters": { "type": "object", "properties": object(vec![field("delete_command", "name", "string")]), "required": ["name"] } }));
+        actions.push(json!({ "name": "save_subagent", "description": describe("tool.save_subagent"),
+            "parameters": { "type": "object", "properties": object(vec![field("save_subagent", "name", "string"), field("save_subagent", "description", "string"), field("save_subagent", "content", "string"),
+                field("save_subagent", "tools", "string"), field("save_subagent", "model", "string"), field("save_subagent", "scope", "string")]), "required": ["name", "description", "content"] } }));
+        actions.push(json!({ "name": "delete_subagent", "description": describe("tool.delete_subagent"),
+            "parameters": { "type": "object", "properties": object(vec![field("delete_subagent", "name", "string")]), "required": ["name"] } }));
+        actions
+    }
+
+    /// 名字不能用时的原因（「:」分开的每一段同文件名的规矩）
+    fn name_problem(name: &str) -> Option<String> {
+        if name.trim().is_empty() {
+            return Some("名字不能是空的".into());
+        }
+        for part in name.split(':') {
+            if part.is_empty()
+                || part.starts_with('.')
+                || part.ends_with(['.', ' '])
+                || part.chars().any(|c| "/\\*?\"<>|".contains(c) || (c as u32) < 0x20)
+            {
+                return Some(format!("「{name}」不能用作文件名：每段不能空、不能以「.」开头或以「.」、空格结尾，不能有 / \\ * ? \" < > |"));
+            }
+        }
+        None
+    }
+
+    fn yaml(value: &str) -> String {
+        let one = value.split_whitespace().collect::<Vec<_>>().join(" ");
+        let special =
+            one.is_empty() || one.starts_with(|c: char| "-?:,[]{}#&*!|>'\"%@`".contains(c)) || one.contains(": ") || one.contains(" #");
+        if special { format!("\"{}\"", one.replace('\\', "\\\\").replace('"', "\\\"")) } else { one }
+    }
+
+    /// 写哪个文件：已有的原地改（插件带的不能改）；新的按 scope（project = 工作目录的 .claude/…（有它没 .friday/… 时）或 .friday/…，其余 = 我的）
+    fn target(agent: bool, name: &str, scope: &str, cwd: &str) -> Result<PathBuf, String> {
+        if agent {
+            if let Some(existing) =
+                agents(cwd).into_iter().find(|item| item["name"].as_str().is_some_and(|other| other.eq_ignore_ascii_case(name)))
+            {
+                if existing["source"] == "plugin" {
+                    return Err(format!("{name} 是插件带的，不能改：换个名字另存一个"));
+                }
+                return Ok(PathBuf::from(existing["file"].as_str().unwrap_or("")));
+            }
+        } else if let Some(existing) = find(name, cwd) {
+            if existing.source == "plugin" {
+                return Err(format!("/{name} 是插件带的，不能改：换个名字另存一个"));
+            }
+            return Ok(existing.file);
+        }
+        let folder = if agent { "agents" } else { "commands" };
+        let relative = format!("{}.md", name.replace(':', "/"));
+        if scope == "project" && !cwd.is_empty() {
+            let base = Path::new(cwd);
+            let claude = base.join(".claude").join(folder);
+            let dir =
+                if claude.is_dir() && !base.join(".friday").join(folder).is_dir() { claude } else { base.join(".friday").join(folder) };
+            return Ok(dir.join(relative));
+        }
+        Ok(if agent { agents_root().join(relative) } else { root().join(relative) })
+    }
+
+    fn text_arg<'a>(arguments: &'a Map<String, Value>, key: &str) -> &'a str {
+        arguments.get(key).and_then(Value::as_str).map(str::trim).unwrap_or("")
+    }
+
+    fn compose(agent: bool, arguments: &Map<String, Value>) -> String {
+        let name = text_arg(arguments, "name");
+        let mut body = arguments.get("content").and_then(Value::as_str).unwrap_or("").replace("\r\n", "\n");
+        if body.trim_start().starts_with("---") {
+            body = parse(&body).body;
+        }
+        let mut header = String::from("---\n");
+        if agent {
+            header.push_str(&format!("name: {}\ndescription: {}\n", yaml(name), yaml(text_arg(arguments, "description"))));
+            for key in ["tools", "model"] {
+                if !text_arg(arguments, key).is_empty() {
+                    header.push_str(&format!("{key}: {}\n", yaml(text_arg(arguments, key))));
+                }
+            }
+        } else {
+            header.push_str(&format!("description: {}\n", yaml(text_arg(arguments, "description"))));
+            for (key, field) in [("argument_hint", "argument-hint"), ("model", "model"), ("allowed_tools", "allowed-tools")] {
+                if !text_arg(arguments, key).is_empty() {
+                    header.push_str(&format!("{field}: {}\n", yaml(text_arg(arguments, key))));
+                }
+            }
+            let disabled = arguments
+                .get("disable_model_invocation")
+                .is_some_and(|value| value.as_bool() == Some(true) || value.as_str() == Some("true"));
+            if disabled {
+                header.push_str("disable-model-invocation: true\n");
+            }
+        }
+        format!("{header}---\n\n{}\n", body.trim())
+    }
+
+    /// PreToolUse 替这几个动作说怎么批准：用命令不用批准，写 / 删文件跟写文件一样（工作目录外的也算）
+    pub fn need(action: &str, arguments: &Map<String, Value>, session: &str) -> Value {
+        if action == "use_command" {
+            return json!(false);
+        }
+        let cwd = crate::find_session(session).map(|stored| stored.cwd).unwrap_or_default();
+        let agent = action.ends_with("subagent");
+        let name = text_arg(arguments, "name").trim_start_matches('/').to_string();
+        let file = target(agent, &name, text_arg(arguments, "scope"), &cwd).map(|path| native(&path)).unwrap_or_else(|_| name.clone());
+        let what = if agent { "子智能体" } else { "命令" };
+        let summary = if action.starts_with("delete") {
+            format!("删掉{what}「{name}」（{file} 移到回收站）")
+        } else {
+            format!("写{what}「{name}」：{file}")
+        };
+        json!({ "target": file, "summary": summary, "rule": format!("friday__{action}") })
+    }
+
+    /// 做动作：(ok, 交回模型的话)
+    pub fn act(action: &str, arguments: &Map<String, Value>, session: &str) -> (bool, String) {
+        let stored = crate::find_session(session);
+        let cwd = stored.as_ref().map(|stored| stored.cwd.clone()).unwrap_or_default();
+        let name = text_arg(arguments, "name").trim_start_matches('/').to_string();
+        match action {
+            "use_command" => {
+                let wanted = text_arg(arguments, "command").trim_start_matches('/');
+                let Some(command) = find(wanted, &cwd) else {
+                    let names: Vec<String> =
+                        all(&cwd).iter().filter(|command| command.model_invocable).map(|command| format!("/{}", command.name)).collect();
+                    return (
+                        false,
+                        format!("没有命令 /{wanted}（有的：{}）", if names.is_empty() { "无".into() } else { names.join("、") }),
+                    );
+                };
+                if !command.model_invocable {
+                    return (false, format!("/{} 只给用户用（disable-model-invocation），你不能自己调", command.name));
+                }
+                // 模型自己调的：不换模型，allowed-tools 也不免确认（不然先写一个命令再调就绕过了确认）；!`命令` 照权限模式
+                let mode = crate::permission_mode(session);
+                let arguments_text = text_arg(arguments, "arguments").to_string();
+                let parsed = match std::fs::read_to_string(&command.file) {
+                    Ok(text) => parse(&text),
+                    Err(error) => return (false, format!("读不了命令文件 {}：{error}", native(&command.file))),
+                };
+                let body = expand(&parsed.body, &arguments_text, command.plugin_dir.as_deref(), &mut |line| {
+                    shell(line, &cwd, &mode, &[], session)
+                });
+                (true, render("command.tool", &command, &arguments_text, body))
+            }
+            "save_command" | "save_subagent" => {
+                let agent = action == "save_subagent";
+                if let Some(problem) = name_problem(&name) {
+                    return (false, problem);
+                }
+                if text_arg(arguments, "content").is_empty() {
+                    return (false, "content 不能是空的".into());
+                }
+                let file = match target(agent, &name, text_arg(arguments, "scope"), &cwd) {
+                    Ok(file) => file,
+                    Err(error) => return (false, error),
+                };
+                let existed = file.exists();
+                if let Some(parent) = file.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                match std::fs::write(&file, compose(agent, arguments)) {
+                    Ok(()) => {
+                        let what = if agent {
+                            format!("子智能体「{name}」：以后派活时 subagent_type 写 {name}")
+                        } else {
+                            format!("命令 /{name}：用户打 /{name} 就用它")
+                        };
+                        (true, format!("{}{what}（{}）", if existed { "改好了" } else { "建好了" }, native(&file)))
+                    }
+                    Err(error) => (false, format!("写不了 {}：{error}", native(&file))),
+                }
+            }
+            "delete_command" | "delete_subagent" => {
+                let agent = action == "delete_subagent";
+                let file = if agent {
+                    agents(&cwd)
+                        .into_iter()
+                        .find(|item| item["name"].as_str().is_some_and(|other| other.eq_ignore_ascii_case(&name)))
+                        .map(|item| (item["source"] == "plugin", PathBuf::from(item["file"].as_str().unwrap_or(""))))
+                } else {
+                    find(&name, &cwd).map(|command| (command.source == "plugin", command.file))
+                };
+                match file {
+                    None => (false, format!("没有{}「{name}」", if agent { "子智能体" } else { "命令" })),
+                    Some((true, _)) => (false, format!("「{name}」是插件带的，不能删：在设置 › 插件里停用那个插件")),
+                    Some((false, file)) => match crate::move_to_trash(&file) {
+                        Ok(()) => (true, format!("删掉了「{name}」（{} 移到了回收站）", native(&file))),
+                        Err(error) => (false, error),
+                    },
+                }
+            }
+            other => (false, format!("没有 {other}")),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn parses_headers_and_expands() {
+            let parsed = parse(
+                "---\ndescription: \"审一下: 改动\"\nallowed-tools:\n  - Bash(git diff:*)\n  - Read\ndisable-model-invocation: true\n---\n看 $1 和 $ARGUMENTS\n",
+            );
+            assert_eq!(parsed.description, "审一下: 改动");
+            assert_eq!(split_rules(&parsed.fields["allowed-tools"]), vec!["Bash(git diff:*)", "Read"]);
+            assert_eq!(parsed.body, "看 $1 和 $ARGUMENTS");
+            assert_eq!(expand(&parsed.body, "a \"b c\"", None, &mut |_| None), "看 a 和 a \"b c\"");
+            assert_eq!(expand("做这个", "x y", None, &mut |_| None), "做这个\n\nARGUMENTS: x y");
+            assert_eq!(expand("状态 !`git status`", "", None, &mut |_| None), "状态 （先用 run_shell 运行 `git status`，用它的输出）");
+            assert_eq!(expand("状态 !`echo hi`", "", None, &mut |_| Some("hi".into())), "状态 hi");
+            assert_eq!(parse("没有头的命令\n第二行").description, "没有头的命令");
+        }
+
+        #[test]
+        fn grants_match_like_friday() {
+            let given = grants(&split_rules("Bash(git add:*), Bash(git status), Read(src/**), WebFetch(domain:example.com)"));
+            let args = |key: &str, value: &str| -> Map<String, Value> { [(key.to_string(), json!(value))].into_iter().collect() };
+            assert!(granted(&given, "run_shell", &args("command", "git add a.txt && git status"), "/w", false));
+            assert!(!granted(&given, "run_shell", &args("command", "git add a && rm -rf b"), "/w", false));
+            assert!(!granted(&given, "run_shell", &args("command", "git add $(ls)"), "/w", false));
+            assert!(granted(&given, "read_file", &args("path", "src/a/b.rs"), "/w", false));
+            assert!(!granted(&given, "read_file", &args("path", "/etc/passwd"), "/w", false));
+            assert!(granted(&given, "fetch_url", &args("url", "https://docs.example.com/x"), "/w", false));
+            assert!(!granted(&given, "fetch_url", &args("url", "https://evil.com/example.com"), "/w", false));
+            let whole = grants(&split_rules("Bash"));
+            assert!(granted(&whole, "run_shell", &args("command", "ls"), "/w", false));
+            assert!(!granted(&whole, "run_shell", &args("command", "rm -rf x"), "/w", true), "删除类的要写明模式");
+        }
     }
 }
 
