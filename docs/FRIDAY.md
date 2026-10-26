@@ -242,7 +242,7 @@ cp edith ~/.friday-server/bin/                            # 或者 edith 在 PAT
 | 钩子（特性 `hooks`）、内置钩子（特性 `builtinHooks`） | `hooks.state` / `saveGlobal` / `trust` / `example` / `setBuiltin` |
 | 插件（特性 `plugins`） | `plugins.list` / `inspectGithub` / `inspectData` / `update` / `install` / `discard` / `setEnabled` / `uninstall` |
 | 能力提供方、提供方包 | `capabilities.setEnabled` / `setKindAllowed` / `setTitle` / `setOption` / `deleteJob` / `refreshAvailability` / `retest` / `import` / `export` / `deletePackage` |
-| 在线服务商（特性 `services`、`serviceOps`、`serviceUsage`） | `services.install` / `installCustom` / `apply` / `setEnabled` / `uninstall` / `fetchModels` / `usage` |
+| 在线服务商（特性 `services`、`serviceOps`、`serviceUsage`） | `services.install` / `installCustom` / `apply` / `setEnabled` / `uninstall` / `fetchModels` / `usage`（百炼 Token Plan / Coding Plan 用 EDITH 密钥库里的控制台 token `DASHSCOPE_CONSOLE_TOKEN` 或阿里云 AccessKey 查，都没有 / 过期了回 `consoleLogin: missing / expired`，客户端在自己的浏览器里登录后经 `secrets.set` 存过来；同 Friday v2.85） |
 | 命令（特性 `commands`） | `commands.list`，输入框里的「/名字 参数」 |
 | 提示词文件（特性 `prompts`） | `prompts.get` / `recheck` / `rollback` / `restoreBundled` / `setAutoRollback` / `evaluate`、`prompts` 事件 |
 | 文件存放位置（特性 `storage`） | `storage.get` / `measure` / `move` / `cancel` / `setModels` / `adoptModels` / `restart`、`storage` 事件 |

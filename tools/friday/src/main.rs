@@ -15451,7 +15451,8 @@ mod services {
 mod usage {
     //! 在线服务的余额和套餐用量（设置 › 服务与密钥 每家服务下面那几行，同 Friday 的 ServiceUsage）：用密钥就能查的接口，按接口地址认——
     //! DeepSeek /user/balance、Kimi /v1/users/me/balance、Kimi Code 套餐 /coding/v1/usages、硅基流动 /v1/user/info、OpenRouter /api/v1/key、
-    //! 智谱 / Z.ai Coding 套餐 /api/monitor/usage/quota/limit、MiniMax Token Plan、自定义服务（one-api / new-api 中转）的 billing 接口。
+    //! 智谱 / Z.ai Coding 套餐 /api/monitor/usage/quota/limit、MiniMax Token Plan、自定义服务（one-api / new-api 中转）的 billing 接口；
+    //! 百炼 Token Plan / Coding Plan 走控制台（bailian：控制台登录 token 或阿里云 AccessKey，没有时回 consoleLogin，同 Friday v2.85）。
     //! 对话请求里顺手记的限流余量（observed）在大脑那边，这里给空的。
 
     use serde_json::{Value, json};
@@ -15466,6 +15467,7 @@ mod usage {
         OpenRouter,
         Zhipu,
         MiniMax,
+        Bailian,
         Relay,
     }
 
@@ -15501,6 +15503,7 @@ mod usage {
             "openrouter.ai" => Kind::OpenRouter,
             "open.bigmodel.cn" | "api.z.ai" if path.contains("/coding") => Kind::Zhipu,
             "api.minimaxi.com" | "api.minimax.io" | "api.minimax.chat" => Kind::MiniMax,
+            _ if bailian::target(base).is_some() => Kind::Bailian,
             _ if custom && !host.is_empty() && (scheme == "https" || scheme == "http") && !local_host(&host) => Kind::Relay,
             _ => Kind::None,
         }
@@ -15873,7 +15876,8 @@ mod usage {
         let origin = format!("https://{host}");
         let currency = if host.ends_with(".cn") { "CNY" } else { "USD" };
         let mut found = match kind {
-            Kind::None => None,
+            // 百炼要控制台的凭证，request 里另走 bailian
+            Kind::None | Kind::Bailian => None,
             Kind::DeepSeek => Some(deepseek(&get(&format!("{origin}/user/balance"), bearer(key))?)),
             Kind::Moonshot => {
                 let object = get(&format!("{origin}/v1/users/me/balance"), bearer(key))?;
@@ -15928,7 +15932,7 @@ mod usage {
         Ok(found)
     }
 
-    /// services.usage：{supported, report?, error?, observed}
+    /// services.usage：{supported, report?, error?, observed, consoleLogin?}
     pub fn request(params: &Value) -> Value {
         let base = params["baseURL"].as_str().unwrap_or("").to_string();
         let custom = params["custom"].as_bool().unwrap_or(false);
@@ -15937,12 +15941,456 @@ mod usage {
             .as_str()
             .and_then(|name| crate::read_json_file(&crate::edith_home().join("secrets.json"))[name].as_str().map(str::to_string));
         let (Some(secret), true, false) = (secret, result["supported"] == true, params["observedOnly"] == true) else { return result };
+        if let Some(target) = bailian::target(&base) {
+            // 百炼：这台密钥库里的控制台 token / 阿里云 AccessKey；都没有回 consoleLogin: missing，过期了回 expired
+            let store = crate::read_json_file(&crate::edith_home().join("secrets.json"));
+            let value = |name: &str| store[name].as_str().unwrap_or("").to_string();
+            let token_name = bailian::token_secret_name(params["secretName"].as_str().unwrap_or(""));
+            let credentials = bailian::Credentials {
+                token: value(&token_name),
+                access_key_id: value(bailian::ACCESS_KEY_ID),
+                access_key_secret: value(bailian::ACCESS_KEY_SECRET),
+            };
+            let save = |token: &str| {
+                let path = crate::edith_home().join("secrets.json");
+                let mut all = crate::read_json_file(&path);
+                if !all.is_object() {
+                    all = json!({});
+                }
+                all[&token_name] = json!(token);
+                let _ = crate::write_json_file(&path, &all);
+            };
+            match bailian::query(&target, &credentials, &save) {
+                Ok(report) => result["report"] = report,
+                Err(bailian::Fail::Login(login)) => result["consoleLogin"] = json!(login),
+                Err(bailian::Fail::Error(error)) => result["error"] = json!(error),
+            }
+            return result;
+        }
         match query(&base, &secret, custom) {
             Ok(Some(report)) => result["report"] = report,
             Ok(None) => result["supported"] = json!(false),
             Err(error) => result["error"] = json!(error),
         }
         result
+    }
+
+    /// 阿里云百炼 Token Plan / Coding Plan 的套餐额度（同 Friday v2.85 的 BailianConsole）：密钥查不了用量（控制台网关回 NotLogined），
+    /// 要百炼控制台的登录 token（Friday 客户端在自己的浏览器里登录，经 secrets.set 存进这台：DASHSCOPE_CONSOLE_TOKEN，两天过期），
+    /// 或者阿里云 AccessKey（ALIBABA_CLOUD_ACCESS_KEY_ID / _SECRET）用 OpenAPI GenerateCLIAccessToken（ACS3-HMAC-SHA256）换一个存回去；
+    /// Token Plan 有 AccessKey 时顺带查团队版席位 Credits（GetSubscriptionStats）。接口、字段、窗口标题同 Friday 逐字一致
+    pub(super) mod bailian {
+        use serde_json::{Value, json};
+        use sha2::{Digest, Sha256};
+
+        #[derive(Clone, Copy, PartialEq, Debug)]
+        pub enum Plan {
+            TokenPlan,
+            CodingPlan,
+        }
+
+        /// 查哪种套餐、在哪个地域（cn-beijing / ap-southeast-1）/ 站点（domestic / international）的控制台
+        #[derive(Clone, PartialEq, Debug)]
+        pub struct Target {
+            pub plan: Plan,
+            pub region: String,
+            pub site: String,
+        }
+
+        /// 接口地址是百炼的 Token Plan / Coding Plan 时：在哪查
+        pub fn target(base: &str) -> Option<Target> {
+            let (_, host, _) = super::parts(base);
+            let international = host.contains("-intl") || host.ends_with("alibabacloud.com");
+            let region = if international || host.contains("ap-southeast-1") { "ap-southeast-1" } else { "cn-beijing" };
+            let site = if international { "international" } else { "domestic" };
+            let plan = if host.starts_with("token-plan.") && (host.ends_with(".maas.aliyuncs.com") || host.ends_with(".qianwenaiapi.com")) {
+                Plan::TokenPlan
+            } else if host == "coding.dashscope.aliyuncs.com" || host == "coding-intl.dashscope.aliyuncs.com" {
+                Plan::CodingPlan
+            } else {
+                return None;
+            };
+            Some(Target { plan, region: region.into(), site: site.into() })
+        }
+
+        pub const ACCESS_KEY_ID: &str = "ALIBABA_CLOUD_ACCESS_KEY_ID";
+        pub const ACCESS_KEY_SECRET: &str = "ALIBABA_CLOUD_ACCESS_KEY_SECRET";
+
+        /// 控制台 token 的密钥名：DASHSCOPE_API_KEY → DASHSCOPE_CONSOLE_TOKEN、DASHSCOPE_API_KEY_2 → DASHSCOPE_CONSOLE_TOKEN_2，别的后面加 _CONSOLE_TOKEN
+        pub fn token_secret_name(secret: &str) -> String {
+            if secret.is_empty() {
+                "DASHSCOPE_CONSOLE_TOKEN".into()
+            } else if secret.contains("API_KEY") {
+                secret.replace("API_KEY", "CONSOLE_TOKEN")
+            } else {
+                format!("{secret}_CONSOLE_TOKEN")
+            }
+        }
+
+        #[derive(Default)]
+        pub struct Credentials {
+            pub token: String,
+            pub access_key_id: String,
+            pub access_key_secret: String,
+        }
+
+        impl Credentials {
+            pub fn has_access_key(&self) -> bool {
+                !self.access_key_id.is_empty() && !self.access_key_secret.is_empty()
+            }
+        }
+
+        /// 查不了的原因：没登录 / 登录过期（回 consoleLogin: missing / expired，客户端给「登录百炼控制台」），或者别的错
+        #[derive(Debug, PartialEq)]
+        pub enum Fail {
+            Login(&'static str),
+            Error(String),
+        }
+
+        impl From<String> for Fail {
+            fn from(error: String) -> Self {
+                Fail::Error(error)
+            }
+        }
+
+        /// 网关的地址和 action（== 官方 CLI 的 REGION_GATEWAYS）
+        pub fn gateway(target: &Target) -> (&'static str, &'static str) {
+            let international = target.site == "international";
+            match (target.region.as_str(), international) {
+                ("ap-southeast-1", true) => ("bailian-singapore-cs.alibabacloud.com", "IntlBroadScopeAspnGateway"),
+                ("ap-southeast-1", false) => ("modelstudio-cs.console.aliyun.com", "IntlBroadScopeAspnGateway"),
+                (_, true) => ("bailian-cs.console.alibabacloud.com", "BroadScopeAspnGateway"),
+                _ => ("bailian-cs.console.aliyun.com", "BroadScopeAspnGateway"),
+            }
+        }
+
+        /// RFC 3986：只留字母、数字和 -._~
+        pub fn encode(text: &str) -> String {
+            text.bytes()
+                .map(|byte| match byte {
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => (byte as char).to_string(),
+                    _ => format!("%{byte:02X}"),
+                })
+                .collect()
+        }
+
+        fn env_or(name: &str, fallback: String) -> String {
+            std::env::var(name).ok().filter(|value| !value.is_empty()).unwrap_or(fallback)
+        }
+
+        /// 调一个控制台接口，返回解开包装的 data
+        pub fn call(api: &str, data: Value, target: &Target, token: &str) -> Result<Value, Fail> {
+            let (host, action) = gateway(target);
+            let mut payload = if data.is_object() { data } else { json!({}) };
+            payload["cornerstoneParam"] = json!({ "protocol": "V2", "console": "ONE_CONSOLE", "productCode": "p_efm", "switchUserType": 3,
+                                                  "consoleSite": "BAILIAN_ALIYUN" });
+            let params = json!({ "Api": api, "V": "1.0", "Data": payload }).to_string();
+            // 测试：FRIDAY_BAILIAN_GATEWAY 换成本机的假网关（http://127.0.0.1:端口），同 Friday
+            let base = env_or("FRIDAY_BAILIAN_GATEWAY", format!("https://{host}"));
+            let url = format!("{base}/cli/api.json?action={action}&product=sfm_bailian&api={}", encode(api));
+            let body = format!("params={}&region={}", encode(&params), encode(&target.region));
+            let headers = vec![("Authorization".to_string(), format!("Bearer {token}")), ("Accept".to_string(), "*/*".to_string())];
+            let response = crate::capnet::send("POST", &url, &headers, Some(("application/x-www-form-urlencoded", body.into_bytes())), 20)
+                .map_err(|error| Fail::Error(error.message))?;
+            if !response.ok() {
+                return Err(Fail::Error(crate::capnet::Error::http(response.status, &response.text(300)).message));
+            }
+            let object = response.json();
+            if !object.is_object() {
+                return Err(Fail::Error("响应格式不符合预期：返回的不是 JSON".into()));
+            }
+            unwrap(&object)
+        }
+
+        /// {data: {success, errorCode, DataV2: {data: {success, data: {…}}}}}：外层 NotLogined = 没登录 / 过期，里层 success: false 是参数之类的错
+        pub fn unwrap(object: &Value) -> Result<Value, Fail> {
+            let outer = &object["data"];
+            if !outer.is_object() {
+                return Ok(object.clone());
+            }
+            if outer["success"] == false {
+                let code = outer["errorCode"].as_str().unwrap_or("");
+                if code.contains("NotLogined") {
+                    return Err(Fail::Login("expired"));
+                }
+                return Err(Fail::Error(if code.is_empty() {
+                    "百炼控制台没查到".into()
+                } else {
+                    format!("百炼控制台：{code}")
+                }));
+            }
+            let data_v2 = &outer["DataV2"];
+            if !data_v2.is_object() {
+                return Ok(if outer["data"].is_object() { outer["data"].clone() } else { outer.clone() });
+            }
+            let inner = &data_v2["data"];
+            if !inner.is_object() {
+                return Ok(data_v2.clone());
+            }
+            if inner["success"] == false || inner["failed"] == true {
+                let message = ["errorMsg", "msg", "errorCode"]
+                    .iter()
+                    .filter_map(|key| inner[*key].as_str())
+                    .find(|text| !text.is_empty())
+                    .unwrap_or("");
+                return Err(Fail::Error(if message.is_empty() {
+                    "百炼控制台没查到".into()
+                } else {
+                    format!("百炼控制台：{message}")
+                }));
+            }
+            Ok(if inner["data"].is_object() { inner["data"].clone() } else { inner.clone() })
+        }
+
+        /// Token Plan 个人版：per5Hour / per1Week / per1Month 的 Percentage（已用的比例 0–1）、ResetTime（毫秒）
+        pub fn parse_token_plan(data: &Value) -> Value {
+            let mut out = super::report();
+            out["subscription"] = json!(true);
+            let mut windows = Vec::new();
+            for (prefix, title) in [("per5Hour", "5 小时"), ("per1Week", "每周"), ("per1Month", "每月")] {
+                let Some(used) = super::number(&data[format!("{prefix}Percentage")]) else { continue };
+                let mut window = json!({ "title": title, "remainingPercent": (1.0 - used.clamp(0.0, 1.0)) * 100.0 });
+                if let Some(reset) = super::date(&data[format!("{prefix}ResetTime")]) {
+                    window["resetAt"] = json!(reset);
+                }
+                windows.push(window);
+            }
+            out["windows"] = json!(windows);
+            out
+        }
+
+        /// Coding Plan：第一个 VALID 实例（== 控制台）的 5 小时 / 每周 / 每月次数；没有生效中的实例写一句橙色的
+        pub fn parse_coding_plan(data: &Value) -> Value {
+            let mut out = super::report();
+            out["subscription"] = json!(true);
+            let instances = data["codingPlanInstanceInfos"].as_array().cloned().unwrap_or_default();
+            let Some(instance) = instances.iter().find(|instance| instance["status"] == "VALID") else {
+                out["warnings"] = json!(["没有生效中的套餐（百炼 Coding Plan）"]);
+                return out;
+            };
+            let quota = &instance["codingPlanQuotaInfo"];
+            let mut windows = Vec::new();
+            for (prefix, title) in [("per5Hour", "5 小时"), ("perWeek", "每周"), ("perBillMonth", "每月")] {
+                let used = super::number(&quota[format!("{prefix}UsedQuota")]);
+                let total = super::number(&quota[format!("{prefix}TotalQuota")]);
+                if used.is_none() && total.is_none() {
+                    continue;
+                }
+                let mut window = json!({ "title": title, "unit": "次" });
+                if let Some(used) = used {
+                    window["used"] = json!(used);
+                }
+                if let Some(total) = total {
+                    window["limit"] = json!(total);
+                }
+                if let (Some(used), Some(total)) = (used, total)
+                    && total > 0.0
+                {
+                    window["remaining"] = json!((total - used).max(0.0));
+                }
+                if let Some(reset) = super::date(&quota[format!("{prefix}QuotaNextRefreshTime")]) {
+                    window["resetAt"] = json!(reset);
+                }
+                windows.push(window);
+            }
+            out["windows"] = json!(windows);
+            if let Some(kind) = instance["instanceType"].as_str().filter(|kind| !kind.is_empty()) {
+                out["plan"] = json!(kind);
+            }
+            out
+        }
+
+        /// GetSubscriptionStats（Token Plan 团队版）：{Data: {Items: [{SeatType, SeatRefreshTime, SeatCredits, SeatRemainingCredits}]}}
+        pub fn parse_seats(object: &Value) -> Vec<Value> {
+            let mut windows = Vec::new();
+            for item in object["Data"]["Items"].as_array().into_iter().flatten() {
+                let Some(credits) = super::number(&item["SeatCredits"]).filter(|credits| *credits > 0.0) else { continue };
+                let kind = item["SeatType"].as_str().unwrap_or("");
+                let name = match kind {
+                    "standard" => "标准",
+                    "pro" => "高级",
+                    "max" => "尊享",
+                    other => other,
+                };
+                let mut window = json!({ "title": format!("{name}席位 Credits"), "limit": credits });
+                if let Some(remaining) = super::number(&item["SeatRemainingCredits"]) {
+                    window["remaining"] = json!(remaining);
+                }
+                if let Some(reset) = super::date(&item["SeatRefreshTime"]) {
+                    window["resetAt"] = json!(reset);
+                }
+                windows.push(window);
+            }
+            windows
+        }
+
+        /// 查这一家：没有 token 先用 AccessKey 换；token 过期了有 AccessKey 就换一个重查一次，没有就回 Login。
+        /// save_token：用 AccessKey 换到的新 token 存回密钥库
+        pub fn query(target: &Target, credentials: &Credentials, save_token: &dyn Fn(&str)) -> Result<Value, Fail> {
+            let mut token = credentials.token.clone();
+            let mut renewed = false;
+            let renew = |token: &mut String, renewed: &mut bool| -> Result<(), Fail> {
+                *token = generate_token(&target.region, &credentials.access_key_id, &credentials.access_key_secret)?;
+                *renewed = true;
+                save_token(token);
+                Ok(())
+            };
+            if token.is_empty() {
+                if !credentials.has_access_key() {
+                    return Err(Fail::Login("missing"));
+                }
+                renew(&mut token, &mut renewed)?;
+            }
+            let usage = |token: &str| match target.plan {
+                Plan::TokenPlan => call("zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/usage", json!({}), target, token),
+                Plan::CodingPlan => {
+                    let commodity = if target.site == "international" { "sfm_codingplan_public_intl" } else { "sfm_codingplan_public_cn" };
+                    call(
+                        "zeldaEasy.broadscope-bailian.codingPlan.queryCodingPlanInstanceInfoV2",
+                        json!({ "queryCodingPlanInstanceInfoRequest": { "commodityCode": commodity, "onlyLatestOne": true } }),
+                        target,
+                        token,
+                    )
+                }
+            };
+            let data = match usage(&token) {
+                Err(Fail::Login(_)) if credentials.has_access_key() && !renewed => {
+                    renew(&mut token, &mut renewed)?;
+                    usage(&token)?
+                }
+                other => other?,
+            };
+            let mut report = if target.plan == Plan::TokenPlan { parse_token_plan(&data) } else { parse_coding_plan(&data) };
+            // 团队版的席位 Credits：个人版、AccessKey 没这个权限的报错，不显示
+            if target.plan == Plan::TokenPlan
+                && credentials.has_access_key()
+                && let Ok(stats) = open_api(
+                    &format!("modelstudio.{}.aliyuncs.com", target.region),
+                    "/tokenplan/subscription/stats",
+                    "GetSubscriptionStats",
+                    "GET",
+                    &credentials.access_key_id,
+                    &credentials.access_key_secret,
+                )
+                && let Some(windows) = report["windows"].as_array_mut()
+            {
+                windows.extend(parse_seats(&stats));
+            }
+            report["fetchedAt"] = json!(chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string());
+            Ok(report)
+        }
+
+        /// AccessKey 换控制台 token（== 官方 CLI 的 bl auth login --open-api）
+        pub fn generate_token(region: &str, id: &str, secret: &str) -> Result<String, String> {
+            let object = open_api(
+                &format!("modelstudio.{region}.aliyuncs.com"),
+                "/modelstudio/cli/generateAccessToken",
+                "GenerateCLIAccessToken",
+                "POST",
+                id,
+                secret,
+            )?;
+            object["cliAccessToken"]
+                .as_str()
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| "响应格式不符合预期：阿里云没给控制台 token".to_string())
+        }
+
+        /// 调 ModelStudio 的 OpenAPI（版本 2026-02-10，没有参数、没有请求体）
+        pub fn open_api(host: &str, path: &str, action: &str, method: &str, id: &str, secret: &str) -> Result<Value, String> {
+            let base = env_or("FRIDAY_BAILIAN_OPENAPI", format!("https://{host}"));
+            let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+            let nonce = uuid::Uuid::new_v4().to_string();
+            let headers: Vec<(String, String)> = signed_headers(method, host, path, "", action, "2026-02-10", id, secret, &now, &nonce)
+                .into_iter()
+                .filter(|(name, _)| name != "host")
+                .collect();
+            let response = crate::capnet::send(method, &format!("{base}{path}"), &headers, None, 20).map_err(|error| error.message)?;
+            let object = response.json();
+            if !response.ok() || !object.is_object() || object["Success"] == false {
+                let code = object["Code"].as_str().unwrap_or("");
+                let message = object["Message"].as_str().unwrap_or("");
+                if code.is_empty() && message.is_empty() {
+                    return Err(crate::capnet::Error::http(response.status, &response.text(300)).message);
+                }
+                let parts: Vec<&str> = [code, message].into_iter().filter(|part| !part.is_empty()).collect();
+                return Err(format!("阿里云 OpenAPI：{}", parts.join(" ")));
+            }
+            Ok(object)
+        }
+
+        /// 签好的请求头（名字小写，按名字排好，含 authorization）
+        #[allow(clippy::too_many_arguments)]
+        pub fn signed_headers(
+            method: &str,
+            host: &str,
+            path: &str,
+            query: &str,
+            action: &str,
+            version: &str,
+            id: &str,
+            secret: &str,
+            date: &str,
+            nonce: &str,
+        ) -> Vec<(String, String)> {
+            let mut headers: Vec<(String, String)> = vec![
+                ("content-type".into(), "application/json".into()),
+                ("host".into(), host.into()),
+                ("x-acs-action".into(), action.into()),
+                ("x-acs-content-sha256".into(), hex(&Sha256::digest(b""))),
+                ("x-acs-date".into(), date.into()),
+                ("x-acs-signature-nonce".into(), nonce.into()),
+                ("x-acs-version".into(), version.into()),
+            ];
+            let (signed, signature) = signature(method, path, query, &headers, secret);
+            headers
+                .push(("authorization".into(), format!("ACS3-HMAC-SHA256 Credential={id},SignedHeaders={signed},Signature={signature}")));
+            headers
+        }
+
+        /// ACS3-HMAC-SHA256：规范请求（方法、路径、查询串、host / content-type / x-acs-* 按名字排好的头、签了哪些头、请求体的 SHA256）
+        /// 的 SHA256 拼在算法名后面，用 AccessKey Secret 做 HMAC-SHA256。返回（签了哪些头, 签名）
+        pub fn signature(method: &str, path: &str, query: &str, headers: &[(String, String)], secret: &str) -> (String, String) {
+            let mut signed: Vec<(String, String)> = headers
+                .iter()
+                .map(|(name, value)| (name.to_lowercase(), value.trim().to_string()))
+                .filter(|(name, _)| name == "host" || name == "content-type" || name.starts_with("x-acs-"))
+                .collect();
+            signed.sort();
+            signed.dedup_by(|a, b| a.0 == b.0);
+            let canonical_headers: String = signed.iter().map(|(name, value)| format!("{name}:{value}\n")).collect();
+            let names = signed.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>().join(";");
+            let payload = signed
+                .iter()
+                .find(|(name, _)| name == "x-acs-content-sha256")
+                .map(|(_, value)| value.clone())
+                .unwrap_or_else(|| hex(&Sha256::digest(b"")));
+            let canonical = [method, path, query, &canonical_headers, &names, &payload].join("\n");
+            let to_sign = format!("ACS3-HMAC-SHA256\n{}", hex(&Sha256::digest(canonical.as_bytes())));
+            (names, hex(&hmac_sha256(secret.as_bytes(), to_sign.as_bytes())))
+        }
+
+        fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
+            let mut block = [0u8; 64];
+            if key.len() > 64 {
+                block[..32].copy_from_slice(&Sha256::digest(key));
+            } else {
+                block[..key.len()].copy_from_slice(key);
+            }
+            let mut inner = Sha256::new();
+            inner.update(block.map(|byte| byte ^ 0x36));
+            inner.update(data);
+            let mut outer = Sha256::new();
+            outer.update(block.map(|byte| byte ^ 0x5c));
+            outer.update(inner.finalize());
+            outer.finalize().to_vec()
+        }
+
+        fn hex(bytes: &[u8]) -> String {
+            bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+        }
     }
 
     #[cfg(test)]
@@ -15969,6 +16417,214 @@ mod usage {
             assert!(can_query("https://relay.example.com/v1", true) && !can_query("http://localhost:3000/v1", true));
             assert_eq!(span_title(5.0 * 3600.0), "5 小时");
             assert_eq!(span_title(7.0 * 86400.0), "每周");
+        }
+
+        /// 百炼控制台查套餐额度（== Friday 的 TestEngines::bailianConsole / Swift SelfTests.bailianConsole）
+        #[test]
+        fn bailian_like_friday() {
+            use bailian::*;
+            let beijing = |plan| Target { plan, region: "cn-beijing".into(), site: "domestic".into() };
+            assert_eq!(target("https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1"), Some(beijing(Plan::TokenPlan)));
+            assert_eq!(
+                target("https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1").map(|found| found.plan),
+                Some(Plan::TokenPlan)
+            );
+            assert_eq!(target("https://coding.dashscope.aliyuncs.com/v1"), Some(beijing(Plan::CodingPlan)));
+            assert_eq!(
+                target("https://coding-intl.dashscope.aliyuncs.com/v1"),
+                Some(Target { plan: Plan::CodingPlan, region: "ap-southeast-1".into(), site: "international".into() })
+            );
+            assert_eq!(target("https://dashscope.aliyuncs.com/compatible-mode/v1"), None);
+            assert!(can_query("https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1", false));
+            assert!(!can_query("https://dashscope.aliyuncs.com/compatible-mode/v1", false));
+            assert_eq!(gateway(&beijing(Plan::TokenPlan)), ("bailian-cs.console.aliyun.com", "BroadScopeAspnGateway"));
+            assert_eq!(
+                gateway(&Target { plan: Plan::CodingPlan, region: "ap-southeast-1".into(), site: "international".into() }),
+                ("bailian-singapore-cs.alibabacloud.com", "IntlBroadScopeAspnGateway")
+            );
+            assert_eq!(token_secret_name("DASHSCOPE_API_KEY"), "DASHSCOPE_CONSOLE_TOKEN");
+            assert_eq!(token_secret_name("DASHSCOPE_API_KEY_2"), "DASHSCOPE_CONSOLE_TOKEN_2");
+            assert_eq!(token_secret_name("MY_PLAN"), "MY_PLAN_CONSOLE_TOKEN");
+
+            // 网关的返回（2026-10-26 实测）
+            let usage = json!({ "code": "200", "data": { "DataV2": { "ret": ["SUCCESS::接口调用成功"], "data": { "msg": "Success.", "code": "SUCCESS",
+                "data": { "per1MonthPercentage": 0.828558211288889, "per1MonthResetTime": 1793808000000u64 }, "success": true } },
+                "success": true, "httpStatus": 200, "errorCode": "" } });
+            let report = parse_token_plan(&unwrap(&usage).unwrap());
+            assert_eq!(report["subscription"], true);
+            assert_eq!(report["freeTier"], false);
+            assert_eq!(report["windows"].as_array().map(Vec::len), Some(1));
+            assert_eq!(report["windows"][0]["title"], "每月");
+            assert!((report["windows"][0]["remainingPercent"].as_f64().unwrap() - 17.1441788711111).abs() < 1e-6);
+            assert_eq!(report["windows"][0]["resetAt"], "2026-11-04T16:00:00Z");
+            let old =
+                parse_token_plan(&json!({ "per5HourPercentage": 1, "per5HourResetTime": 1793030000000u64, "per1WeekPercentage": 0.25 }));
+            assert_eq!(old["windows"][0]["title"], "5 小时");
+            assert_eq!(old["windows"][0]["remainingPercent"], 0.0);
+            assert_eq!(old["windows"][1]["title"], "每周");
+            assert_eq!(old["windows"][1]["remainingPercent"], 75.0);
+            let not_logined =
+                json!({ "code": "200", "data": { "success": false, "httpStatus": 200, "errorCode": "BailianGateway.Login.NotLogined" } });
+            assert_eq!(unwrap(&not_logined), Err(Fail::Login("expired")));
+            let wrong = json!({ "data": { "DataV2": { "data": { "success": false, "errorCode": "100005", "failed": true,
+                "errorMsg": "queryTokenPlanEquityInfoRequest must not be null" } }, "success": true } });
+            assert_eq!(unwrap(&wrong), Err(Fail::Error("百炼控制台：queryTokenPlanEquityInfoRequest must not be null".into())));
+
+            // Coding Plan：第一个 VALID 实例；没有的写一句
+            let coding = parse_coding_plan(&json!({ "codingPlanInstanceInfos": [{ "status": "EXPIRED", "instanceType": "old" },
+                { "status": "VALID", "instanceType": "pro", "codingPlanQuotaInfo": { "per5HourUsedQuota": 120, "per5HourTotalQuota": 6000,
+                  "per5HourQuotaNextRefreshTime": 1793040000000u64, "perWeekUsedQuota": 3000, "perWeekTotalQuota": 45000,
+                  "perBillMonthUsedQuota": 9000, "perBillMonthTotalQuota": 90000 } }] }));
+            assert_eq!(coding["plan"], "pro");
+            assert_eq!(coding["windows"].as_array().map(Vec::len), Some(3));
+            assert_eq!(coding["windows"][2]["title"], "每月");
+            assert_eq!(coding["windows"][0]["remaining"], 5880.0);
+            assert_eq!(coding["windows"][0]["unit"], "次");
+            assert_eq!(coding["windows"][0]["resetAt"], "2026-10-26T18:40:00Z");
+            let none = parse_coding_plan(&json!({ "codingPlanInstanceInfos": [], "userId": "1" }));
+            assert_eq!(none["windows"], json!([]));
+            assert_eq!(none["warnings"], json!(["没有生效中的套餐（百炼 Coding Plan）"]));
+
+            // GetSubscriptionStats（团队版席位）
+            let seats =
+                parse_seats(&json!({ "Success": true, "Data": { "Items": [{ "SeatType": "standard", "SeatRefreshTime": 1790920800000u64,
+                "TotalSeats": 2, "AssignedSeats": 1, "SeatCredits": 100, "SeatRemainingCredits": 40 }] } }));
+            assert_eq!(
+                seats,
+                vec![json!({ "title": "标准席位 Credits", "limit": 100.0, "remaining": 40.0, "resetAt": "2026-10-02T06:00:00Z" })]
+            );
+
+            // ACS3-HMAC-SHA256：阿里云文档的示例（help.aliyun.com/zh/sdk/product-overview/v3-request-structure-and-signature）
+            let example: Vec<(String, String)> = [
+                ("host", "ecs.cn-shanghai.aliyuncs.com"),
+                ("x-acs-action", "RunInstances"),
+                ("x-acs-version", "2014-05-26"),
+                ("x-acs-date", "2023-10-26T10:22:32Z"),
+                ("x-acs-signature-nonce", "3156853299f313e23d1673dc12e1703d"),
+                ("x-acs-content-sha256", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+            ]
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+            let (names, signed) = signature(
+                "POST",
+                "/",
+                "ImageId=win2019_1809_x64_dtc_zh-cn_40G_alibase_20230811.vhd&RegionId=cn-shanghai",
+                &example,
+                "YourAccessKeySecret",
+            );
+            assert_eq!(names, "host;x-acs-action;x-acs-content-sha256;x-acs-date;x-acs-signature-nonce;x-acs-version");
+            assert_eq!(signed, "06563a9e1b43f5dfe96b81484da74bceab24a1d853912eee15083a6f0f3283c0");
+            let headers = signed_headers(
+                "GET",
+                "modelstudio.cn-beijing.aliyuncs.com",
+                "/tokenplan/subscription/stats",
+                "",
+                "GetSubscriptionStats",
+                "2026-02-10",
+                "AK",
+                "SK",
+                "2026-10-26T15:42:40Z",
+                "n",
+            );
+            let authorization = headers.iter().find(|(name, _)| name == "authorization").map(|(_, value)| value.as_str()).unwrap_or("");
+            assert!(
+                authorization.starts_with("ACS3-HMAC-SHA256 Credential=AK,SignedHeaders=content-type;host;x-acs-action;"),
+                "{authorization}"
+            );
+            assert_eq!(encode("a/b c+é"), "a%2Fb%20c%2B%C3%A9");
+        }
+
+        /// 端到端：token 过期 → 用 AccessKey 换一个（存回去）→ 重查 → 顺带查团队席位；没有 AccessKey 过期回 expired、什么都没有回 missing 不发请求
+        /// （网关、OpenAPI 都指到本机的假服务）
+        #[test]
+        fn bailian_renews_with_access_key() {
+            use std::io::{Read, Write};
+            use std::sync::{Arc, Mutex};
+            let replies = [
+                json!({ "code": "200", "data": { "success": false, "errorCode": "BailianGateway.Login.NotLogined" } }),
+                json!({ "cliAccessToken": " new-token ", "Success": true }),
+                json!({ "data": { "DataV2": { "data": { "data": { "per1MonthPercentage": 0.5, "per1MonthResetTime": 1793808000000u64 }, "success": true } },
+                    "success": true } }),
+                json!({ "Success": true, "Data": { "Items": [{ "SeatType": "pro", "SeatRefreshTime": 1790920800000u64, "SeatCredits": 500,
+                    "SeatRemainingCredits": 120 }] } }),
+                json!({ "code": "200", "data": { "success": false, "errorCode": "BailianGateway.Login.NotLogined" } }),
+            ];
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+            let record = seen.clone();
+            std::thread::spawn(move || {
+                for reply in replies {
+                    let Ok((mut stream, _)) = listener.accept() else { return };
+                    let mut buffer = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        let read = stream.read(&mut chunk).unwrap_or(0);
+                        buffer.extend_from_slice(&chunk[..read]);
+                        let text = String::from_utf8_lossy(&buffer).to_string();
+                        if let Some(end) = text.find("\r\n\r\n") {
+                            let length = text[..end]
+                                .lines()
+                                .find_map(|line| {
+                                    line.to_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .map(|value| value.trim().parse::<usize>().unwrap_or(0))
+                                })
+                                .unwrap_or(0);
+                            if buffer.len() >= end + 4 + length || read == 0 {
+                                record.lock().unwrap().push(text);
+                                break;
+                            }
+                        }
+                        if read == 0 {
+                            break;
+                        }
+                    }
+                    let body = reply.to_string();
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                }
+            });
+            // 只有这个测试用这两个环境变量
+            unsafe {
+                std::env::set_var("FRIDAY_BAILIAN_GATEWAY", &base);
+                std::env::set_var("FRIDAY_BAILIAN_OPENAPI", &base);
+            }
+            let target = bailian::target("https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1").unwrap();
+            let saved = std::cell::RefCell::new(String::new());
+            let credentials =
+                bailian::Credentials { token: "old-token".into(), access_key_id: "AKID".into(), access_key_secret: "SECRET".into() };
+            let report = bailian::query(&target, &credentials, &|token: &str| *saved.borrow_mut() = token.to_string()).unwrap();
+            assert_eq!(*saved.borrow(), "new-token");
+            assert_eq!(report["windows"][0]["remainingPercent"], 50.0);
+            assert_eq!(report["windows"][1]["title"], "高级席位 Credits");
+            let requests = seen.lock().unwrap().clone();
+            assert_eq!(requests.len(), 4);
+            assert!(
+                requests[0].starts_with(
+                    "POST /cli/api.json?action=BroadScopeAspnGateway&product=sfm_bailian&api=zeldaHttp.apikeyMgr.%2Ftokenplan"
+                )
+            );
+            assert!(requests[0].to_lowercase().contains("authorization: bearer old-token"));
+            assert!(requests[0].contains("params=%7B%22Api%22%3A%22zeldaHttp.apikeyMgr.%2Ftokenplan%2Fpersonal%2Fapi%2Fv2%2Fusage%22"));
+            assert!(requests[0].ends_with("&region=cn-beijing"));
+            assert!(requests[1].starts_with("POST /modelstudio/cli/generateAccessToken"));
+            assert!(requests[1].to_lowercase().contains("x-acs-action: generatecliaccesstoken"));
+            assert!(requests[1].contains("ACS3-HMAC-SHA256 Credential=AKID,"));
+            assert!(requests[2].to_lowercase().contains("authorization: bearer new-token"));
+            assert!(requests[3].starts_with("GET /tokenplan/subscription/stats"));
+
+            let token_only = bailian::Credentials { token: "old-token".into(), ..Default::default() };
+            assert_eq!(bailian::query(&target, &token_only, &|_: &str| {}).err(), Some(bailian::Fail::Login("expired")));
+            assert_eq!(
+                bailian::query(&target, &bailian::Credentials::default(), &|_: &str| {}).err(),
+                Some(bailian::Fail::Login("missing"))
+            );
+            assert_eq!(seen.lock().unwrap().len(), 5);
         }
     }
 }

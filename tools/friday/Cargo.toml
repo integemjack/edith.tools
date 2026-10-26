@@ -2,7 +2,7 @@
 name = "edith-friday"
 description = "Friday 客户端的网关：讲 Friday 的远程协议，客户端经 SSH 连上来就用这台的 EDITH（按工作目录起大脑）；常驻的那份管 Friday 专有的终端、浏览器、本地能力和模型、定时任务、脚本工具、钩子、插件、能力提供方"
 # 每个工具各自的版本：发布标签是 edith-friday-v<前两位>.<这个工具发过几次>（.github/workflows/tool.yml）
-version = "0.10.0"
+version = "0.11.0"
 edition = "2024"
 publish = false
 license = "MIT OR Apache-2.0"
