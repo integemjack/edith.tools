@@ -193,6 +193,49 @@ fn has(list: &Value, id: &str) -> bool {
     list.as_array().unwrap().iter().any(|item| item == &json!(id.to_uppercase()))
 }
 
+/// EDITH v2.86 起存档里是原样的历史：一轮开头那条带 x_edith_turn，较早的部分怎么交给模型记在 folds 行里（摘要、骨架、整轮省略）。
+/// 网关照原样显示：不认识的行跳过，x_ 键不当正文，折叠只影响交给模型的那份
+#[test]
+fn folded_session_shows_original() {
+    let home = scratch("friday-folds");
+    let work = home.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let dir = sessions_dir(&home);
+    std::fs::create_dir_all(&dir).unwrap();
+    let long = "结果".repeat(1_500);
+    let lines = [
+        json!({ "type": "meta", "id": SESSION, "cwd": work.to_string_lossy(), "created": "2026-10-28T10:00:00+08:00" }),
+        json!({ "type": "message", "message": { "role": "user", "content": "第 1 轮：读 a", "x_edith_turn": 1 } }),
+        json!({ "type": "message", "message": { "role": "assistant", "content": "", "tool_calls": [tool_call("c1", "read_file", json!({ "path": "a" }))] } }),
+        json!({ "type": "message", "message": { "role": "tool", "tool_call_id": "c1", "content": long } }),
+        json!({ "type": "message", "message": { "role": "assistant", "content": "读完了 a" } }),
+        json!({ "type": "message", "message": { "role": "user", "content": "第 2 轮：读 b", "x_edith_turn": 2 } }),
+        json!({ "type": "message", "message": { "role": "assistant", "content": "读完了 b" } }),
+        json!({ "type": "folds", "marks": { "0": { "level": 3 }, "1": { "fold": true }, "2": { "fold": true }, "3": { "fold": true } } }),
+    ];
+    let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+    std::fs::write(dir.join(format!("{SESSION}.jsonl")), text).unwrap();
+    let brain = FakeBrain::new();
+    register(&home, &brain, &work);
+    let mut client = Client::start(&home, &work);
+    let hello = client.send("hello", json!({ "protocol": 1, "client": { "name": "test" } }));
+    let mut link = accept(&brain);
+    let list = link.wait_for(10, |message| message["method"] == "sessions.list").expect("连上来没问大脑在干什么");
+    reply(&mut link, &list, json!([{ "id": SESSION, "cwd": work.to_string_lossy(), "working": false }]));
+    let agents = link.wait_for(10, |message| message["method"] == "agents.list").expect("连上来没问子智能体");
+    reply(&mut link, &agents, json!([]));
+    client.reply(hello);
+    let opened = client.request("conversation.subscribe", json!({ "id": SESSION.to_uppercase() }));
+    let shown = opened["conversation"]["nodes"].as_array().unwrap().clone();
+    let roles: Vec<&str> = shown.iter().map(|node| node["role"].as_str().unwrap()).collect();
+    assert_eq!(roles, ["user", "assistant", "user", "assistant"], "省略了的那一轮照样显示");
+    assert_eq!(shown[0]["blocks"][0]["kind"]["text"]["_0"], "第 1 轮：读 a");
+    assert_eq!(tools(&shown[1])[0]["result"], json!(long), "工具结果是原样的，不是摘要");
+    assert_eq!(shown[2]["blocks"][0]["kind"]["text"]["_0"], "第 2 轮：读 b");
+    let all = opened.to_string();
+    assert!(!all.contains("已折叠") && !all.contains("较早的对话已省略") && !all.contains("x_edith_turn"), "{all}");
+}
+
 #[test]
 fn friday_client_through_gateway() {
     let home = scratch("friday");
