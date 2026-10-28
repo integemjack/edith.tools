@@ -1237,16 +1237,17 @@ fn agent_terminal_pushes_back() {
     };
     assert_eq!(retire["result"]["busy"], 1, "{retire}");
 
-    // 标记行送回来（interject，标来源 command）；之前之后的行不送
+    // 标记行送回来（interject，标来源 command）；之前之后的行不送。windows-arm64 上 PowerShell 起来要很久（读配置文件），多等一会儿
     let loaded = if cfg!(windows) { "loaded" } else { "模型加载完了" };
-    let marker = resident.wait_for(30, |message| message["method"] == "sense").expect("标记行没送回来");
+    let patience = if cfg!(windows) { 120 } else { 30 };
+    let marker = resident.wait_for(patience, |message| message["method"] == "sense").expect("标记行没送回来");
     let params = &marker["params"];
     assert_eq!((params["session"].as_str(), params["urgency"].as_str(), params["kind"].as_str()), (Some(SESSION), Some("interject"), Some("command")));
     let said = params["text"].as_str().unwrap_or("");
     let body = said.split_once('\n').map_or("", |(_, body)| body);
     assert!(said.contains("发来消息") && body.contains(loaded) && !body.contains("plain") && !said.contains("{ID}"), "{said}");
     // 跑完：退出码和最后的输出
-    let finished = resident.wait_for(30, |message| message["method"] == "sense").expect("跑完没送回来");
+    let finished = resident.wait_for(patience, |message| message["method"] == "sense").expect("跑完没送回来");
     let said = finished["params"]["text"].as_str().unwrap_or("");
     assert!(said.contains("跑完了") && said.contains("退出码 3") && said.contains("done-line"), "{said}");
     // read_terminal 读得到最后的输出
@@ -1255,7 +1256,7 @@ fn agent_terminal_pushes_back() {
     let read = resident.wait_for(30, |message| message["id"] == 3).expect("读终端没回");
     assert!(read["result"]["text"].as_str().is_some_and(|text| text.contains("done-line")), "{read}");
     // 后台命令跑完了：它自己退（换新版）
-    assert!(edith_tools_support::wait_until(20, || !home.join("friday").join("serve.json").exists()), "跑完了常驻的那份没退");
+    assert!(edith_tools_support::wait_until(patience, || !home.join("friday").join("serve.json").exists()), "跑完了常驻的那份没退");
     drop(client);
 }
 
