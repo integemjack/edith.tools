@@ -33445,13 +33445,14 @@ mod pty {
         let terminal = create(id, session, cwd, cols, rows, &program, &args, command, Some(watcher), None)?;
         if let Some(command) = command.filter(|command| !command.trim().is_empty()) {
             if cfg!(windows) {
-                // PowerShell 起得慢（windows-arm64 上好几秒），起好之前写进去的会被吞掉：等它出过提示符、安静 0.5 秒再写
+                // PowerShell 起得慢（windows-arm64 上好几秒），起好之前写进去的会被吞掉：等它出过提示符、安静 1.5 秒再写
+                // （0.5 秒在 windows-x86 的 32 位 PowerShell 上不够：提示符出来了输入行还没准备好，连着两次吞掉）
                 let terminal = terminal.clone();
                 let line = format!("{command}\r");
                 std::thread::spawn(move || {
                     let deadline = Instant::now() + Duration::from_secs(20);
                     while Instant::now() < deadline && terminal.running.load(Ordering::Relaxed) {
-                        let quiet = terminal.last_output.lock().unwrap().is_some_and(|at| at.elapsed() >= Duration::from_millis(500));
+                        let quiet = terminal.last_output.lock().unwrap().is_some_and(|at| at.elapsed() >= Duration::from_millis(1500));
                         if quiet {
                             break;
                         }
