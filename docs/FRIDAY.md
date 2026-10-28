@@ -51,6 +51,14 @@ Friday 客户端 ──SSH──▶ edith-friday --attach（一条连接一个�
   报 `resident`（不算有人连着，大脑闲够了照样退）。没有网关连着、没有在跑的终端、没在干活的大脑，闲半小时自己退，下次用到再起。
   `EDITH_FRIDAY_HUB=off` 不用它（终端、浏览器用不了）。
 - **终端**：常驻的那份开伪终端跑 shell（macOS / Linux 的 posix_openpt，Windows 的 ConPTY），客户端断了照常跑，接上来重放最近 512 KB 的输出。
+- **智能体的终端**（0.12，同 Friday v2.88）：常驻的那份在大脑里开 `run_in_terminal` / `read_terminal` / `close_terminal`（模型那边叫 `friday__*`，
+  批准同 run_shell：删除类自动模式也问）。shell 只跑这条命令（Unix `$SHELL -l -i -c`、Windows PowerShell `-EncodedCommand`），屏幕第一行写一行淡色的 `$ 命令`，
+  客户端的终端卡片、后台任务里看得见（`terminals` 里带 `command`）。命令还在跑时**主动给开它的会话发内容**：打出带 `::friday::` 的行（送标记后面的字）、
+  匹配 `notify_on` 的行、跑完（退出码、跑了多久、最后 40 行）、用户把还在跑的关了——经能力协议的 `sense`（`kind: "command"`、`urgency: "interject"`：
+  大脑在干这段会话就塞进下一步，闲着就马上开一轮）送回去；一秒内的几行合成一条（`EDITH_FRIDAY_TERM_BATCH_MS`），一个终端最多 30 次
+  （`EDITH_FRIDAY_TERM_MAX_PUSHES`）。大脑已经闲够了自己退了就先拉起来再送。跑完的留 90 秒（`EDITH_FRIDAY_TERM_RETAIN`）再收掉，最后的输出
+  `read_terminal` 还读得到。网关把这些消息（「（…能力「friday」（command）…）」下面是「[终端 …」）标成汇报（fromAgent，Friday 里不显示），卡片标题同 Friday。
+  **有后台命令在跑时不换新版**：新网关请常驻的那份退（`serve.retire`）时回 `{busy: N}`，新网关先接着用它；它等后台命令都跑完（再过 2 秒，让「跑完了」先送到）自己退。
 - **浏览器**：常驻的那份起这台装着的 Chrome / Chromium / Edge 的无头模式（`EDITH_BROWSER` 指定别的），标签按会话开，记在
   `~/.edith/friday/browser/tabs.json`，它重起后按网址重新打开；画面推给看着的客户端。
 - **智能体的浏览器工具**：是常驻那份的动作（`friday__browser_navigate` / `read` / `act` / `screenshot` / `resize` / `tabs` / `hand_over` / `run_js`，

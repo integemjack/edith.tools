@@ -590,6 +590,10 @@ fn tool_look(name: &str) -> Option<(&'static str, &'static str)> {
         "browser_hand_over" => ("请你在浏览器里操作", "hand.raised"),
         "browser_run_js" => ("在网页里运行脚本", "curlybraces"),
         "search_memory" => ("查记忆", "brain"),
+        // 常驻那份的智能体终端（同 Friday 的 run_in_terminal / read_terminal / close_terminal）
+        "run_in_terminal" => ("在终端里运行", "terminal"),
+        "read_terminal" => ("读取终端", "terminal"),
+        "close_terminal" => ("关闭终端", "terminal"),
         _ => return None,
     })
 }
@@ -817,6 +821,14 @@ fn stored_status(result: &str) -> &'static str {
 
 /// 子智能体交回的汇报（主智能体收到的一段话，存成用户消息）：是谁交的。Friday 里这样的消息标 fromAgent、不显示
 fn report_from(text: &str) -> Option<String> {
+    // 常驻那份送回来的命令消息（智能体开的终端打出 ::friday:: 标记行、跑完了；sense kind command）：大脑包了一行
+    // 「（下面这段由能力「friday」（command）传来）」或「（能力「friday」（command）在你工作时补充了…）」，下面是「[终端 …」
+    if let Some((head, body)) = text.split_once('\n')
+        && head.contains("（command）")
+        && body.starts_with("[终端 ")
+    {
+        return Some("后台命令".into());
+    }
     if let Some(rest) = text.strip_prefix("子 Agent「") {
         return rest.split_once('」').map(|(name, _)| name.to_string());
     }
@@ -4886,6 +4898,8 @@ static TURNS: LazyLock<Mutex<HashSet<(String, String)>>> = LazyLock::new(|| Mute
 static SERVE_EXIT: AtomicBool = AtomicBool::new(false);
 /// 新版本的网关请这份退出（serve.retire：升级过 edith-friday）
 static SERVE_RETIRE: AtomicBool = AtomicBool::new(false);
+/// 新版本的网关来过、当时还有智能体开的后台命令在跑：等它们都跑完再退（退了会把它们一起结束，智能体等着的消息也就没了）
+static SERVE_RETIRE_WHEN_FREE: AtomicBool = AtomicBool::new(false);
 
 /// 推一条通知给这几个网关（终端的输出给开了、接着它的）
 fn notify_clients(names: &[String], method: &str, params: Value) {
@@ -4939,6 +4953,8 @@ fn serve_actions() -> Vec<Value> {
     actions.extend(commands::actions());
     // 助手管会话的工具（只给助手那段会话）
     actions.extend(assistant::actions());
+    // 智能体的终端：run_in_terminal 开的命令跑完、打出 ::friday:: 标记行时主动发消息回来
+    actions.extend(agent_terminals::actions());
     actions
 }
 
@@ -4981,7 +4997,8 @@ fn own_action(tool: &str) -> Option<&str> {
         || action == "loop"
         || commands::is_action(action)
         || caps::is_action(action)
-        || assistant::is_action(action)))
+        || assistant::is_action(action)
+        || agent_terminals::is_action(action)))
     .then_some(action)
 }
 
@@ -5002,6 +5019,9 @@ fn serve_hook(params: &Value) -> Value {
     }
     if caps::is_action(action) {
         return json!({ "need": caps::need(action, &arguments) });
+    }
+    if agent_terminals::is_action(action) {
+        return json!({ "need": agent_terminals::need(action, &arguments) });
     }
     // 助手管会话的工具：派活、发话本来就是它的事
     if assistant::is_action(action) {
@@ -5024,6 +5044,10 @@ fn serve_act(params: &Value, brain: &Brain) -> Value {
     }
     if assistant::is_action(action) {
         let (ok, text) = assistant::act(action, &arguments);
+        return json!({ "text": text, "ok": ok });
+    }
+    if agent_terminals::is_action(action) {
+        let (ok, text) = agent_terminals::act(action, &arguments, session, &brain.workspace);
         return json!({ "text": text, "ok": ok });
     }
     if commands::is_action(action) {
@@ -5241,6 +5265,12 @@ fn serve_request(client: &str, method: &str, params: &Value) -> Reply {
         "ping" => Ok(json!({})),
         // 新版本的网关（升级过 edith-friday）：这份退出，它起新的
         "serve.retire" => {
+            let busy = pty::agent_running();
+            if busy > 0 {
+                // 后台命令跑完再退；回 busy，新网关先接着用这份
+                SERVE_RETIRE_WHEN_FREE.store(true, Ordering::Relaxed);
+                return Ok(json!({ "busy": busy }));
+            }
             SERVE_RETIRE.store(true, Ordering::Relaxed);
             Ok(json!({}))
         }
@@ -5485,6 +5515,7 @@ fn serve() -> Result<(), String> {
     let idle = Duration::from_secs(std::env::var("EDITH_FRIDAY_HUB_IDLE").ok().and_then(|text| text.parse().ok()).unwrap_or(1800));
     let mut idle_since = Instant::now();
     let mut commands_seen = (Instant::now(), commands::signature());
+    let mut retire_free_since: Option<Instant> = None;
     loop {
         std::thread::sleep(Duration::from_secs(1));
         if SERVE_EXIT.load(Ordering::Relaxed) {
@@ -5494,6 +5525,15 @@ fn serve() -> Result<(), String> {
         if SERVE_RETIRE.load(Ordering::Relaxed) {
             serve_log("serve", "新版本的网关来了，退出换新的");
             break;
+        }
+        // 跑完了再等 2 秒：「跑完了」那条消息先送回大脑
+        if SERVE_RETIRE_WHEN_FREE.load(Ordering::Relaxed) {
+            if pty::agent_running() > 0 {
+                retire_free_since = None;
+            } else if retire_free_since.get_or_insert_with(Instant::now).elapsed() >= Duration::from_secs(2) {
+                serve_log("serve", "新版本的网关来过，后台命令都跑完了，退出换新的");
+                break;
+            }
         }
         // 命令文件加了、改了、删了：大脑那边 use_command 的清单跟着换
         if commands_seen.0.elapsed() >= Duration::from_secs(5) {
@@ -5624,7 +5664,7 @@ fn retire_old_hub(entry: &Value) -> bool {
         return false;
     }
     log(&format!("常驻的那份是旧的（{theirs}{}，这个网关 {VERSION}）：请它退出，换新的", if replaced { "，程序换过" } else { "" }));
-    let asked = (|| -> Result<(), String> {
+    let asked = (|| -> Result<u64, String> {
         let address = entry["address"].as_str().unwrap_or("").parse().map_err(|_| "地址不对".to_string())?;
         let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(3)).map_err(|error| error.to_string())?;
         stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
@@ -5643,11 +5683,18 @@ fn retire_old_hub(entry: &Value) -> bool {
                 return if reply.get("error").is_some() {
                     Err(reply["error"]["message"].as_str().unwrap_or("").to_string())
                 } else {
-                    Ok(())
+                    Ok(reply["result"]["busy"].as_u64().unwrap_or(0))
                 };
             }
         }
     })();
+    // 它那里还有智能体开的后台命令在跑：先接着用它（跑完它自己退，下回再换新的）
+    if let Ok(busy) = asked
+        && busy > 0
+    {
+        log(&format!("常驻的那份还有 {busy} 个后台命令在跑：先接着用它，跑完它自己退"));
+        return false;
+    }
     if let Err(error) = asked
         && let Some(pid) = entry["pid"].as_u64()
     {
@@ -32550,6 +32597,687 @@ mod call_phone {
     }
 }
 
+mod agent_terminals {
+    //! 智能体的终端（照 Friday v2.88 的 TerminalTools + TerminalWatch，Friday 仓库的 qt/docs/TERMINAL.md §5）：run_in_terminal / read_terminal /
+    //! close_terminal，开在这台的内置终端里（pty：用户在 Friday 的终端卡片、后台任务里看得见、能停）。shell 只跑这条命令，跑完终端就退出。
+    //! 命令还在跑时**主动给开它的会话发内容**（能力协议的 sense，urgency interject：大脑在干这段会话就塞进下一步，闲着就马上开一轮），
+    //! 智能体不用 read_terminal 守着、不用 sleep 干等：
+    //! - 打出一行带 `::friday::` 的（脚本在关键节点自己说；经 ssh 在远端打的也一样传回来）：送标记后面的字；
+    //! - 打出的一行匹配 notify_on（开的时候给的正则，不分大小写）：送这一行；
+    //! - 跑完：退出码、跑了多久、最后 40 行；用户把还在跑的关了说一声（智能体自己 close_terminal 的不说）。
+    //!
+    //! 一秒内的几行合成一条，一个终端最多送 30 次行。跑完的留 90 秒（read_terminal 读最后的输出）再收掉，收掉后最后的输出还记着。
+    //! 子 Agent 开的也送给这段会话（大脑那边是主智能体收到）。
+
+    use std::collections::HashMap;
+    use std::path::Path;
+    use std::sync::{LazyLock, Mutex};
+    use std::time::{Duration, Instant};
+
+    use regex::Regex;
+    use serde_json::{Map, Value, json};
+
+    use crate::pty;
+
+    pub const MARKER: &str = "::friday::";
+    const ACTIONS: [&str; 3] = ["run_in_terminal", "read_terminal", "close_terminal"];
+
+    fn env_number(key: &str, default: u64) -> u64 {
+        std::env::var(key).ok().and_then(|text| text.parse().ok()).unwrap_or(default)
+    }
+    /// 一批：第一行打出来后再等这么久（测试里改小：EDITH_FRIDAY_TERM_BATCH_MS）
+    fn batch() -> Duration {
+        Duration::from_millis(env_number("EDITH_FRIDAY_TERM_BATCH_MS", 1000))
+    }
+    fn max_pushes() -> usize {
+        env_number("EDITH_FRIDAY_TERM_MAX_PUSHES", 30) as usize
+    }
+    /// 跑完留多久再收掉（EDITH_FRIDAY_TERM_RETAIN 秒）
+    fn retain() -> Duration {
+        Duration::from_secs(env_number("EDITH_FRIDAY_TERM_RETAIN", 90))
+    }
+
+    struct Watch {
+        session: String,
+        /// 开它的大脑（工作目录）：消息经它送回去
+        workspace: String,
+        title: String,
+        notify: bool,
+        pattern: Option<Regex>,
+        splitter: LineSplitter,
+        pending: Vec<String>,
+        flushing: bool,
+        pushes: usize,
+        capped: bool,
+        started: Instant,
+    }
+
+    /// 收掉了的智能体终端最后的输出（read_terminal 还读得到；最多 20 个）
+    struct Closed {
+        id: String,
+        session: String,
+        title: String,
+        exit_code: Option<i32>,
+        screen: String,
+    }
+
+    static WATCHES: LazyLock<Mutex<HashMap<String, Watch>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+    static CLOSED: LazyLock<Mutex<Vec<Closed>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+    pub fn is_action(name: &str) -> bool {
+        ACTIONS.contains(&name)
+    }
+
+    /// 动作的定义（说明同 Friday 的 prompts-tools.md tool.run_in_terminal / read_terminal / close_terminal）
+    pub fn actions() -> Vec<Value> {
+        vec![
+            json!({
+                "name": "run_in_terminal",
+                "description": "在这段对话的内置终端里新开一个标签运行命令，马上返回、不等它结束（返回开头几秒的输出）。开发服务器、监听编译、要一直跑或要用户看着的命令，还有要跑好几分钟、说不准多久的（构建、测试、远端脚本、训练）用它；一会儿就跑完、要拿到结果的命令用 run_shell。\n命令会主动给你发消息：它跑完时（带退出码和最后的输出），或者打出一行带「::friday::」标记的（标记后面的字就是消息），或者打出匹配 notify_on 的行时，内容自动送到你这里——你在忙就做完当前这一步看到，这一轮结束了就新开一轮交给你。所以开了之后不用 read_terminal 守着，也不要 sleep 干等：去做别的，没别的可做就结束这一轮。自己写的脚本在关键节点打一行，比如 `echo \"::friday:: 模型加载完了\"`、`echo \"::friday:: 第 3 步失败：$err\"`（经 ssh 在远端打的也一样传回来）。\n终端在用户界面上看得见，用户随时能停；想提前看一眼用 read_terminal。命令跑完终端就退出，过一会儿自动关掉；还在跑的用完了用 close_terminal 关掉。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": { "type": "string", "description": "要运行的命令（在默认的交互式 shell 里，工作目录是这段对话的）" },
+                        "notify": { "type": "boolean", "description": "跑完、打出 ::friday:: 标记行时要不要把内容送给你，默认 true；开发服务器这类一直跑、不用管的可以设 false" },
+                        "notify_on": { "type": "string", "description": "另外要送给你的行：一段字或正则（不分大小写），命令打出匹配的行就送过来，比如 \"error|failed|Traceback\"、\"listening on\"；一秒内的几行合成一条，最多送 30 次" }
+                    },
+                    "required": ["command"]
+                },
+                "timeoutSeconds": 60,
+            }),
+            json!({
+                "name": "read_terminal",
+                "description": "读这段对话的内置终端（用户在界面上开的，或 run_in_terminal 开的）最近的输出。用户说「看下终端」「终端里的报错」时用它，不要让用户复制粘贴。不指定 terminal 时读最近有输出的那个；有几个终端时结果开头会列出来。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "terminal": { "type": "string", "description": "读哪个终端：编号（结果里给的 8 位）或命令里的字；不填读最近有输出的" },
+                        "lines": { "type": "integer", "description": "读最近几行，默认 200，最多 2000" },
+                        "wait_for": { "type": "string", "description": "等到输出里出现这段字再读（可以是正则，不分大小写，如 Build succeeded|error）；命令结束了也不再等" },
+                        "wait_seconds": { "type": "integer", "description": "最多等几秒（给了 wait_for 默认 300，最多 600）" }
+                    },
+                    "required": []
+                },
+                "readOnly": true,
+                "timeoutSeconds": 620,
+            }),
+            json!({
+                "name": "close_terminal",
+                "description": "关掉 run_in_terminal 开的一个终端（命令还在跑就停掉）。验证完的开发服务器、不再需要的监听编译这类用它收掉；用户要接着用的留着。用户自己开的终端关不了。",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "terminal": { "type": "string", "description": "关哪个终端：编号（结果里给的 8 位）或命令里的字" } },
+                    "required": ["terminal"]
+                },
+                "readOnly": true,
+                "timeoutSeconds": 30,
+            }),
+        ]
+    }
+
+    fn text_arg<'a>(arguments: &'a Map<String, Value>, key: &str) -> &'a str {
+        arguments.get(key).and_then(Value::as_str).unwrap_or("")
+    }
+
+    fn number_arg(arguments: &Map<String, Value>, key: &str) -> Option<i64> {
+        let value = arguments.get(key)?;
+        value.as_i64().or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
+    }
+
+    /// 要不要批准：同 run_shell（自动模式只问删除类、改系统的；读终端、关自己开的不问）
+    pub fn need(action: &str, arguments: &Map<String, Value>) -> Value {
+        if action != "run_in_terminal" {
+            return json!(false);
+        }
+        let command = text_arg(arguments, "command").trim();
+        let first = command.split_whitespace().next().unwrap_or("");
+        let stop = friday_core::approval::is_destructive("run_shell", Some(command), cfg!(windows));
+        json!({ "target": command, "summary": format!("在终端里运行：{command}"), "rule": format!("friday__run_in_terminal({first})"), "stop": stop })
+    }
+
+    /// 给模型看的终端编号：id 的前 8 位（小写）
+    fn short(id: &str) -> String {
+        id.chars().take(8).collect::<String>().to_lowercase()
+    }
+
+    fn title_of(command: &str) -> String {
+        let title = command.split_whitespace().collect::<Vec<_>>().join(" ");
+        if title.chars().count() > 80 { title.chars().take(80).collect::<String>() + "…" } else { title }
+    }
+
+    /// 只留最后 max 个字符
+    fn tail(text: &str, max: usize) -> String {
+        let count = text.chars().count();
+        if count <= max {
+            return text.to_string();
+        }
+        format!("…（前面省略了 {} 个字符）\n{}", count - max, text.chars().skip(count - max).collect::<String>())
+    }
+
+    /// 最后 lines 行的纯文字
+    fn last_lines(output: &[u8], lines: usize) -> String {
+        let text = plain(output);
+        let all: Vec<&str> = text.lines().collect();
+        all[all.len().saturating_sub(lines.max(1))..].join("\n")
+    }
+
+    /// 「12 秒」「3 分 5 秒」「1 小时 20 分」
+    pub fn duration(elapsed: Duration) -> String {
+        let seconds = elapsed.as_secs();
+        if seconds < 60 {
+            format!("{seconds} 秒")
+        } else if seconds < 3600 {
+            format!("{} 分 {} 秒", seconds / 60, seconds % 60)
+        } else {
+            format!("{} 小时 {} 分", seconds / 3600, seconds % 3600 / 60)
+        }
+    }
+
+    fn describe(snapshot: &pty::Snapshot) -> String {
+        let state = if snapshot.running {
+            "运行中".to_string()
+        } else {
+            format!("已退出，代码 {}", snapshot.exit_code.map_or("?".into(), |code| code.to_string()))
+        };
+        let title = snapshot.command.as_deref().map(title_of).unwrap_or_else(|| "终端".into());
+        format!("{}「{title}」（{state}）", short(&snapshot.id))
+    }
+
+    fn matches(snapshot: &pty::Snapshot, wanted: &str) -> bool {
+        let wanted = wanted.trim().to_lowercase();
+        wanted.is_empty()
+            || snapshot.id.to_lowercase().starts_with(&wanted)
+            || snapshot.command.as_deref().is_some_and(|command| command.to_lowercase().contains(&wanted))
+    }
+
+    /// 做动作：(ok, 交回模型的话)
+    pub fn act(action: &str, arguments: &Map<String, Value>, session: &str, workspace: &str) -> (bool, String) {
+        match action {
+            "run_in_terminal" => run(arguments, session, workspace),
+            "read_terminal" => read(arguments, session),
+            "close_terminal" => close(arguments, session),
+            other => (false, format!("Friday 没有动作 {other}")),
+        }
+    }
+
+    fn run(arguments: &Map<String, Value>, session: &str, workspace: &str) -> (bool, String) {
+        let command = text_arg(arguments, "command").trim().to_string();
+        if command.is_empty() {
+            return (false, "command 不能是空的".into());
+        }
+        let cwd = crate::find_session(session)
+            .map(|stored| stored.cwd)
+            .filter(|cwd| !cwd.is_empty())
+            .unwrap_or_else(|| if workspace.is_empty() { crate::default_directory() } else { workspace.to_string() });
+        let id = uuid::Uuid::new_v4().to_string().to_uppercase();
+        if let Err(error) = pty::open_agent(&id, session, Path::new(&cwd), &command) {
+            return (false, error);
+        }
+        // 等几秒拿开头的输出（端口占用、找不到命令这类错误一开始就会打出来）；命令本身不等它结束
+        std::thread::sleep(Duration::from_secs(3));
+        let notify = arguments.get("notify").map(|value| value.as_bool().unwrap_or_else(|| value.as_str() != Some("false"))).unwrap_or(true);
+        let notify_on = text_arg(arguments, "notify_on").trim().to_string();
+        // 拿屏幕和接上看在同一把锁里（中间打出的行不漏也不重复）
+        let (screen, running, exit_code, watched) = {
+            let mut watches = WATCHES.lock().unwrap();
+            let Some(snapshot) = pty::snapshot(&id) else { return (false, "终端开了又没了".into()) };
+            let watched = snapshot.running && (notify || !notify_on.is_empty());
+            if watched {
+                let pattern = (!notify_on.is_empty())
+                    .then(|| Regex::new(&format!("(?i){notify_on}")).or_else(|_| Regex::new(&format!("(?i){}", regex::escape(&notify_on)))).ok())
+                    .flatten();
+                let mut splitter = LineSplitter::default();
+                // 之前打出的（交给模型了）不再看：切过一遍，丢掉
+                let _ = splitter.feed(&snapshot.output);
+                watches.insert(
+                    id.clone(),
+                    Watch {
+                        session: session.to_string(),
+                        workspace: workspace.to_string(),
+                        title: title_of(&command),
+                        notify,
+                        pattern,
+                        splitter,
+                        pending: Vec::new(),
+                        flushing: false,
+                        pushes: 0,
+                        capped: false,
+                        started: snapshot.started,
+                    },
+                );
+            }
+            (last_lines(&snapshot.output, 40), snapshot.running, snapshot.exit_code, watched)
+        };
+        if !running {
+            schedule_close(&id);
+        }
+        let mut text = format!("已在这段对话的终端 {} 里运行（新开的标签，用户在终端卡片里看得见、随时能停）：{command}\n工作目录：{cwd}\n", short(&id));
+        text += "开头几秒的输出：\n";
+        text += &if screen.trim().is_empty() { "（还没有输出）".to_string() } else { tail(&screen, 6000) };
+        if !running {
+            text += &format!(
+                "\n\n命令已经跑完（退出码 {}），终端过一会儿自动关掉（关掉后 read_terminal 照样读得到最后的输出）。",
+                exit_code.map_or("?".into(), |code| code.to_string())
+            );
+        } else if watched {
+            let mut when: Vec<String> = Vec::new();
+            if notify {
+                when.push("跑完".into());
+                when.push(format!("打出带 {MARKER} 标记的行"));
+            }
+            if !notify_on.is_empty() {
+                when.push(format!("打出匹配「{notify_on}」的行"));
+            }
+            text += &format!(
+                "\n\n命令在后台跑。它{}时会自动把内容送到你这里（你在忙就做完当前这一步看到；你这一轮结束了就新开一轮交给你），所以不用 read_terminal 守着，也不要 sleep 干等：现在去做别的；没别的可做就告诉用户在等什么、然后结束这一轮。想提前看一眼用 read_terminal（terminal 填 {}）。",
+                when.join("、"),
+                short(&id)
+            );
+            text += "命令跑完终端就退出，过一会儿自动关掉（关掉后 read_terminal 照样读得到最后的输出）；还在跑的（开发服务器这类）用完了用 close_terminal 关掉，用户要接着用的留着。";
+        } else {
+            text += &format!(
+                "\n\n命令在后台一直跑，不用等它结束；之后用 read_terminal（terminal 填 {}）看输出，要等它跑完或打出某句话就带上 wait_for / wait_seconds，不要 sleep 干等。",
+                short(&id)
+            );
+            text += "还在跑的（开发服务器这类）用完了用 close_terminal 关掉，用户要接着用的留着。";
+        }
+        (true, text)
+    }
+
+    fn read(arguments: &Map<String, Value>, session: &str) -> (bool, String) {
+        let wanted = text_arg(arguments, "terminal").trim().to_string();
+        let lines = number_arg(arguments, "lines").unwrap_or(200).clamp(1, 2000) as usize;
+        let wait_for = text_arg(arguments, "wait_for").trim().to_string();
+        let wait_seconds = number_arg(arguments, "wait_seconds").unwrap_or(0);
+        let pick = || -> Option<pty::Snapshot> {
+            pty::of_session(session).into_iter().filter(|snapshot| matches(snapshot, &wanted)).max_by_key(|snapshot| snapshot.last_output.unwrap_or(snapshot.started))
+        };
+        let mut waited = String::new();
+        if !wait_for.is_empty() || wait_seconds > 0 {
+            let limit = Duration::from_secs((if wait_seconds > 0 { wait_seconds } else { 300 }).clamp(1, 600) as u64);
+            let pattern = Regex::new(&format!("(?i){wait_for}")).or_else(|_| Regex::new(&format!("(?i){}", regex::escape(&wait_for)))).ok();
+            let started = Instant::now();
+            while let Some(snapshot) = pick() {
+                let elapsed = started.elapsed().as_secs();
+                if !wait_for.is_empty() && pattern.as_ref().is_some_and(|pattern| pattern.is_match(&last_lines(&snapshot.output, lines))) {
+                    waited = format!("（等到了「{wait_for}」，等了 {elapsed} 秒）\n");
+                    break;
+                }
+                if !snapshot.running {
+                    waited = format!("（命令已经结束，等了 {elapsed} 秒）\n");
+                    break;
+                }
+                if started.elapsed() >= limit {
+                    waited = if wait_for.is_empty() {
+                        format!("（等了 {} 秒，命令还在跑）\n", limit.as_secs())
+                    } else {
+                        format!("（等了 {} 秒还没出现「{wait_for}」，命令还在跑）\n", limit.as_secs())
+                    };
+                    break;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+        let all = pty::of_session(session);
+        let Some(chosen) = pick() else {
+            // 跑完自己收掉了的：给关掉前的输出（不然模型以为没跑过、又跑一遍）
+            let closed = CLOSED.lock().unwrap();
+            if let Some(closed) = closed.iter().rev().find(|closed| {
+                closed.session == session
+                    && (wanted.is_empty() || closed.id.to_lowercase().starts_with(&wanted.to_lowercase()) || closed.title.contains(&wanted))
+            }) {
+                let screen: Vec<&str> = closed.screen.lines().collect();
+                let screen = screen[screen.len().saturating_sub(lines)..].join("\n");
+                return (
+                    true,
+                    format!(
+                        "{waited}终端 {}「{}」（已退出，代码 {}；命令跑完后已自动关掉，下面是关掉前最后的输出）：\n{}",
+                        short(&closed.id),
+                        closed.title,
+                        closed.exit_code.map_or("?".into(), |code| code.to_string()),
+                        if screen.trim().is_empty() { "（没有输出）".to_string() } else { tail(&screen, 16000) }
+                    ),
+                );
+            }
+            if all.is_empty() {
+                return (true, "这段对话还没有终端：用户可以在 Friday 里点工具栏的终端按钮打开一个；要运行一直跑的命令用 run_in_terminal。".into());
+            }
+            let known: Vec<String> = all.iter().map(describe).collect();
+            return (false, format!("没有叫「{wanted}」的终端。这段对话的终端：{}", known.join("；")));
+        };
+        let mut text = String::new();
+        if all.len() > 1 {
+            text += &format!("这段对话有 {} 个终端：\n", all.len());
+            for snapshot in &all {
+                text += &format!("- {}\n", describe(snapshot));
+            }
+            text += "\n";
+        }
+        let screen = last_lines(&chosen.output, lines);
+        text += &waited;
+        text += &format!("终端 {} 最近的输出：\n", describe(&chosen));
+        text += &if screen.trim().is_empty() { "（还没有输出）".to_string() } else { tail(&screen, 16000) };
+        (true, text)
+    }
+
+    fn close(arguments: &Map<String, Value>, session: &str) -> (bool, String) {
+        let wanted = text_arg(arguments, "terminal").trim().to_string();
+        if wanted.is_empty() {
+            return (false, "要给 terminal：关哪个终端（编号或命令里的字）".into());
+        }
+        let all = pty::of_session(session);
+        let Some(chosen) = all.iter().find(|snapshot| matches(snapshot, &wanted)) else {
+            if all.is_empty() {
+                return (false, "这段对话没有终端".into());
+            }
+            let known: Vec<String> = all.iter().map(describe).collect();
+            return (false, format!("没有叫「{wanted}」的终端。这段对话的终端：{}", known.join("；")));
+        };
+        if chosen.command.is_none() {
+            return (false, format!("终端 {} 是用户自己开的，要用户自己关", describe(chosen)));
+        }
+        let summary = describe(chosen);
+        // 自己关的不再送「终端被关掉了」
+        WATCHES.lock().unwrap().remove(&chosen.id);
+        remember(chosen);
+        let _ = pty::close(&chosen.id);
+        (true, format!("已关掉终端 {summary}{}", if chosen.running { "，里面的命令停了。" } else { "。" }))
+    }
+
+    /// 收掉前记下最后的输出
+    fn remember(snapshot: &pty::Snapshot) {
+        let mut closed = CLOSED.lock().unwrap();
+        closed.retain(|item| item.id != snapshot.id);
+        closed.push(Closed {
+            id: snapshot.id.clone(),
+            session: snapshot.session.clone(),
+            title: snapshot.command.as_deref().map(title_of).unwrap_or_default(),
+            exit_code: snapshot.exit_code,
+            screen: last_lines(&snapshot.output, 2000),
+        });
+        let extra = closed.len().saturating_sub(20);
+        closed.drain(..extra);
+    }
+
+    /// 跑完的智能体终端留一会儿（read_terminal 读最后的输出）再收掉
+    fn schedule_close(id: &str) {
+        let id = id.to_string();
+        std::thread::spawn(move || {
+            std::thread::sleep(retain());
+            if let Some(snapshot) = pty::snapshot(&id)
+                && !snapshot.running
+            {
+                remember(&snapshot);
+                let _ = pty::close(&id);
+            }
+        });
+    }
+
+    /// 送回开它的会话（大脑闲着就开一轮，在干就塞进下一步）。命令跑得比大脑的 linger 还久、大脑已经自己退了：拉起来再送
+    fn sense(workspace: &str, session: &str, text: String) {
+        let connected = crate::SERVED.lock().unwrap().get(workspace).cloned();
+        let brain = connected.or_else(|| {
+            let entry = match crate::registry().into_iter().find(|entry| entry["workspace"].as_str() == Some(workspace)) {
+                Some(entry) => entry,
+                None => crate::launch_brain(Path::new(workspace)).ok()?,
+            };
+            crate::serve_attach(&entry, Duration::from_secs(30)).ok()?;
+            crate::SERVED.lock().unwrap().get(workspace).cloned()
+        });
+        match brain {
+            Some(brain) => {
+                brain.write(&json!({ "jsonrpc": "2.0", "method": "sense", "params": {
+                    "text": text, "kind": "command", "session": session, "urgency": "interject",
+                } }));
+            }
+            None => crate::serve_log("terminal", &format!("命令发来的消息送不回去：{workspace} 的大脑不在了")),
+        }
+    }
+
+    /// 终端的输出（pty 调）：智能体开的、看着的，切行、挑出要送的
+    pub fn output(id: &str, data: &[u8]) {
+        let mut watches = WATCHES.lock().unwrap();
+        let Some(watch) = watches.get_mut(id) else { return };
+        take(id, watch, data);
+    }
+
+    fn take(id: &str, watch: &mut Watch, data: &[u8]) {
+        let lines = watch.splitter.feed(data);
+        consider(id, watch, lines);
+    }
+
+    /// 打完的几行：挑出要送的攒着，一批之后送
+    fn consider(id: &str, watch: &mut Watch, lines: Vec<String>) {
+        for line in lines {
+            if watch.capped {
+                break;
+            }
+            let mut message = if watch.notify { marker_message(&line) } else { None };
+            if message.is_none() && watch.pattern.as_ref().is_some_and(|pattern| pattern.is_match(&line)) {
+                message = Some(line.trim().to_string());
+            }
+            let Some(message) = message else { continue };
+            watch.pending.push(message);
+            if !watch.flushing {
+                watch.flushing = true;
+                let id = id.to_string();
+                std::thread::spawn(move || {
+                    std::thread::sleep(batch());
+                    let mut watches = WATCHES.lock().unwrap();
+                    if let Some(watch) = watches.get_mut(&id) {
+                        let sent = flush_with_id(watch, &id);
+                        drop(watches);
+                        if let Some((workspace, session, text)) = sent {
+                            sense(&workspace, &session, text);
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    /// 攒着的行合成一条：(大脑, 会话, 文字)
+    fn flush(watch: &mut Watch) -> Option<(String, String, String)> {
+        watch.flushing = false;
+        if watch.pending.is_empty() {
+            return None;
+        }
+        let mut text = watch.pending.join("\n");
+        watch.pending.clear();
+        watch.pushes += 1;
+        if watch.pushes >= max_pushes() {
+            watch.capped = true;
+            text += &format!("\n（这个命令已经发来 {} 次消息，之后打出的不再一条条送，跑完时再告诉你）", watch.pushes);
+        }
+        Some((
+            watch.workspace.clone(),
+            watch.session.clone(),
+            format!("[终端 {}「{}」里的命令发来消息，它还在跑]\n{text}", "{ID}", watch.title),
+        ))
+    }
+
+    /// 命令结束了（pty 调）：送攒着的行和「跑完了」，留一会儿再收掉
+    pub fn exited(id: &str) {
+        let snapshot = pty::snapshot(id);
+        if snapshot.as_ref().is_some_and(|snapshot| snapshot.command.is_some()) {
+            schedule_close(id);
+        }
+        let Some(mut watch) = WATCHES.lock().unwrap().remove(id) else { return };
+        // 最后没换行的那行也看
+        let rest = watch.splitter.finish();
+        consider(id, &mut watch, rest);
+        let mut sends = Vec::new();
+        if let Some(sent) = flush_with_id(&mut watch, id) {
+            sends.push(sent);
+        }
+        if watch.notify {
+            let screen = snapshot.as_ref().map(|snapshot| last_lines(&snapshot.output, 40)).unwrap_or_default();
+            let code = snapshot.as_ref().and_then(|snapshot| snapshot.exit_code);
+            let mut text = format!(
+                "[终端 {}「{}」里的命令跑完了]\n退出码 {}，跑了 {}。最后的输出：\n",
+                short(id),
+                watch.title,
+                code.map_or("?".into(), |code| code.to_string()),
+                duration(watch.started.elapsed())
+            );
+            text += &if screen.trim().is_empty() { "（没有输出）".to_string() } else { tail(&screen, 6000) };
+            sends.push((watch.workspace.clone(), watch.session.clone(), text));
+        }
+        for (workspace, session, text) in sends {
+            sense(&workspace, &session, text);
+        }
+    }
+
+    fn flush_with_id(watch: &mut Watch, id: &str) -> Option<(String, String, String)> {
+        flush(watch).map(|(workspace, session, text)| (workspace, session, text.replacen("{ID}", &short(id), 1)))
+    }
+
+    /// 终端要被关掉（pty::close 调）：智能体开的、还在跑、还看着的，是用户关的——告诉开它的会话
+    pub fn closed(id: &str) {
+        let Some(mut watch) = WATCHES.lock().unwrap().remove(id) else { return };
+        if let Some(snapshot) = pty::snapshot(id) {
+            remember(&snapshot);
+        }
+        let mut sends = Vec::new();
+        if let Some(sent) = flush_with_id(&mut watch, id) {
+            sends.push(sent);
+        }
+        if watch.notify {
+            sends.push((
+                watch.workspace.clone(),
+                watch.session.clone(),
+                format!(
+                    "[终端 {}「{}」里的命令跑完了]\n终端被关掉了，命令没跑完就停了（跑了 {}）。",
+                    short(id),
+                    watch.title,
+                    duration(watch.started.elapsed())
+                ),
+            ));
+        }
+        for (workspace, session, text) in sends {
+            sense(&workspace, &session, text);
+        }
+    }
+
+    /// 一行里的标记消息：带 ::friday:: 的为标记后面的字（没写字的为整行），不带的为 None
+    pub fn marker_message(line: &str) -> Option<String> {
+        let at = line.find(MARKER)?;
+        let message = line[at + MARKER.len()..].trim();
+        Some(if message.is_empty() { line.trim().to_string() } else { message.to_string() })
+    }
+
+    /// 原始输出的纯文字（去掉控制序列，回车重来的只留最后的样子）
+    pub fn plain(bytes: &[u8]) -> String {
+        let mut splitter = LineSplitter::default();
+        let mut lines = splitter.feed(bytes);
+        lines.extend(splitter.finish());
+        lines.join("\n")
+    }
+
+    /// 把伪终端的原始字节切成行：去掉控制序列（CSI、OSC 等），单独的回车把这一行重来（进度条只留最后的样子），去掉行尾空白
+    #[derive(Default)]
+    pub struct LineSplitter {
+        state: u8,
+        line: Vec<u8>,
+        carriage_return: bool,
+    }
+
+    impl LineSplitter {
+        const TEXT: u8 = 0;
+        const ESCAPE: u8 = 1;
+        const CSI: u8 = 2;
+        const OSC: u8 = 3;
+        const OSC_ESCAPE: u8 = 4;
+
+        pub fn feed(&mut self, bytes: &[u8]) -> Vec<String> {
+            let mut lines = Vec::new();
+            for &byte in bytes {
+                match self.state {
+                    Self::ESCAPE => {
+                        self.state = match byte {
+                            b'[' => Self::CSI,
+                            b']' => Self::OSC,
+                            _ => Self::TEXT,
+                        }
+                    }
+                    Self::CSI => {
+                        if (0x40..=0x7e).contains(&byte) {
+                            self.state = Self::TEXT;
+                        }
+                    }
+                    Self::OSC => {
+                        if byte == 0x07 {
+                            self.state = Self::TEXT;
+                        } else if byte == 0x1b {
+                            self.state = Self::OSC_ESCAPE;
+                        }
+                    }
+                    Self::OSC_ESCAPE => self.state = if byte == b'\\' { Self::TEXT } else { Self::OSC },
+                    _ => {
+                        if byte == b'\n' {
+                            lines.push(Self::text(&self.line));
+                            self.line.clear();
+                            self.carriage_return = false;
+                            continue;
+                        }
+                        if self.carriage_return {
+                            // 单独的回车：这一行从头写
+                            self.line.clear();
+                            self.carriage_return = false;
+                        }
+                        if byte == b'\r' {
+                            self.carriage_return = true;
+                        } else if byte == 0x1b {
+                            self.state = Self::ESCAPE;
+                        } else if byte >= 0x20 || byte == b'\t' {
+                            self.line.push(byte);
+                        }
+                    }
+                }
+            }
+            lines
+        }
+
+        /// 命令结束：还没换行的最后一行也算
+        pub fn finish(&mut self) -> Vec<String> {
+            let last = Self::text(&self.line);
+            self.line.clear();
+            if last.is_empty() { Vec::new() } else { vec![last] }
+        }
+
+        fn text(bytes: &[u8]) -> String {
+            String::from_utf8_lossy(bytes).trim_end().to_string()
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn splits_lines_and_markers() {
+            let mut splitter = LineSplitter::default();
+            let lines = splitter.feed(b"a\r\nb\x1b[31mred\x1b[0m\rprogress 50%\rprogress 100%  \n\x1b]0;title\x07x");
+            assert_eq!(lines, vec!["a", "progress 100%"]);
+            assert_eq!(splitter.finish(), vec!["x"]);
+            assert_eq!(marker_message("[x] ::friday::  模型加载完了 ").as_deref(), Some("模型加载完了"));
+            assert_eq!(marker_message("::friday::").as_deref(), Some("::friday::"));
+            assert!(marker_message("friday: no").is_none());
+            assert_eq!(duration(Duration::from_secs(185)), "3 分 5 秒");
+        }
+
+        /// 网关把送回来的命令消息标成汇报（Friday 里 fromAgent、不显示）
+        #[test]
+        fn command_notice_is_a_report() {
+            let sent = "（下面这段由能力「friday」（command）传来）\n[终端 1a2b3c4d「make」里的命令跑完了]\n退出码 0";
+            assert_eq!(crate::report_from(sent).as_deref(), Some("后台命令"));
+            let interjected = "（能力「friday」（command）在你工作时补充了下面这段：和手上的事一起考虑）\n[终端 1a2b3c4d「make」里的命令发来消息，它还在跑]\n好了";
+            assert_eq!(crate::report_from(interjected).as_deref(), Some("后台命令"));
+            assert!(crate::report_from("（下面这段由能力「ear」（speech）传来）\n[终端 是别的").is_none());
+        }
+    }
+}
+
 mod pty {
     //! 内置终端（Friday 的 term.*，Friday 仓库的 qt/docs/TERMINAL.md）：大脑开伪终端跑 shell，客户端断了照常跑，连上来的接着看
     //! （最近 512 KB 的原始输出重放）。macOS / Linux 用 posix_openpt，Windows 用 ConPTY。
@@ -32588,6 +33316,21 @@ mod pty {
         /// 接着它的连接（能力名）
         watchers: Mutex<HashSet<String>>,
         pty: Box<dyn Pty>,
+        /// 开的时候（智能体的终端跑了多久）
+        started: Instant,
+    }
+
+    /// 一个终端现在的样子（智能体的 read_terminal、run_in_terminal 用）
+    pub struct Snapshot {
+        pub id: String,
+        pub session: String,
+        pub command: Option<String>,
+        pub running: bool,
+        pub exit_code: Option<i32>,
+        /// 最近的原始输出
+        pub output: Vec<u8>,
+        pub started: Instant,
+        pub last_output: Option<Instant>,
     }
 
     static TERMINALS: LazyLock<Mutex<HashMap<String, Arc<Terminal>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -32619,13 +33362,52 @@ mod pty {
             if !watchers.is_empty() {
                 crate::notify_clients(&watchers, "terminal.output", json!({ "id": self.id, "data": base64(data) }));
             }
+            // 智能体开的：看有没有要主动告诉它的行
+            crate::agent_terminals::output(&self.id, data);
         }
 
         fn exited(&self, code: Option<i32>) {
             self.running.store(false, Ordering::Relaxed);
             *self.exit_code.lock().unwrap() = code;
             changed();
+            crate::agent_terminals::exited(&self.id);
         }
+
+        fn snapshot(&self) -> Snapshot {
+            Snapshot {
+                id: self.id.clone(),
+                session: self.session.clone(),
+                command: self.command.clone(),
+                running: self.running.load(Ordering::Relaxed),
+                exit_code: *self.exit_code.lock().unwrap(),
+                output: self.output.lock().unwrap().iter().copied().collect(),
+                started: self.started,
+                last_output: *self.last_output.lock().unwrap(),
+            }
+        }
+    }
+
+    /// 这个终端现在的样子
+    pub fn snapshot(id: &str) -> Option<Snapshot> {
+        TERMINALS.lock().unwrap().get(id).map(|terminal| terminal.snapshot())
+    }
+
+    /// 这段会话的终端（按 id 排）
+    pub fn of_session(session: &str) -> Vec<Snapshot> {
+        let mut all: Vec<Snapshot> =
+            TERMINALS.lock().unwrap().values().filter(|terminal| terminal.session == session).map(|terminal| terminal.snapshot()).collect();
+        all.sort_by_key(|snapshot| snapshot.started);
+        all
+    }
+
+    /// 还在跑的智能体开的终端（后台命令）有几个：常驻的那份不换新版（serve.retire）
+    pub fn agent_running() -> usize {
+        TERMINALS
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|terminal| terminal.command.is_some() && terminal.running.load(Ordering::Relaxed))
+            .count()
     }
 
     /// 全部终端（TerminalInfo）
@@ -32659,45 +33441,8 @@ mod pty {
 
     /// 开一个（id 是客户端给的；watcher：开它的连接，开好就接着它）。command 起好后打进去回车
     pub fn open(id: &str, session: &str, cwd: &Path, cols: u16, rows: u16, command: Option<&str>, watcher: &str) -> Result<Value, String> {
-        if id.is_empty() || TERMINALS.lock().unwrap().contains_key(id) {
-            return Err(format!("终端 id 不对或已经有了：{id}"));
-        }
-        let (cols, rows) = (cols.max(2), rows.max(1));
         let (program, args) = shell();
-        let title = Path::new(&program).file_stem().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| program.clone());
-        let cwd = if cwd.is_dir() { cwd.to_path_buf() } else { crate::user_home() };
-        let (pty, reader, waiter) = spawn(&program, &args, &cwd, cols, rows)?;
-        let terminal = Arc::new(Terminal {
-            id: id.to_string(),
-            session: session.to_string(),
-            title,
-            command: command.map(str::to_string),
-            size: Mutex::new((cols, rows)),
-            output: Mutex::new(VecDeque::new()),
-            last_output: Mutex::new(None),
-            running: AtomicBool::new(true),
-            exit_code: Mutex::new(None),
-            watchers: Mutex::new(HashSet::from([watcher.to_string()])),
-            pty,
-        });
-        TERMINALS.lock().unwrap().insert(id.to_string(), terminal.clone());
-        {
-            let terminal = terminal.clone();
-            let mut reader = reader;
-            std::thread::spawn(move || {
-                let mut buffer = [0u8; 16 * 1024];
-                loop {
-                    match reader.read(&mut buffer) {
-                        Ok(0) | Err(_) => break,
-                        Ok(count) => terminal.output(&buffer[..count]),
-                    }
-                }
-            });
-        }
-        {
-            let terminal = terminal.clone();
-            std::thread::spawn(move || terminal.exited(waiter()));
-        }
+        let terminal = create(id, session, cwd, cols, rows, &program, &args, command, Some(watcher), None)?;
         if let Some(command) = command.filter(|command| !command.trim().is_empty()) {
             if cfg!(windows) {
                 // PowerShell 起得慢（windows-arm64 上好几秒），起好之前写进去的会被吞掉：等它出过提示符、安静 0.5 秒再写
@@ -32720,6 +33465,80 @@ mod pty {
         }
         changed();
         Ok(terminal.info())
+    }
+
+    /// v2.88 智能体开的（run_in_terminal，同 Friday v2.49）：shell 只跑这条命令（Unix `$SHELL -l -i -c`，照样读 rc；
+    /// Windows PowerShell `-EncodedCommand`，带回原生命令的退出码），命令结束终端就是「已退出，代码 N」。屏幕第一行先写一行淡色的 `$ 命令`
+    pub fn open_agent(id: &str, session: &str, cwd: &Path, command: &str) -> Result<Value, String> {
+        let (program, _) = shell();
+        let args: Vec<String> = if cfg!(windows) {
+            use base64::Engine;
+            let script = format!("{command}\nif ($LASTEXITCODE) {{ exit $LASTEXITCODE }}");
+            let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            vec!["-NoLogo".into(), "-EncodedCommand".into(), base64::engine::general_purpose::STANDARD.encode(utf16)]
+        } else {
+            vec!["-l".into(), "-i".into(), "-c".into(), command.to_string()]
+        };
+        let echo = format!("\x1b[2m$\x1b[0m {command}\r\n");
+        let terminal = create(id, session, cwd, 120, 30, &program, &args, Some(command), None, Some(echo.as_bytes()))?;
+        changed();
+        Ok(terminal.info())
+    }
+
+    /// 起 shell、登记、开读输出和等退出的线程。seed：先放进重放里的字（智能体的终端写的那行 `$ 命令`）
+    #[allow(clippy::too_many_arguments)]
+    fn create(
+        id: &str,
+        session: &str,
+        cwd: &Path,
+        cols: u16,
+        rows: u16,
+        program: &str,
+        args: &[String],
+        command: Option<&str>,
+        watcher: Option<&str>,
+        seed: Option<&[u8]>,
+    ) -> Result<Arc<Terminal>, String> {
+        if id.is_empty() || TERMINALS.lock().unwrap().contains_key(id) {
+            return Err(format!("终端 id 不对或已经有了：{id}"));
+        }
+        let (cols, rows) = (cols.max(2), rows.max(1));
+        let title = Path::new(program).file_stem().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| program.to_string());
+        let cwd = if cwd.is_dir() { cwd.to_path_buf() } else { crate::user_home() };
+        let (pty, reader, waiter) = spawn(program, args, &cwd, cols, rows)?;
+        let terminal = Arc::new(Terminal {
+            id: id.to_string(),
+            session: session.to_string(),
+            title,
+            command: command.map(str::to_string),
+            size: Mutex::new((cols, rows)),
+            output: Mutex::new(seed.map(|seed| seed.iter().copied().collect()).unwrap_or_default()),
+            last_output: Mutex::new(None),
+            running: AtomicBool::new(true),
+            exit_code: Mutex::new(None),
+            watchers: Mutex::new(watcher.into_iter().map(str::to_string).collect()),
+            pty,
+            started: Instant::now(),
+        });
+        TERMINALS.lock().unwrap().insert(id.to_string(), terminal.clone());
+        {
+            let terminal = terminal.clone();
+            let mut reader = reader;
+            std::thread::spawn(move || {
+                let mut buffer = [0u8; 16 * 1024];
+                loop {
+                    match reader.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(count) => terminal.output(&buffer[..count]),
+                    }
+                }
+            });
+        }
+        {
+            let terminal = terminal.clone();
+            std::thread::spawn(move || terminal.exited(waiter()));
+        }
+        Ok(terminal)
     }
 
     /// 接上：之后的输出推给它；回最近的输出和现在的大小
@@ -32759,6 +33578,8 @@ mod pty {
 
     /// 结束 shell 和它起的进程，从列表去掉
     pub fn close(id: &str) -> Result<Value, String> {
+        // 智能体开的、还在跑的被用户关了：告诉开它的会话（智能体自己 close_terminal 的先不看了）
+        crate::agent_terminals::closed(id);
         let terminal = TERMINALS.lock().unwrap().remove(id).ok_or_else(|| format!("没有终端 {id}"))?;
         terminal.pty.kill();
         changed();

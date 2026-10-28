@@ -1168,6 +1168,97 @@ fn terminals_live_in_the_resident_part() {
     assert!(edith_tools_support::wait_until(15, || !home.join("friday").join("serve.json").exists()), "常驻的那份没退");
 }
 
+/// 智能体的终端（同 Friday v2.88）：run_in_terminal 开的命令打出 ::friday:: 标记行、跑完时，常驻的那份经 sense（interject）送回开它的会话；
+/// 有后台命令在跑时新版网关请它退（serve.retire）回 busy，跑完它自己退
+#[test]
+fn agent_terminal_pushes_back() {
+    let home = scratch("friday-agent-terminal");
+    let work = home.join("work");
+    std::fs::create_dir_all(work.join(".git")).unwrap();
+    write_session(&home, &work);
+    let brain = FakeBrain::new();
+    register(&home, &brain, &work);
+    let mut client = Client::start_with(&home, &work, &[("EDITH_FRIDAY_HUB_IDLE", "60"), ("EDITH_FRIDAY_TERM_BATCH_MS", "200")]);
+    let hello = client.send("hello", json!({ "protocol": 1 }));
+    let (mut gateway, mut resident) = (None, None);
+    for _ in 0..2 {
+        let mut link = brain.accept(15).expect("少了一条连接");
+        let reply = link.handshake(json!({ "name": "EDITH", "version": "test" }));
+        match reply["name"].as_str() {
+            Some("friday-client") => gateway = Some(link),
+            Some("friday") => resident = Some((link, reply)),
+            other => panic!("不认识的连接 {other:?}：{reply}"),
+        }
+    }
+    let (mut gateway, (mut resident, info)) = (gateway.unwrap(), resident.unwrap());
+    let actions: Vec<&str> = info["actions"].as_array().unwrap().iter().filter_map(|action| action["name"].as_str()).collect();
+    assert!(["run_in_terminal", "read_terminal", "close_terminal"].iter().all(|name| actions.contains(name)), "{actions:?}");
+    let list = gateway.wait_for(10, |message| message["method"] == "sessions.list").unwrap();
+    reply(&mut gateway, &list, json!([]));
+    let agents = gateway.wait_for(10, |message| message["method"] == "agents.list").unwrap();
+    reply(&mut gateway, &agents, json!([]));
+    assert!(client.reply(hello).get("error").is_none());
+
+    // 批准：同 run_shell（删除类自动模式也问）
+    let hook = json!({ "hook_event_name": "PreToolUse", "session_id": SESSION, "tool_name": "friday__run_in_terminal",
+                       "tool_input": { "command": "rm -rf build" } });
+    resident.send(json!({ "jsonrpc": "2.0", "id": 1, "method": "hook", "params": hook }));
+    let need = resident.wait_for(10, |message| message["id"] == 1).expect("钩子没回")["result"]["need"].clone();
+    assert_eq!((need["stop"].as_bool(), need["rule"].as_str()), (Some(true), Some("friday__run_in_terminal(rm)")), "{need}");
+
+    let command = if cfg!(windows) {
+        "Start-Sleep 5; echo 'plain'; echo '::friday:: loaded'; Start-Sleep 2; echo done-line; exit 3"
+    } else {
+        "sleep 5; echo plain; echo '::friday:: 模型加载完了'; sleep 2; echo done-line; exit 3"
+    };
+    let act = json!({ "call": "c1", "action": "run_in_terminal", "arguments": { "command": command }, "session": SESSION, "turn": "t1" });
+    resident.send(json!({ "jsonrpc": "2.0", "id": 2, "method": "act", "params": act }));
+    let done = resident.wait_for(30, |message| message["id"] == 2).expect("动作没回");
+    let text = done["result"]["text"].as_str().unwrap_or("").to_string();
+    assert!(done["result"]["ok"] == true && text.contains("会自动把内容送到你这里"), "{done}");
+    // 客户端看得到这个终端（带命令：后台任务里列出来）
+    let listed = client.event("terminals", |params| params["terminals"].as_array().is_some_and(|all| all.iter().any(|t| t["command"] == command)));
+    assert!(listed["params"]["terminals"][0]["running"].as_bool().is_some(), "{listed}");
+
+    // 新版网关请它退：有后台命令在跑，回 busy
+    let registered: Value = serde_json::from_slice(&std::fs::read(home.join("friday").join("serve.json")).unwrap()).unwrap();
+    let mut stream = std::net::TcpStream::connect(registered["address"].as_str().unwrap()).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    writeln!(stream, "{}", json!({ "jsonrpc": "2.0", "method": "auth", "params": { "token": registered["token"] } })).unwrap();
+    writeln!(stream, "{}", json!({ "jsonrpc": "2.0", "id": 1, "method": "serve.retire", "params": {} })).unwrap();
+    let mut reader = std::io::BufReader::new(stream);
+    let retire = loop {
+        let mut line = String::new();
+        assert!(std::io::BufRead::read_line(&mut reader, &mut line).unwrap() > 0, "常驻的那份断了");
+        let message: Value = serde_json::from_str(&line).unwrap_or_default();
+        if message["id"] == json!(1) {
+            break message;
+        }
+    };
+    assert_eq!(retire["result"]["busy"], 1, "{retire}");
+
+    // 标记行送回来（interject，标来源 command）；之前之后的行不送
+    let loaded = if cfg!(windows) { "loaded" } else { "模型加载完了" };
+    let marker = resident.wait_for(30, |message| message["method"] == "sense").expect("标记行没送回来");
+    let params = &marker["params"];
+    assert_eq!((params["session"].as_str(), params["urgency"].as_str(), params["kind"].as_str()), (Some(SESSION), Some("interject"), Some("command")));
+    let said = params["text"].as_str().unwrap_or("");
+    let body = said.split_once('\n').map_or("", |(_, body)| body);
+    assert!(said.contains("发来消息") && body.contains(loaded) && !body.contains("plain") && !said.contains("{ID}"), "{said}");
+    // 跑完：退出码和最后的输出
+    let finished = resident.wait_for(30, |message| message["method"] == "sense").expect("跑完没送回来");
+    let said = finished["params"]["text"].as_str().unwrap_or("");
+    assert!(said.contains("跑完了") && said.contains("退出码 3") && said.contains("done-line"), "{said}");
+    // read_terminal 读得到最后的输出
+    let act = json!({ "call": "c2", "action": "read_terminal", "arguments": {}, "session": SESSION, "turn": "t2" });
+    resident.send(json!({ "jsonrpc": "2.0", "id": 3, "method": "act", "params": act }));
+    let read = resident.wait_for(30, |message| message["id"] == 3).expect("读终端没回");
+    assert!(read["result"]["text"].as_str().is_some_and(|text| text.contains("done-line")), "{read}");
+    // 后台命令跑完了：它自己退（换新版）
+    assert!(edith_tools_support::wait_until(20, || !home.join("friday").join("serve.json").exists()), "跑完了常驻的那份没退");
+    drop(client);
+}
+
 /// 常驻的那份连着大脑（在那里是能力「friday」，网关是 friday-client）：报浏览器工具、钩子、resident；
 /// PreToolUse 替自己的动作说怎么批准；做动作
 #[test]
