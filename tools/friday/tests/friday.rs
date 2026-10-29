@@ -1217,7 +1217,8 @@ fn agent_terminal_pushes_back() {
     let text = done["result"]["text"].as_str().unwrap_or("").to_string();
     assert!(done["result"]["ok"] == true && text.contains("会自动把内容送到你这里"), "{done}");
     // 客户端看得到这个终端（带命令：后台任务里列出来）
-    let listed = client.event("terminals", |params| params["terminals"].as_array().is_some_and(|all| all.iter().any(|t| t["command"] == command)));
+    let listed =
+        client.event("terminals", |params| params["terminals"].as_array().is_some_and(|all| all.iter().any(|t| t["command"] == command)));
     assert!(listed["params"]["terminals"][0]["running"].as_bool().is_some(), "{listed}");
 
     // 新版网关请它退：有后台命令在跑，回 busy
@@ -1242,7 +1243,10 @@ fn agent_terminal_pushes_back() {
     let patience = if cfg!(windows) { 120 } else { 30 };
     let marker = resident.wait_for(patience, |message| message["method"] == "sense").expect("标记行没送回来");
     let params = &marker["params"];
-    assert_eq!((params["session"].as_str(), params["urgency"].as_str(), params["kind"].as_str()), (Some(SESSION), Some("interject"), Some("command")));
+    assert_eq!(
+        (params["session"].as_str(), params["urgency"].as_str(), params["kind"].as_str()),
+        (Some(SESSION), Some("interject"), Some("command"))
+    );
     let said = params["text"].as_str().unwrap_or("");
     let body = said.split_once('\n').map_or("", |(_, body)| body);
     assert!(said.contains("发来消息") && body.contains(loaded) && !body.contains("plain") && !said.contains("{ID}"), "{said}");
@@ -1293,7 +1297,9 @@ fn resident_part_joins_the_brain() {
     assert!(info["receives"].as_array().unwrap().contains(&json!("done")), "{info}");
     let actions: Vec<&str> = info["actions"].as_array().unwrap().iter().filter_map(|action| action["name"].as_str()).collect();
     // 定时任务、脚本工具一直在；浏览器工具只在这台有浏览器时给
-    assert!(["loop", "create_tool", "list_tools"].iter().all(|name| actions.contains(name)), "{actions:?}");
+    // 管理类同 Friday v2.90 合成几个：list_tools、read_tool、delete_tool 在 manage_tools 里，update_tool 是同名的 create_tool
+    assert!(["loop", "create_tool", "manage_tools", "manage_commands"].iter().all(|name| actions.contains(name)), "{actions:?}");
+    assert!(["list_tools", "update_tool", "save_command"].iter().all(|name| !actions.contains(name)), "{actions:?}");
     let list = gateway.wait_for(10, |message| message["method"] == "sessions.list").unwrap();
     reply(&mut gateway, &list, json!([]));
     let agents = gateway.wait_for(10, |message| message["method"] == "agents.list").unwrap();
@@ -1313,6 +1319,17 @@ fn resident_part_joins_the_brain() {
     assert_eq!(hook(&mut resident, 3, "write_file", json!({ "path": "a" })), json!({}));
     let script = hook(&mut resident, 4, "friday__browser_run_js", json!({ "script": "1+1" }));
     assert_eq!(script["need"]["rule"], "friday__browser_run_js", "{script}");
+    // 合成的按换回的细分动作审：列出工具不用批准
+    assert_eq!(hook(&mut resident, 6, "friday__manage_tools", json!({ "action": "list" }))["need"], false);
+    // 合成的动作按 action 换回细分的做；选不出的说清楚
+    let act = json!({ "call": "c0", "action": "manage_tools", "arguments": { "action": "read", "name": "no_such_tool" }, "session": SESSION, "turn": "t0" });
+    resident.send(json!({ "jsonrpc": "2.0", "id": 7, "method": "act", "params": act }));
+    let read = resident.wait_for(30, |message| message["id"] == 7).expect("动作没回");
+    assert!(read["result"]["text"].as_str().is_some_and(|text| text.contains("no_such_tool")), "{read}");
+    let act = json!({ "call": "c0", "action": "manage_tools", "arguments": { "action": "drop" }, "session": SESSION, "turn": "t0" });
+    resident.send(json!({ "jsonrpc": "2.0", "id": 8, "method": "act", "params": act }));
+    let wrong = resident.wait_for(30, |message| message["id"] == 8).expect("动作没回");
+    assert!(wrong["result"]["text"].as_str().is_some_and(|text| text.contains("list / read / delete")), "{wrong}");
     // 动作：这台没装浏览器的说清楚，装了的列出这段会话的标签
     let act = json!({ "call": "c1", "action": "browser_tabs", "arguments": {}, "session": SESSION, "turn": "t1" });
     resident.send(json!({ "jsonrpc": "2.0", "id": 5, "method": "act", "params": act }));

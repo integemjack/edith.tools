@@ -80,6 +80,8 @@ Friday 客户端 ──SSH──▶ edith-friday --attach（一条连接一个�
 - **脚本工具**：`~/.edith/friday/tools/<名字>/`（格式同 Swift / Qt，存储用 friday-core 的 script_tools）；启用了的是常驻那份的动作，
   按权限加沙盒（macOS sandbox-exec，Linux 有 bwrap 时用它），声明的密钥从 EDITH 的密钥库按同名环境变量给，60 秒超时。
   智能体的 `create_tool` / `update_tool` / `delete_tool` / `list_tools` / `read_tool`（存了就自测，通过才启用）；设置 › 工具的建、存、自测、回滚、开关、删。
+  发给大脑时同 Friday v2.90 合成几个（`mod merge`）：`create_tool` 同名已有就是改（update_tool），`manage_tools`（action list / read / delete）、
+  `manage_providers`（read）、`manage_commands`（action save / delete，kind command / subagent）；调进来、批准钩子都先换回细分的动作，旧名照样能调。
   工具变了经 `capability.update`（能力协议 §4.7）告诉大脑。
 - **钩子**（`hooks.*`）：同 Claude Code 的格式：全局 `~/.edith/friday/hooks.json`、项目 `.friday/hooks.json`（要信任、内容变了再信任）、插件带的；
   大脑在四个时机问常驻的那份（能力协议 §6.7），这里跑命令：标准输入是 Claude Code 那个 JSON，退出码 2 拦下 / 接着做，JSON 输出照 Claude Code 认。

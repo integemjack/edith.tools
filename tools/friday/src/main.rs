@@ -567,6 +567,10 @@ fn tool_look(name: &str) -> Option<(&'static str, &'static str)> {
         "delete_tool" => ("删除工具", "trash"),
         "list_tools" => ("列出工具", "list.bullet"),
         "read_tool" => ("查看工具", "doc.text.magnifyingglass"),
+        // 同 Friday v2.90 合并给模型的（merge）
+        "manage_tools" => ("管理工具", "wrench.and.screwdriver"),
+        "manage_providers" => ("管理能力提供方", "shippingbox"),
+        "manage_commands" => ("管理命令和子智能体", "square.and.pencil"),
         "read_file" => ("读取文件", "doc.text"),
         "write_file" => ("写入文件", "square.and.pencil"),
         "edit_file" => ("修改文件", "pencil"),
@@ -4920,6 +4924,224 @@ fn notify_all_clients(method: &str, params: Value) {
     }
 }
 
+// MARK: - 合并给模型的动作（同 Friday v2.90 的 ToolMerge）
+
+/// 发给大脑的动作里同一组的合成一个：参数是各成员的并集，靠 action / kind 选成员；create_tool 同名的已有就是改它（update_tool）。
+/// 执行、批准、卡片仍按原来的细分动作：调进来时 internal 换回。旧名照样能调。
+mod merge {
+    use serde_json::{Map, Value, json};
+
+    /// 成员：内部动作名、选它的 action、kind
+    type Member = (&'static str, &'static str, &'static str);
+    type Group = (&'static str, &'static [Member]);
+
+    /// 合并名 → 成员；第一个是主的
+    const GROUPS: &[Group] = &[
+        ("create_tool", &[("create_tool", "", ""), ("update_tool", "", "")]),
+        ("manage_tools", &[("list_tools", "list", ""), ("read_tool", "read", ""), ("delete_tool", "delete", "")]),
+        ("manage_providers", &[("read_provider", "read", "")]),
+        (
+            "manage_commands",
+            &[
+                ("save_command", "save", "command"),
+                ("delete_command", "delete", "command"),
+                ("save_subagent", "save", "subagent"),
+                ("delete_subagent", "delete", "subagent"),
+            ],
+        ),
+    ];
+
+    fn group_of(action: &str) -> Option<&'static Group> {
+        GROUPS.iter().find(|(_, members)| members.iter().any(|(name, _, _)| *name == action))
+    }
+
+    fn lowered(arguments: &Map<String, Value>, key: &str) -> String {
+        arguments.get(key).and_then(Value::as_str).unwrap_or("").trim().to_lowercase()
+    }
+
+    /// 合成的说明：prompts-tools.md 里有 tool.<组名> 就用它（EDITH 自带的那份），没有用这里的
+    fn description(group: &str) -> String {
+        let key = format!("tool.{group}");
+        let text = friday_core::prompts::text(&key, &Default::default(), None);
+        if group == "manage_commands" && !text.starts_with("【缺提示词") {
+            return text;
+        }
+        match group {
+            "create_tool" => "当现有工具无法完成任务时，编写一个新的脚本工具并注册。创建后会自动用 test_arguments 自测，通过就启用，马上就能调用。\
+                              已有同名的自定义工具时就是改它：只给要改的字段（如修好的 code），旧版本自动保留以便回滚。",
+            "manage_tools" => "管理自定义脚本工具（新建、修改用 create_tool）。action：list 列出全部工具（内置、自定义脚本、MCP）和状态；\
+                               read 看某个自定义工具的清单和源码，改之前先读；delete 删掉它（移到工具目录的 .trash 里）。",
+            "manage_providers" => "管理能力提供方（新建脚本提供方用 create_provider）。action：read 看一个脚本提供方的清单、源码和上次自测结果，改之前先读。",
+            _ => "新建、改写或删除命令和现成的子智能体（同 Claude Code 的 slash commands、subagents 格式；用命令用 use_command）。\
+                  kind：command 是命令（用户打「/名字 参数」时把正文当提示词发给你），subagent 是现成的子智能体（派活时用 subagent_type 点它）。\
+                  action：save 新建或整份改写，delete 删掉（只在用户要删或它已经过时时用）。",
+        }
+        .to_string()
+    }
+
+    /// 一组的合成定义：主成员打底；参数取并集、必填的取交集，再加选成员的 action / kind；都只读才算只读
+    fn merged(group: &str, members: &[Member], present: &[&Value]) -> Value {
+        let mut result = present[0].clone();
+        let mut properties = Map::new();
+        let mut required: Option<Vec<String>> = None;
+        let mut actions: Vec<&str> = Vec::new();
+        let mut kinds: Vec<&str> = Vec::new();
+        for action in present {
+            for (key, value) in action["parameters"]["properties"].as_object().into_iter().flatten() {
+                properties.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+            let needed: Vec<String> =
+                action["parameters"]["required"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect();
+            required = Some(match required {
+                None => needed,
+                Some(previous) => previous.into_iter().filter(|key| needed.contains(key)).collect(),
+            });
+            for (name, choice, kind) in members {
+                if action["name"] != *name {
+                    continue;
+                }
+                if !choice.is_empty() && !actions.contains(choice) {
+                    actions.push(choice);
+                }
+                if !kind.is_empty() && !kinds.contains(kind) {
+                    kinds.push(kind);
+                }
+            }
+        }
+        let mut required = required.unwrap_or_default();
+        if !actions.is_empty() {
+            properties.insert("action".into(), json!({ "type": "string", "enum": actions, "description": actions.join(" / ") }));
+            required.push("action".into());
+        }
+        if !kinds.is_empty() {
+            let description = format!("{}（默认）{}", kinds[0], kinds[1..].iter().map(|kind| format!(" / {kind}")).collect::<String>());
+            properties.insert("kind".into(), json!({ "type": "string", "enum": kinds, "description": description }));
+        }
+        required.sort();
+        result["name"] = json!(group);
+        result["description"] = json!(description(group));
+        result["parameters"] = json!({ "type": "object", "properties": properties, "required": required });
+        result["readOnly"] = json!(present.iter().all(|action| action["readOnly"] == true));
+        let timeout = present.iter().filter_map(|action| action["timeoutSeconds"].as_u64()).max();
+        result["timeoutSeconds"] = timeout.map_or(Value::Null, |seconds| json!(seconds));
+        if result["timeoutSeconds"].is_null() {
+            result.as_object_mut().map(|object| object.remove("timeoutSeconds"));
+        }
+        result
+    }
+
+    /// 动作清单：同一组的合成一个，放在组里最先出现的那个的位置
+    pub fn apply(actions: Vec<Value>) -> Vec<Value> {
+        let mut result = Vec::new();
+        let mut done: Vec<&str> = Vec::new();
+        for action in &actions {
+            let Some((group, members)) = group_of(action["name"].as_str().unwrap_or("")) else {
+                result.push(action.clone());
+                continue;
+            };
+            if done.contains(group) {
+                continue;
+            }
+            done.push(group);
+            let present: Vec<&Value> =
+                members.iter().filter_map(|(name, _, _)| actions.iter().find(|candidate| candidate["name"] == *name)).collect();
+            result.push(merged(group, members, &present));
+        }
+        result
+    }
+
+    /// 大脑调进来的：合并名 + 参数 → 内部动作和去掉 action / kind 的参数；不是合并名的原样；选不出成员的回说明
+    pub fn internal(
+        action: &str,
+        arguments: Map<String, Value>,
+        script_exists: impl Fn(&str) -> bool,
+    ) -> Result<(String, Map<String, Value>), String> {
+        let Some((group, members)) = GROUPS.iter().find(|(group, _)| *group == action) else {
+            return Ok((action.to_string(), arguments));
+        };
+        if *group == "create_tool" {
+            let name = arguments.get("name").and_then(Value::as_str).unwrap_or("").trim().to_string();
+            let chosen = if !name.is_empty() && script_exists(&name) { "update_tool" } else { "create_tool" };
+            return Ok((chosen.to_string(), arguments));
+        }
+        let choice = lowered(&arguments, "action");
+        let mut kind = lowered(&arguments, "kind");
+        if kind.is_empty() && *group == "manage_commands" {
+            kind = "command".into();
+        }
+        let found = members.iter().find(|(_, wanted, wanted_kind)| *wanted == choice && (wanted_kind.is_empty() || *wanted_kind == kind));
+        let Some((name, _, _)) = found else {
+            let mut choices: Vec<&str> = Vec::new();
+            let mut kinds: Vec<&str> = Vec::new();
+            for (_, wanted, wanted_kind) in members.iter() {
+                if !choices.contains(wanted) {
+                    choices.push(wanted);
+                }
+                if !wanted_kind.is_empty() && !kinds.contains(wanted_kind) {
+                    kinds.push(wanted_kind);
+                }
+            }
+            let mut text = format!("{group} 的 action 只能是 {}", choices.join(" / "));
+            if !kinds.is_empty() {
+                text += &format!("，kind 只能是 {}", kinds.join(" / "));
+            }
+            return Err(text);
+        };
+        let mut arguments = arguments;
+        arguments.remove("action");
+        arguments.remove("kind");
+        Ok((name.to_string(), arguments))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn action(name: &str, properties: &[&str], required: &[&str], read_only: bool) -> Value {
+            let properties: Map<String, Value> = properties.iter().map(|key| (key.to_string(), json!({ "type": "string" }))).collect();
+            json!({ "name": name, "description": name, "readOnly": read_only, "timeoutSeconds": 30,
+                    "parameters": { "type": "object", "properties": properties, "required": required } })
+        }
+
+        #[test]
+        fn merges_and_picks() {
+            let actions = vec![
+                action("loop", &["command"], &["command"], false),
+                action("create_tool", &["name", "code"], &["name", "code"], false),
+                action("update_tool", &["name", "code"], &["name"], false),
+                action("delete_tool", &["name"], &["name"], false),
+                action("list_tools", &[], &[], true),
+                action("read_tool", &["name"], &["name"], true),
+                action("use_command", &["command"], &["command"], true),
+                action("save_command", &["name", "content"], &["name", "content"], false),
+                action("delete_command", &["name"], &["name"], false),
+            ];
+            let merged = apply(actions);
+            let names: Vec<&str> = merged.iter().filter_map(|action| action["name"].as_str()).collect();
+            assert_eq!(names, vec!["loop", "create_tool", "manage_tools", "use_command", "manage_commands"]);
+            assert_eq!(merged[1]["parameters"]["required"], json!(["name"]));
+            assert_eq!(merged[2]["parameters"]["required"], json!(["action"]));
+            assert_eq!(merged[2]["parameters"]["properties"]["action"]["enum"], json!(["list", "read", "delete"]));
+            assert_eq!(merged[2]["readOnly"], false);
+            assert_eq!(merged[4]["parameters"]["properties"]["kind"]["enum"], json!(["command"]));
+
+            let args = |value: Value| value.as_object().unwrap().clone();
+            let exists = |name: &str| name == "old_tool";
+            assert_eq!(internal("create_tool", args(json!({ "name": "old_tool" })), exists).unwrap().0, "update_tool");
+            assert_eq!(internal("create_tool", args(json!({ "name": "new_tool" })), exists).unwrap().0, "create_tool");
+            let (name, rest) = internal("manage_tools", args(json!({ "action": "Read", "name": "x" })), exists).unwrap();
+            assert_eq!((name.as_str(), rest.contains_key("action")), ("read_tool", false));
+            assert_eq!(internal("manage_commands", args(json!({ "action": "delete", "name": "x" })), exists).unwrap().0, "delete_command");
+            assert_eq!(
+                internal("manage_commands", args(json!({ "action": "save", "kind": "subagent" })), exists).unwrap().0,
+                "save_subagent"
+            );
+            assert!(internal("manage_tools", args(json!({ "action": "drop" })), exists).unwrap_err().contains("list / read / delete"));
+            assert_eq!(internal("list_tools", args(json!({})), exists).unwrap().0, "list_tools");
+        }
+    }
+}
+
 /// 只读的浏览器工具（只读权限的一轮也能用）
 const READ_ONLY_BROWSER: [&str; 4] = ["browser_read", "browser_screenshot", "browser_tabs", "browser_hand_over"];
 
@@ -4955,7 +5177,8 @@ fn serve_actions() -> Vec<Value> {
     actions.extend(assistant::actions());
     // 智能体的终端：run_in_terminal 开的命令跑完、打出 ::friday:: 标记行时主动发消息回来
     actions.extend(agent_terminals::actions());
-    actions
+    // 同 Friday v2.90：管理类的合成几个（merge）
+    merge::apply(actions)
 }
 
 /// 动作变了（脚本工具加了、改了、开关了）：连着的大脑都换一份
@@ -5007,12 +5230,26 @@ fn serve_hook(params: &Value) -> Value {
         return json!({});
     }
     let tool = params["tool_name"].as_str().unwrap_or("");
+    // 合并给大脑的动作（merge）按换回的细分动作审：列出、看工具和以前一样不用批准
+    let merged = tool.split_once("__").filter(|(owner, _)| owner.starts_with("friday") && !owner.starts_with("friday-client"));
+    let mut arguments = params["tool_input"].as_object().cloned().unwrap_or_default();
+    let mut inner = String::new();
+    if let Some((owner, action)) = merged
+        && let Ok((name, rest)) = merge::internal(action, arguments.clone(), scripts::exists)
+        && name != action
+    {
+        if name == "list_tools" || name == "read_tool" {
+            return json!({ "need": false });
+        }
+        inner = format!("{owner}__{name}");
+        arguments = rest;
+    }
+    let tool = if inner.is_empty() { tool } else { inner.as_str() };
     let Some(action) = own_action(tool) else { return json!({}) };
     // 建定时任务不用批准（同 Friday：它本来就是照用户说的做；智能体建的有上限）
     if action == "loop" {
         return json!({ "need": false });
     }
-    let arguments = params["tool_input"].as_object().cloned().unwrap_or_default();
     let session = params["session_id"].as_str().unwrap_or("");
     if commands::is_action(action) {
         return json!({ "need": commands::need(action, &arguments, session) });
@@ -5031,8 +5268,16 @@ fn serve_hook(params: &Value) -> Value {
 }
 
 fn serve_act(params: &Value, brain: &Brain) -> Value {
-    let action = params["action"].as_str().unwrap_or("");
-    let arguments = params["arguments"].as_object().cloned().unwrap_or_default();
+    // 合并给大脑的动作换回内部的细分动作（merge）
+    let (action, arguments) = match merge::internal(
+        params["action"].as_str().unwrap_or(""),
+        params["arguments"].as_object().cloned().unwrap_or_default(),
+        scripts::exists,
+    ) {
+        Ok(found) => found,
+        Err(problem) => return json!({ "text": problem, "ok": false }),
+    };
+    let action = action.as_str();
     let session = params["session"].as_str().unwrap_or("");
     if action == "loop" {
         if params["agent"].as_str().is_some_and(|agent| !agent.is_empty()) {
@@ -10737,6 +10982,11 @@ mod scripts {
         ]
     }
 
+    /// 有这个名字的脚本工具（create_tool 同名就是改它：merge）
+    pub fn exists(name: &str) -> bool {
+        load(name).is_some()
+    }
+
     pub fn is_meta(action: &str) -> bool {
         RESERVED[1..].contains(&action)
     }
@@ -10801,7 +11051,7 @@ mod scripts {
             (
                 false,
                 format!(
-                    "工具 {name} {action}（已保存为 v{version}），但自测失败，暂未启用。请用 update_tool（name 仍为 {name}）修正后再试：\n{}",
+                    "工具 {name} {action}（已保存为 v{version}），但自测失败，暂未启用。请用 create_tool 同名再交一次（只给要改的字段）修正后再试：\n{}",
                     test.summary()
                 ),
             )
@@ -10876,7 +11126,7 @@ mod scripts {
                     ));
                 }
                 if load(&name).is_some() {
-                    return failed(format!("已存在名为 {name} 的工具，请换个名字，或用 update_tool 修改"));
+                    return failed(format!("已存在名为 {name} 的工具，请换个名字；要改它就只给要改的字段"));
                 }
                 let Some(language) = text("language").and_then(|value| language(&value)) else {
                     return failed("language 只能是 python | bash | node".into());
@@ -32759,7 +33009,8 @@ mod agent_terminals {
         }
         // 等几秒拿开头的输出（端口占用、找不到命令这类错误一开始就会打出来）；命令本身不等它结束
         std::thread::sleep(Duration::from_secs(3));
-        let notify = arguments.get("notify").map(|value| value.as_bool().unwrap_or_else(|| value.as_str() != Some("false"))).unwrap_or(true);
+        let notify =
+            arguments.get("notify").map(|value| value.as_bool().unwrap_or_else(|| value.as_str() != Some("false"))).unwrap_or(true);
         let notify_on = text_arg(arguments, "notify_on").trim().to_string();
         // 拿屏幕和接上看在同一把锁里（中间打出的行不漏也不重复）
         let (screen, running, exit_code, watched) = {
@@ -32768,7 +33019,9 @@ mod agent_terminals {
             let watched = snapshot.running && (notify || !notify_on.is_empty());
             if watched {
                 let pattern = (!notify_on.is_empty())
-                    .then(|| Regex::new(&format!("(?i){notify_on}")).or_else(|_| Regex::new(&format!("(?i){}", regex::escape(&notify_on)))).ok())
+                    .then(|| {
+                        Regex::new(&format!("(?i){notify_on}")).or_else(|_| Regex::new(&format!("(?i){}", regex::escape(&notify_on)))).ok()
+                    })
                     .flatten();
                 let mut splitter = LineSplitter::default();
                 // 之前打出的（交给模型了）不再看：切过一遍，丢掉
@@ -32795,7 +33048,10 @@ mod agent_terminals {
         if !running {
             schedule_close(&id);
         }
-        let mut text = format!("已在这段对话的终端 {} 里运行（新开的标签，用户在终端卡片里看得见、随时能停）：{command}\n工作目录：{cwd}\n", short(&id));
+        let mut text = format!(
+            "已在这段对话的终端 {} 里运行（新开的标签，用户在终端卡片里看得见、随时能停）：{command}\n工作目录：{cwd}\n",
+            short(&id)
+        );
         text += "开头几秒的输出：\n";
         text += &if screen.trim().is_empty() { "（还没有输出）".to_string() } else { tail(&screen, 6000) };
         if !running {
@@ -32834,7 +33090,10 @@ mod agent_terminals {
         let wait_for = text_arg(arguments, "wait_for").trim().to_string();
         let wait_seconds = number_arg(arguments, "wait_seconds").unwrap_or(0);
         let pick = || -> Option<pty::Snapshot> {
-            pty::of_session(session).into_iter().filter(|snapshot| matches(snapshot, &wanted)).max_by_key(|snapshot| snapshot.last_output.unwrap_or(snapshot.started))
+            pty::of_session(session)
+                .into_iter()
+                .filter(|snapshot| matches(snapshot, &wanted))
+                .max_by_key(|snapshot| snapshot.last_output.unwrap_or(snapshot.started))
         };
         let mut waited = String::new();
         if !wait_for.is_empty() || wait_seconds > 0 {
@@ -32884,7 +33143,10 @@ mod agent_terminals {
                 );
             }
             if all.is_empty() {
-                return (true, "这段对话还没有终端：用户可以在 Friday 里点工具栏的终端按钮打开一个；要运行一直跑的命令用 run_in_terminal。".into());
+                return (
+                    true,
+                    "这段对话还没有终端：用户可以在 Friday 里点工具栏的终端按钮打开一个；要运行一直跑的命令用 run_in_terminal。".into(),
+                );
             }
             let known: Vec<String> = all.iter().map(describe).collect();
             return (false, format!("没有叫「{wanted}」的终端。这段对话的终端：{}", known.join("；")));
@@ -33346,12 +33608,7 @@ mod pty {
 
     /// 还在跑的智能体开的终端（后台命令）有几个：常驻的那份不换新版（serve.retire）
     pub fn agent_running() -> usize {
-        TERMINALS
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|terminal| terminal.command.is_some() && terminal.running.load(Ordering::Relaxed))
-            .count()
+        TERMINALS.lock().unwrap().values().filter(|terminal| terminal.command.is_some() && terminal.running.load(Ordering::Relaxed)).count()
     }
 
     /// 全部终端（TerminalInfo）
