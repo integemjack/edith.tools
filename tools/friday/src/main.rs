@@ -22265,7 +22265,7 @@ mod learn {
     //! 读过的技能、查到 / 放进去的记忆、调了哪些工具、最后的回答。
     //! - 内置钩子「会话第一条消息」（catalog）：用户发第一条消息时（UserPromptSubmit）附上记忆库和技能的目录（memory.catalog）；
     //! - 内置钩子「一轮结束」（organize）：这段会话全部做完 1 秒后，用选的模型（自动：快的）整理还没整理的轮次（memory.organize）——
-    //!   记下 / 改掉 / 忘掉记忆，记经验，建 / 改技能（标「试用」）；没整理成的试 3 次；
+    //!   记下 / 改掉 / 忘掉记忆，记经验（同 Friday v2.91 起不再建 / 改技能）；没整理成的试 3 次；
     //! - 判定：一段对话交付后 12 小时没再说话，判一次（memory.judge）：几件事、追问几次（判过的段就是提示词版本的指标）；用过的记忆、技能记成败，
     //!   对不上的改掉、忘掉，试用的技能帮上了转正、带偏了移到回收站；写了「怎样算做好」的收成评测题；判完看要不要自动回滚提示词；
     //!   追问比平时多、90 天没用上的自动学的记忆归档，自动建的技能移到回收站；
@@ -22864,40 +22864,6 @@ mod learn {
             )
         }
 
-        fn name_problem(name: &str) -> Option<String> {
-            if name.is_empty() {
-                return Some("技能名不能是空的".into());
-            }
-            if name.chars().count() > 64 {
-                return Some("技能名太长".into());
-            }
-            name.chars().any(|c| "/\\:*?\"<>|".contains(c) || c.is_control()).then(|| format!("技能名「{name}」里有不能用的字符"))
-        }
-
-        /// 整理建 / 改的技能：新的标试用；用户写的、别处来的不改。回说明和是不是新建的
-        pub fn save_auto(name: &str, description: &str, content: &str) -> Result<(String, bool), String> {
-            let name = name.trim();
-            if let Some(problem) = name_problem(name) {
-                return Err(problem);
-            }
-            if content.trim().is_empty() {
-                return Err("技能的内容是空的".into());
-            }
-            if let Some(existing) = find(name) {
-                if !existing.auto {
-                    return Err(format!("「{}」是用户自己的技能，自动整理不改它", existing.name));
-                }
-                let description = if description.trim().is_empty() { existing.description.clone() } else { description.to_string() };
-                std::fs::write(&existing.file, compose(&existing.name, &description, content, existing.trial))
-                    .map_err(|error| error.to_string())?;
-                return Ok((format!("改了技能「{}」", existing.name), false));
-            }
-            let file = root().join(name).join("SKILL.md");
-            std::fs::create_dir_all(file.parent().unwrap_or(&file)).map_err(|error| error.to_string())?;
-            std::fs::write(&file, compose(name, description, content, true)).map_err(|error| error.to_string())?;
-            Ok((format!("建了技能「{name}」（试用）"), true))
-        }
-
         /// 试用的帮上了：转正
         pub fn promote(name: &str) -> bool {
             let Some(skill) = find(name).filter(|skill| skill.trial) else { return false };
@@ -22935,8 +22901,8 @@ mod learn {
                 "eventTitle": "用户发消息", "usesModel": false, "model": "", "enabled": hook_enabled("catalog"),
             },
             {
-                "key": "organize", "title": "一轮结束：整理记忆、经验和技能",
-                "detail": "用户说一句话、智能体（含子智能体）全部做完之后，用选的模型在后台看一遍这一轮：记下新的偏好、事实、纠正和经验，改掉、忘掉记错的；有一套以后还会再做的做法就建成技能（标「试用」，帮上了转正，带偏了或 90 天没用上移到回收站）。",
+                "key": "organize", "title": "一轮结束：整理记忆和经验",
+                "detail": "用户说一句话、智能体（含子智能体）全部做完之后，用选的模型在后台看一遍这一轮：记下新的偏好、事实、纠正和经验，改掉、忘掉记错的（v2.91 起不再建技能）。",
                 "eventTitle": "一轮结束", "usesModel": true, "model": organize_model(), "enabled": hook_enabled("organize"),
             },
         ])
@@ -23438,22 +23404,13 @@ mod learn {
                 related.push(item);
             }
         }
-        let mut names = HashSet::new();
-        let mut skill_lines = Vec::new();
-        let used_skills: Vec<skills::Skill> =
-            turns.iter().flat_map(|turn| strings(turn, "skills")).filter_map(|name| skills::find(&name)).collect();
-        for skill in used_skills.into_iter().chain(skills::search(&said, 5)) {
-            if names.insert(skill.name.clone()) {
-                skill_lines.push(skills::line(&skill));
-            }
-        }
+        // 同 Friday v2.91：只整理记忆，不再给它看技能、不再建技能（用户 2026-10-29）
         let none = || "（没有）".to_string();
         let request = prompt(
             "memory.organize",
             &[
                 ("transcript", transcript(&asks, true, 1200, 1500)),
                 ("memories", if related.is_empty() { none() } else { book::render(&related) }),
-                ("skills", if skill_lines.is_empty() { none() } else { skill_lines.join("\n") }),
                 ("project", if project.is_empty() { "（没有项目）".into() } else { project.clone() }),
             ],
         );
@@ -23490,7 +23447,7 @@ mod learn {
         }
     }
 
-    /// 按整理的结果改：记下 / 改掉 / 忘掉记忆，记经验，建 / 改技能。回说明（一行一条）
+    /// 按整理的结果改：记下 / 改掉 / 忘掉记忆，记经验（同 Friday v2.91 起不再建 / 改技能）。回说明（一行一条）
     pub fn apply_organize(changes: &Map<String, Value>, project: &str) -> Vec<String> {
         let mut notes = Vec::new();
         for id in changes.get("forget").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
@@ -23524,20 +23481,7 @@ mod learn {
                 notes.push(format!("记下了经验：{words}"));
             }
         }
-        let skill = changes.get("skill").cloned().unwrap_or_default();
-        let action = text(&skill, "action").trim().to_lowercase();
-        let name = text(&skill, "name").trim().to_string();
-        if (action == "create" || action == "update") && !name.is_empty() {
-            match skills::save_auto(&name, text(&skill, "description"), text(&skill, "content")) {
-                Ok((note, created)) => {
-                    if created {
-                        with(|store| store["skills"][&name] = json!({ "uses": 0, "wins": 0, "losses": 0, "createdAt": stamp() }));
-                    }
-                    notes.push(note);
-                }
-                Err(error) => crate::serve_log("learn", &format!("没建成技能「{name}」：{error}")),
-            }
-        }
+        // 同 Friday v2.91：回的 skill 不再管，只整理记忆
         notes
     }
 
