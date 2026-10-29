@@ -81,7 +81,11 @@ impl Client {
     }
 
     fn reply(&mut self, id: u64) -> Value {
-        self.wait_for(30, &format!("请求 {id} 的回话"), |message| message["id"] == id && message.get("method").is_none())
+        self.reply_within(30, id)
+    }
+
+    fn reply_within(&mut self, seconds: u64, id: u64) -> Value {
+        self.wait_for(seconds, &format!("请求 {id} 的回话"), |message| message["id"] == id && message.get("method").is_none())
     }
 
     fn request(&mut self, method: &str, params: Value) -> Value {
@@ -98,8 +102,12 @@ impl Client {
         self.backlog.clear();
     }
 
-    fn event(&mut self, method: &str, mut wanted: impl FnMut(&Value) -> bool) -> Value {
-        self.wait_for(15, method, |message| message["method"] == method && wanted(&message["params"]))
+    fn event(&mut self, method: &str, wanted: impl FnMut(&Value) -> bool) -> Value {
+        self.event_within(15, method, wanted)
+    }
+
+    fn event_within(&mut self, seconds: u64, method: &str, mut wanted: impl FnMut(&Value) -> bool) -> Value {
+        self.wait_for(seconds, method, |message| message["method"] == method && wanted(&message["params"]))
     }
 }
 
@@ -1142,11 +1150,12 @@ fn terminals_live_in_the_resident_part() {
     assert!(client.reply(open).get("error").is_none());
     let listed = client.event("terminals", |params| params["terminals"].as_array().unwrap().len() == 1);
     assert_eq!(listed["params"]["terminals"][0]["conversationID"], json!(SESSION.to_uppercase()));
-    // 开它的网关收输出（原样的 base64）
+    // 开它的网关收输出（原样的 base64）。Windows 上伪终端里起 PowerShell 慢（CI 的 windows-x64 / x86 上忙时 15 秒还没输出）：多等
     let mut seen = String::new();
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let wait = if cfg!(windows) { 60 } else { 15 };
+    let deadline = Instant::now() + Duration::from_secs(wait);
     while !seen.contains("edith-42") && Instant::now() < deadline {
-        let output = client.event("term.output", |params| params["id"] == "T1");
+        let output = client.event_within(wait, "term.output", |params| params["id"] == "T1");
         let bytes = base64::engine::general_purpose::STANDARD.decode(output["params"]["data"].as_str().unwrap()).unwrap();
         seen.push_str(&String::from_utf8_lossy(&bytes));
     }
@@ -1349,14 +1358,15 @@ fn browser_tabs_live_in_the_resident_part() {
     let hello = client.reply(hello)["result"].clone();
     let state = &hello["state"]["browser"];
     let open = client.send("browser.open", json!({ "conversationID": SESSION, "url": "about:blank" }));
-    let opened = client.reply(open);
+    // 头一回起浏览器：网关最多等 60 秒（Windows 上等端口文件最多 40 秒）
+    let opened = client.reply_within(70, open);
     if state["available"] != true {
         // 这台没有浏览器：说清楚怎么装
         assert!(state["reason"].as_str().is_some_and(|reason| !reason.is_empty()), "{state}");
         assert!(opened.get("error").is_some(), "{opened}");
         return;
     }
-    let tab = opened["result"]["tab"].as_str().expect("没开出标签").to_string();
+    let tab = opened["result"]["tab"].as_str().unwrap_or_else(|| panic!("没开出标签：{opened}")).to_string();
     let listed = client.event("browser", |params| params["tabs"].as_array().unwrap().iter().any(|item| item["id"] == json!(tab)));
     let item = listed["params"]["tabs"].as_array().unwrap().iter().find(|item| item["id"] == json!(tab)).unwrap().clone();
     assert_eq!(item["conversationID"], json!(SESSION.to_uppercase()));

@@ -34438,8 +34438,9 @@ mod browser {
             .spawn()
             .map_err(|error| format!("起不来浏览器（{}）：{error}", program.display()))?;
         *BROWSER.process.lock().unwrap() = Some(child);
-        // 等端口文件出来（最多 15 秒）再连
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        // 等端口文件出来再连：最多 40 秒（新建的配置目录头一回起 Chrome 要初始化，CI 的 windows-x64 上忙时 15 秒不够；
+        // 网关那头的 browser.open 等 60 秒）
+        let deadline = std::time::Instant::now() + Duration::from_secs(40);
         let lines = loop {
             let lines: Vec<String> = std::fs::read_to_string(&port_file)
                 .unwrap_or_default()
