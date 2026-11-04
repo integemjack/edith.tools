@@ -90,8 +90,12 @@ Friday 客户端 ──SSH──▶ edith-friday --attach（一条连接一个�
   （「插件名-服务名」，带 `fridayPlugin` 标记）——停用、卸载时撤掉。插件的脚本工具只读。
 - **能力提供方**（`capabilities.*`）：装好的本地语音是「听录音、说话」的提供方，friday-diffusion 是「生图、生视频」的；智能体的 `transcribe_audio` / `speak` /
   `generate_image` / `generate_video` / `check_job` 是常驻那份的动作（有开着的提供方才给；生视频是异步任务，check_job 取回）。设置页能开关、关掉一项、改名、看任务。
-  结果存在 `~/.edith/friday/media/`。在线服务接入时它的看图 / 生图 / 听录音这些也是提供方（照 Friday 的在线提供方发请求）；提供方包（`.fridayprovider`，
-  脚本提供方）导入、导出、重测、删，脚本照 Friday 的格式跑。
+  结果存在 `~/.edith/friday/media/`。提供方包（`.fridayprovider`，脚本提供方）导入、导出、重测、删，脚本照 Friday 的格式跑。
+  - **工具选模型**（0.14，同 Friday v2.96）：看图 / 看视频 / 生图 / 生视频 / 说话 / 听录音在 设置 › 工具 里直接选已添加服务里的模型
+    （`capabilities.state` 的 `toolModels`，`capabilities.setModel` / `refreshModels`，选的记在 `~/.edith/friday/tool-models.json`）。
+    看图用标了 `supportsVision` 的对话模型直接发图；生图等按服务的模型列表（`/models`，带发布时间，存 `service-models.json`）按名字认。
+    没选是自动：本地提供方优先，再挑默认对话模型那家的、名字带 flash 的、发布最新的。在线服务的条目只当连接（接口地址、密钥名），
+    不再写死模型（旧的启动时去掉）；某个模型报余额不足 / 没权限 / 不存在只记下它、自动挑时跳过，不停掉整家服务。
 - **在线服务商**（`services.*`，设置 › 服务与密钥）：服务目录同 Friday，一个密钥一家服务；接入时对话模型进 EDITH 的 `config.json`、别的进能力提供方，
   同一家第二个账号是「id#n」、密钥名 X_n，不在目录里的 OpenAI 兼容服务认成 custom-…；拉模型列表（`/models`），余额和套餐用量按接口地址认
   （DeepSeek、Kimi、硅基流动、OpenRouter、智谱 / Z.ai、MiniMax、one-api / new-api 中转）。

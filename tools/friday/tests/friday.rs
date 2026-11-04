@@ -1378,3 +1378,176 @@ fn browser_tabs_live_in_the_resident_part() {
     drop(client);
     assert!(edith_tools_support::wait_until(15, || !home.join("friday").join("serve.json").exists()), "常驻的那份没退");
 }
+
+/// 假服务收到的请求（路径、正文）
+type RequestLog = std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>;
+
+/// 假的 OpenAI 兼容服务：/models 带发布时间、看图回一句、生图回一张图；记下每个请求
+fn fake_service() -> (String, RequestLog) {
+    use base64::Engine as _;
+    use std::io::Read;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://127.0.0.1:{}/v1", listener.local_addr().unwrap().port());
+    let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = log.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().map_while(Result::ok) {
+            let mut stream = stream;
+            let mut data = Vec::new();
+            let mut buffer = [0u8; 8192];
+            let (head, mut body) = loop {
+                let count = stream.read(&mut buffer).unwrap_or(0);
+                if count == 0 {
+                    break (String::from_utf8_lossy(&data).into_owned(), Vec::new());
+                }
+                data.extend_from_slice(&buffer[..count]);
+                if let Some(end) = data.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break (String::from_utf8_lossy(&data[..end]).into_owned(), data[end + 4..].to_vec());
+                }
+            };
+            let length = head
+                .lines()
+                .find_map(|line| {
+                    line.to_lowercase().strip_prefix("content-length:").map(|value| value.trim().parse::<usize>().unwrap_or(0))
+                })
+                .unwrap_or(0);
+            while body.len() < length {
+                let count = stream.read(&mut buffer).unwrap_or(0);
+                if count == 0 {
+                    break;
+                }
+                body.extend_from_slice(&buffer[..count]);
+            }
+            let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+            seen.lock().unwrap().push((path.clone(), serde_json::from_slice(&body).unwrap_or(Value::Null)));
+            let png: &[u8] = &[
+                137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 31, 21, 196, 137, 0,
+                0, 0, 13, 73, 68, 65, 84, 120, 218, 99, 252, 207, 192, 80, 15, 0, 4, 133, 1, 128, 132, 169, 140, 33, 0, 0, 0, 0, 73, 69,
+                78, 68, 174, 66, 96, 130,
+            ];
+            let reply = match path.as_str() {
+                "/v1/models" => json!({ "data": [
+                    { "id": "gw-vl-flash", "created": 200 }, { "id": "gw-image-old", "created": 100 },
+                    { "id": "gw-image-new", "created": 300 }, { "id": "gw-chat" },
+                ] }),
+                "/v1/chat/completions" => json!({ "choices": [{ "message": { "role": "assistant", "content": "图里是一只猫" } }] }),
+                "/v1/images/generations" => json!({ "data": [{ "b64_json": base64::engine::general_purpose::STANDARD.encode(png) }] }),
+                _ => json!({ "error": { "message": "no such path" } }),
+            }
+            .to_string();
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+        }
+    });
+    (base, log)
+}
+
+/// v2.96 工具选模型（同 Friday）：在线服务的条目不再写死模型（旧的去掉）；看图用能看图的对话模型直接看，
+/// 生图按服务的模型列表自动挑最新的，设置里选了就用选的；设置页的状态带 toolModels
+#[test]
+fn tool_models_pick_from_services() {
+    let home = scratch("friday-tool-models");
+    let work = home.join("work");
+    std::fs::create_dir_all(work.join(".git")).unwrap();
+    write_session(&home, &work);
+    let (base, log) = fake_service();
+    let engine = json!({ "id": "fake-vl", "title": "假服务", "baseURL": base, "model": "gw-vl-flash", "apiKeySecret": "FAKE_KEY", "supportsVision": true });
+    std::fs::write(home.join("config.json"), json!({ "engines": [engine], "defaultEngine": "fake-vl" }).to_string()).unwrap();
+    std::fs::write(home.join("secrets.json"), json!({ "FAKE_KEY": "k" }).to_string()).unwrap();
+    std::fs::create_dir_all(home.join("friday")).unwrap();
+    let connection = json!({ "id": "openaicompatible", "type": "openAICompatible", "title": "假服务", "enabled": true,
+        "options": { "baseURL": base, "apiKeySecret": "FAKE_KEY", "imageModel": "old-hardcoded", "visionModel": "gpt-4o-mini" } });
+    std::fs::write(home.join("friday").join("capabilities.json"), json!({ "entries": [connection] }).to_string()).unwrap();
+    let image = work.join("cat.png");
+    std::fs::write(
+        &image,
+        base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let brain = FakeBrain::new();
+    register(&home, &brain, &work);
+    let mut client = Client::start_with(&home, &work, &[("EDITH_FRIDAY_HUB_IDLE", "2"), ("NO_PROXY", "*"), ("no_proxy", "*")]);
+    let hello = client.send("hello", json!({ "protocol": 1 }));
+    let (mut gateway, mut resident) = (None, None);
+    for _ in 0..2 {
+        let mut link = brain.accept(15).expect("少了一条连接");
+        let reply = link.handshake(json!({ "name": "EDITH", "version": "test" }));
+        match reply["name"].as_str() {
+            Some("friday-client") => gateway = Some(link),
+            Some("friday") => resident = Some((link, reply)),
+            other => panic!("不认识的连接 {other:?}：{reply}"),
+        }
+    }
+    let (mut gateway, (mut resident, info)) = (gateway.unwrap(), resident.unwrap());
+    let actions: Vec<&str> = info["actions"].as_array().unwrap().iter().filter_map(|action| action["name"].as_str()).collect();
+    // 生图：模型列表还没拉到也先给（调用时现拉）
+    assert!(actions.contains(&"analyze_image") && actions.contains(&"generate_image"), "{actions:?}");
+    let list = gateway.wait_for(10, |message| message["method"] == "sessions.list").unwrap();
+    reply(&mut gateway, &list, json!([]));
+    let agents = gateway.wait_for(10, |message| message["method"] == "agents.list").unwrap();
+    reply(&mut gateway, &agents, json!([]));
+    assert!(client.reply(hello).get("error").is_none());
+
+    // 旧版本写死的模型去掉了
+    let saved = std::fs::read_to_string(home.join("friday").join("capabilities.json")).unwrap();
+    assert!(!saved.contains("old-hardcoded") && !saved.contains("gpt-4o-mini"), "{saved}");
+    // 设置页：看图是能看图的对话模型，生图等模型列表拉到后自动挑最新的
+    let mut models = Value::Null;
+    assert!(
+        edith_tools_support::wait_until(20, || {
+            models = client.request("capabilities.state", json!({}))["toolModels"].clone();
+            models.as_array().is_some_and(|list| {
+                list.iter().any(|item| item["kind"] == "imageGeneration" && item["candidates"].as_array().is_some_and(|all| all.len() == 2))
+            })
+        }),
+        "{models}"
+    );
+    let state = |kind: &str| models.as_array().unwrap().iter().find(|item| item["kind"] == kind).cloned().unwrap();
+    assert_eq!(state("vision")["current"]["id"], "engine:fake-vl", "{models}");
+    assert_eq!(state("vision")["current"]["label"], "假服务 · gw-vl-flash", "{models}");
+    assert_eq!(state("imageGeneration")["current"]["id"], "openaicompatible|gw-image-new", "{models}");
+    assert_eq!(state("imageGeneration")["choice"], "", "{models}");
+    // 说话 / 听录音：列表里没认出这类模型，说清楚
+    assert!(
+        state("speech")["current"].is_null() && state("speech")["note"].as_str().is_some_and(|note| note.contains("没认出")),
+        "{models}"
+    );
+
+    let act = |link: &mut Link, id: i64, action: &str, arguments: Value| {
+        let params = json!({ "call": format!("c{id}"), "action": action, "arguments": arguments, "session": SESSION, "turn": "t0" });
+        link.send(json!({ "jsonrpc": "2.0", "id": id, "method": "act", "params": params }));
+        link.wait_for(60, |message| message["id"] == id).expect("动作没回")["result"].clone()
+    };
+    // 看图：图直接交给对话模型，写明用的是哪个
+    let seen = act(&mut resident, 1, "analyze_image", json!({ "image": image.to_string_lossy(), "question": "图里是什么" }));
+    assert!(
+        seen["text"].as_str().is_some_and(|text| text.contains("图里是一只猫") && text.contains("（用的是 假服务 · gw-vl-flash）")),
+        "{seen}"
+    );
+    let asked = log.lock().unwrap().iter().rev().find(|(path, _)| path == "/v1/chat/completions").cloned().unwrap();
+    assert_eq!(asked.1["model"], "gw-vl-flash");
+    // 生图：自动挑的最新的；设置里选了旧的就用选的
+    let drawn = act(&mut resident, 2, "generate_image", json!({ "prompt": "一只猫" }));
+    assert!(drawn["text"].as_str().is_some_and(|text| text.contains("用的是 假服务 · gw-image-new")), "{drawn}");
+    client.request("capabilities.setModel", json!({ "kind": "imageGeneration", "id": "openaicompatible|gw-image-old" }));
+    let drawn = act(&mut resident, 3, "generate_image", json!({ "prompt": "一只狗" }));
+    assert!(drawn["text"].as_str().is_some_and(|text| text.contains("用的是 假服务 · gw-image-old")), "{drawn}");
+    let models: Vec<Value> =
+        log.lock().unwrap().iter().filter(|(path, _)| path == "/v1/images/generations").map(|(_, body)| body["model"].clone()).collect();
+    assert_eq!(models, vec![json!("gw-image-new"), json!("gw-image-old")]);
+    let chosen = client.request("capabilities.state", json!({}))["toolModels"].clone();
+    let image_state = chosen.as_array().unwrap().iter().find(|item| item["kind"] == "imageGeneration").cloned().unwrap();
+    assert_eq!(
+        (image_state["choice"].clone(), image_state["current"]["id"].clone()),
+        (json!("openaicompatible|gw-image-old"), json!("openaicompatible|gw-image-old"))
+    );
+    let file: Value = serde_json::from_str(&std::fs::read_to_string(home.join("friday").join("tool-models.json")).unwrap()).unwrap();
+    assert_eq!(file["models"]["imageGeneration"], "openaicompatible|gw-image-old", "{file}");
+}

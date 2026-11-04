@@ -14867,13 +14867,7 @@ mod services {
                 Some("ZHIPU_API_KEY"),
                 e("智谱 GLM", "https://open.bigmodel.cn/api/paas/v4", "ZHIPU_API_KEY", "glm-4.5", false, true),
                 Some("openAICompatible"),
-                &[
-                    ("baseURL", "https://open.bigmodel.cn/api/paas/v4"),
-                    ("apiKeySecret", "ZHIPU_API_KEY"),
-                    ("visionModel", "glm-4.5v"),
-                    ("videoUnderstandingModel", "glm-4.5v"),
-                    ("imageModel", "cogview-4-250304"),
-                ],
+                &[("baseURL", "https://open.bigmodel.cn/api/paas/v4"), ("apiKeySecret", "ZHIPU_API_KEY")],
             ),
             service(
                 "qianfan",
@@ -14940,11 +14934,6 @@ mod services {
                 &[
                     ("baseURL", "https://api.siliconflow.cn/v1"),
                     ("apiKeySecret", "SILICONFLOW_API_KEY"),
-                    ("visionModel", "Qwen/Qwen2.5-VL-72B-Instruct"),
-                    ("videoUnderstandingModel", "Qwen/Qwen2.5-VL-72B-Instruct"),
-                    ("imageModel", "Kwai-Kolors/Kolors"),
-                    ("transcriptionModel", "FunAudioLLM/SenseVoiceSmall"),
-                    ("speechModel", "FunAudioLLM/CosyVoice2-0.5B"),
                     ("speechVoice", "FunAudioLLM/CosyVoice2-0.5B:anna"),
                 ],
             ),
@@ -14978,13 +14967,7 @@ mod services {
                 Some("GEMINI_API_KEY"),
                 e("Gemini", "https://generativelanguage.googleapis.com/v1beta/openai", "GEMINI_API_KEY", "gemini-2.5-flash", true, true),
                 Some("openAICompatible"),
-                &[
-                    ("baseURL", "https://generativelanguage.googleapis.com/v1beta/openai"),
-                    ("apiKeySecret", "GEMINI_API_KEY"),
-                    ("visionModel", "gemini-2.5-flash"),
-                    ("videoUnderstandingModel", "gemini-2.5-flash"),
-                    ("imageModel", "imagen-3.0-generate-002"),
-                ],
+                &[("baseURL", "https://generativelanguage.googleapis.com/v1beta/openai"), ("apiKeySecret", "GEMINI_API_KEY")],
             ),
             service(
                 "xai",
@@ -14992,13 +14975,7 @@ mod services {
                 Some("XAI_API_KEY"),
                 e("Grok", "https://api.x.ai/v1", "XAI_API_KEY", "grok-4", true, true),
                 Some("openAICompatible"),
-                &[
-                    ("baseURL", "https://api.x.ai/v1"),
-                    ("apiKeySecret", "XAI_API_KEY"),
-                    ("visionModel", "grok-4"),
-                    ("videoUnderstandingModel", "grok-4"),
-                    ("imageModel", "grok-2-image"),
-                ],
+                &[("baseURL", "https://api.x.ai/v1"), ("apiKeySecret", "XAI_API_KEY")],
             ),
             service(
                 "mistral",
@@ -15006,12 +14983,7 @@ mod services {
                 Some("MISTRAL_API_KEY"),
                 e("Mistral", "https://api.mistral.ai/v1", "MISTRAL_API_KEY", "mistral-large-latest", false, true),
                 Some("openAICompatible"),
-                &[
-                    ("baseURL", "https://api.mistral.ai/v1"),
-                    ("apiKeySecret", "MISTRAL_API_KEY"),
-                    ("visionModel", "pixtral-large-latest"),
-                    ("videoUnderstandingModel", "pixtral-large-latest"),
-                ],
+                &[("baseURL", "https://api.mistral.ai/v1"), ("apiKeySecret", "MISTRAL_API_KEY")],
             ),
             service(
                 "groq",
@@ -15027,13 +14999,7 @@ mod services {
                 Some("TOGETHER_API_KEY"),
                 e("Together", "https://api.together.xyz/v1", "TOGETHER_API_KEY", "meta-llama/Llama-3.3-70B-Instruct-Turbo", false, true),
                 Some("openAICompatible"),
-                &[
-                    ("baseURL", "https://api.together.xyz/v1"),
-                    ("apiKeySecret", "TOGETHER_API_KEY"),
-                    ("visionModel", "meta-llama/Llama-3.2-90B-Vision-Instruct-Turbo"),
-                    ("videoUnderstandingModel", "meta-llama/Llama-3.2-90B-Vision-Instruct-Turbo"),
-                    ("imageModel", "black-forest-labs/FLUX.1-schnell"),
-                ],
+                &[("baseURL", "https://api.together.xyz/v1"), ("apiKeySecret", "TOGETHER_API_KEY")],
             ),
             service(
                 "fireworks",
@@ -15419,6 +15385,7 @@ mod services {
             let options: Map<String, Value> = service.options.iter().map(|(key, value)| (key.clone(), json!(value))).collect();
             crate::caps::add_entry(kind, &service.title, options);
         }
+        crate::caps::refresh_models();
         Ok(())
     }
 
@@ -15546,8 +15513,47 @@ mod services {
         Ok(())
     }
 
+    /// v2.96 能力层用：这台接了的引擎（EDITH config.json 的 engines）
+    pub fn engines() -> Vec<Value> {
+        engine_list()
+    }
+
+    /// 新对话默认的大脑：config.json 的 defaultEngine；没选过、选的关掉了是第一个开着的
+    pub fn default_engine() -> Option<Value> {
+        let list = engine_list();
+        let wanted = config()["defaultEngine"].as_str().map(str::to_string);
+        wanted
+            .and_then(|id| list.iter().find(|engine| engine["id"] == json!(id) && engine["disabled"] != true).cloned())
+            .or_else(|| list.into_iter().find(|engine| engine["disabled"] != true))
+    }
+
+    pub fn engine_secret(engine: &Value) -> Option<String> {
+        secret_of(engine)
+    }
+
+    pub fn secret_value(name: &str) -> Option<String> {
+        secrets()[name].as_str().map(str::to_string)
+    }
+
+    /// 已接入的服务（能力层找「默认对话模型那家」、拉模型列表用）
+    pub fn installed_list() -> Vec<Service> {
+        installed_services()
+    }
+
+    pub fn provider_for(service: &Service) -> Option<Value> {
+        provider_of(service)
+    }
+
     /// 拉 OpenAI 兼容接口的模型列表（GET {baseURL}/models）：自然排序、去重
     pub fn fetch_models(base: &str, key: Option<&str>) -> Result<Vec<String>, String> {
+        let mut ids: Vec<String> = fetch_model_list(base, key)?.into_iter().map(|(id, _)| id).collect();
+        ids.sort_by(|a, b| natural(a, b));
+        ids.dedup();
+        Ok(ids)
+    }
+
+    /// v2.96 模型列表带发布时间（OpenAI 格式的 created，Unix 秒）：工具设置里按它挑「最新」的
+    pub fn fetch_model_list(base: &str, key: Option<&str>) -> Result<Vec<(String, Option<i64>)>, String> {
         let url = crate::capnet::endpoint(base, "models").map_err(|error| error.message)?;
         let mut headers = crate::capnet::bearer(key);
         headers.push(("Accept".into(), "application/json".into()));
@@ -15564,16 +15570,19 @@ mod services {
         } else {
             document["data"].as_array().or_else(|| document["models"].as_array()).cloned().unwrap_or_default()
         };
-        let mut ids: Vec<String> = items
+        let mut seen = HashSet::new();
+        let listed: Vec<(String, Option<i64>)> = items
             .iter()
-            .filter_map(|item| ["id", "name", "model"].iter().find_map(|key| item[*key].as_str()).map(str::to_string))
+            .filter_map(|item| {
+                let id = ["id", "name", "model"].iter().find_map(|key| item[*key].as_str())?.to_string();
+                Some((id, item["created"].as_i64().filter(|created| *created > 0)))
+            })
+            .filter(|(id, _)| seen.insert(id.clone()))
             .collect();
-        if ids.is_empty() {
+        if listed.is_empty() {
             return Err("响应格式不符合预期：返回里没有模型列表，这个接口可能不支持 /models，请手动填模型名".into());
         }
-        ids.sort_by(|a, b| natural(a, b));
-        ids.dedup();
-        Ok(ids)
+        Ok(listed)
     }
 
     /// 不分大小写、数字按数值比（Finder 的排序）
@@ -15705,17 +15714,15 @@ mod services {
                     list.push(engine);
                 }
                 save_engines(list).map_err(|error| (crate::NOT_ALLOWED, error))?;
-                if vision && let Some(first) = models.first() {
-                    let options: Map<String, Value> = [
-                        ("baseURL", base.clone()),
-                        ("apiKeySecret", if secret.is_empty() { "none".to_string() } else { secret.clone() }),
-                        ("visionModel", first.clone()),
-                        ("videoUnderstandingModel", first.clone()),
-                    ]
-                    .into_iter()
-                    .map(|(key, value)| (key.to_string(), json!(value)))
-                    .collect();
+                // v2.96 这家服务的连接：生图、说话等在 设置 › 工具 里按它的模型列表选（看图用能看图的对话模型，不经过它）
+                if !models.is_empty() {
+                    let options: Map<String, Value> =
+                        [("baseURL", base.clone()), ("apiKeySecret", if secret.is_empty() { "none".to_string() } else { secret.clone() })]
+                            .into_iter()
+                            .map(|(key, value)| (key.to_string(), json!(value)))
+                            .collect();
                     crate::caps::add_entry("openAICompatible", &title, options);
+                    crate::caps::refresh_models();
                 }
                 Ok(json!({}))
             }
@@ -17941,8 +17948,11 @@ mod caps {
     //!   密钥在 EDITH 的 secrets.json；
     //! - 脚本提供方（script）：`~/.edith/friday/providers/<id>/` 下的包（智能体用 create_provider 写，或在设置里导入 .fridayprovider）。
     //!
-    //! 智能体看到的是固定的几个工具（analyze_image…、check_job、新能力的工具），是常驻那份的动作；有允许的提供方才给。provider 参数指定用哪家，
-    //! 不填自动选：本机优先，本机不可用再用在线。生视频这类异步任务记在 jobs.json，check_job 查进度、做完取回文件（存在 ~/.edith/friday/media/）。
+    //! 智能体看到的是固定的几个工具（analyze_image…、check_job、新能力的工具），是常驻那份的动作；有能用的模型或提供方才给。
+    //! v2.96（同 Friday 的 CapabilityModels，用户 2026-11-04「能力都是由本地提供的才叫能力」）：内置六项在 设置 › 工具 里直接选已添加服务的模型，
+    //! 默认自动挑（本地提供方优先，再挑默认对话模型那家、名字带 flash、发布最新的）；在线服务的条目只当连接（接口地址、密钥名、音色），不再记模型；
+    //! 看图 / 看视频用能看图的对话模型（EDITH config.json 的 engines）直接发图，生图等按服务的模型列表（service-models.json）认；
+    //! 选的记在 tool-models.json。生视频这类异步任务记在 jobs.json，check_job 查进度、做完取回文件（存在 ~/.edith/friday/media/）。
     //! 存档同 Friday：capabilities.json（entries / scriptEntries / powerEntries）、jobs.json，格式用 friday-core 的 capability_store。
 
     use std::collections::HashMap;
@@ -18129,6 +18139,10 @@ mod caps {
         problems: Vec<String>,
         /// refreshAvailability 的结果：「提供方 id|能力」→ {ready, needs}
         availability: Map<String, Value>,
+        /// v2.96 设置里给每项能力选的模型（tool-models.json 的 models：能力 → 候选 id）
+        choices: Map<String, Value>,
+        /// v2.96 出过「用不了」的错（余额不足、没权限、模型不存在）的候选及原因：自动挑时跳过（这次运行里记着，改了选择就清掉）
+        unusable: HashMap<String, String>,
     }
 
     static REGISTRY: LazyLock<Mutex<Registry>> = LazyLock::new(|| {
@@ -18139,6 +18153,8 @@ mod caps {
             packages: Vec::new(),
             problems: Vec::new(),
             availability: Map::new(),
+            choices: Map::new(),
+            unusable: HashMap::new(),
         })
     });
 
@@ -18236,6 +18252,31 @@ mod caps {
                 .collect(),
             _ => friday_core::capability_store::load_jobs(&jobs_path()),
         };
+        registry.choices = crate::read_json_file(&choices_path())["models"].as_object().cloned().unwrap_or_default();
+        // v2.96 在线服务的条目不再记模型（以前每家写死了默认模型）：去掉，模型在 设置 › 工具 里选
+        let mut migrated = false;
+        for entry in &mut registry.entries {
+            if matches!(kind_of(entry), "power" | "script") {
+                continue;
+            }
+            if let Some(options) = entry["options"].as_object_mut() {
+                for key in MODEL_KEYS {
+                    migrated |= options.remove(key).is_some();
+                }
+            }
+        }
+        if migrated {
+            save(registry);
+        }
+    }
+
+    fn choices_path() -> PathBuf {
+        crate::serve_dir().join("tool-models.json")
+    }
+
+    fn save_choices(registry: &Registry) {
+        let _ = std::fs::create_dir_all(crate::serve_dir());
+        let _ = crate::write_json_file(&choices_path(), &json!({ "models": registry.choices }));
     }
 
     fn save(registry: &Registry) {
@@ -18771,25 +18812,8 @@ mod caps {
             "dashscope" => all6(),
             "volcengineArk" => vec!["vision".into(), "videoUnderstanding".into(), "imageGeneration".into(), "videoGeneration".into()],
             "volcengineSpeech" => vec!["transcription".into(), "speech".into()],
-            "openAICompatible" => {
-                let keys = [
-                    ("visionModel", "vision"),
-                    ("videoUnderstandingModel", "videoUnderstanding"),
-                    ("imageModel", "imageGeneration"),
-                    ("videoModel", "videoGeneration"),
-                    ("transcriptionModel", "transcription"),
-                    ("speechModel", "speech"),
-                ];
-                let mut configured: Vec<&str> =
-                    keys.iter().filter(|(key, _)| !option(entry, key, "").is_empty()).map(|(_, kind)| *kind).collect();
-                if configured.contains(&"vision") && !configured.contains(&"videoUnderstanding") {
-                    configured.push("videoUnderstanding");
-                }
-                if configured.is_empty() {
-                    return all6();
-                }
-                BUILTINS.iter().filter(|kind| configured.contains(&kind.raw)).map(|kind| kind.raw.to_string()).collect()
-            }
+            // v2.96 连接不记模型，哪几项能做看这家的模型列表：都算能做
+            "openAICompatible" => all6(),
             "script" => package_of(entry)
                 .map(|package| {
                     package["manifest"]["capabilities"]
@@ -18844,7 +18868,11 @@ mod caps {
         local
     }
 
+    /// 能力现在对智能体可见：内置六项有能用的模型（或模型列表还在拉），新能力至少有一个允许的提供方
     fn usable(kind: &str) -> bool {
+        if builtin(kind).is_some() {
+            return current(kind).is_some() || !pending_listings(kind).is_empty();
+        }
         !providers(kind, false).is_empty()
     }
 
@@ -18970,6 +18998,18 @@ mod caps {
 
     /// 看图 / 看视频（抽帧后当多张图）。video_list：百炼兼容模式的 {"type":"video","video":[帧…]}
     fn describe(base: &str, key: Option<&str>, model: &str, request: &Request, video_list: bool) -> Result<String, Error> {
+        describe_with(base, key, model, request, video_list, None)
+    }
+
+    /// extra：本机大模型（power://llm）要带的 x_friday
+    fn describe_with(
+        base: &str,
+        key: Option<&str>,
+        model: &str,
+        request: &Request,
+        video_list: bool,
+        extra: Option<Value>,
+    ) -> Result<String, Error> {
         let mut content = Vec::new();
         for input in &request.inputs {
             if request.kind == "videoUnderstanding" {
@@ -18990,7 +19030,10 @@ mod caps {
             request.prompt.clone()
         };
         content.push(json!({ "type": "text", "text": text }));
-        let body = json!({ "model": model, "messages": [{ "role": "user", "content": content }], "max_tokens": 2048 });
+        let mut body = json!({ "model": model, "messages": [{ "role": "user", "content": content }], "max_tokens": 2048 });
+        if let Some(extra) = extra {
+            body["x_friday"] = extra;
+        }
         let object = capnet::json("POST", &capnet::endpoint(base, "chat/completions")?, &capnet::bearer(key), Some(&body), 180)?;
         if let Some(message) = capnet::string_at(&object, "choices.0.message.content") {
             return Ok(message);
@@ -20210,32 +20253,637 @@ mod caps {
         }
     }
 
+    // MARK: 工具选模型（v2.96，同 Friday 的 CapabilityModels）
+
+    /// 后端读模型名的选项键（旧版本写在每家服务的条目里，v2.96 起只在调用时临时填上选中的）
+    const MODEL_KEYS: [&str; 8] = [
+        "visionModel",
+        "videoUnderstandingModel",
+        "imageModel",
+        "imageEditModel",
+        "videoModel",
+        "i2vModel",
+        "transcriptionModel",
+        "speechModel",
+    ];
+
+    /// 看图 / 看视频用能看图的对话模型
+    fn uses_engines(kind: &str) -> bool {
+        kind == "vision" || kind == "videoUnderstanding"
+    }
+
+    fn model_key(kind: &str) -> Option<&'static str> {
+        match kind {
+            "vision" => Some("visionModel"),
+            "videoUnderstanding" => Some("videoUnderstandingModel"),
+            "imageGeneration" => Some("imageModel"),
+            "videoGeneration" => Some("videoModel"),
+            "transcription" => Some("transcriptionModel"),
+            "speech" => Some("speechModel"),
+            _ => None,
+        }
+    }
+
+    /// 名字看起来是做这项能力的模型（按服务的 /models 列表认；看图 / 看视频不靠名字，看对话模型的开关）
+    pub fn serves(model: &str, kind: &str) -> bool {
+        let name = model.to_lowercase();
+        let has = |words: &[&str]| words.iter().any(|word| name.contains(word));
+        if has(&["realtime", "embedding", "rerank"]) {
+            return false;
+        }
+        match kind {
+            "imageGeneration" => {
+                !has(&["video", "t2v", "i2v", "edit"])
+                    && (has(&[
+                        "t2i",
+                        "seedream",
+                        "cogview",
+                        "flux",
+                        "dall-e",
+                        "gpt-image",
+                        "kolors",
+                        "stable-diffusion",
+                        "sdxl",
+                        "imagen",
+                        "wanx",
+                    ]) || (has(&["image"]) && !has(&["-vl", "vision", "understand"])))
+            }
+            "videoGeneration" => {
+                has(&["t2v", "i2v", "seedance", "sora", "cogvideo", "kling", "veo", "hailuo", "vidu"])
+                    || (has(&["video"]) && !has(&["-vl", "vision", "understand"]))
+            }
+            "transcription" => has(&["asr", "transcribe", "whisper", "paraformer", "sensevoice"]),
+            "speech" => has(&["tts", "cosyvoice", "sambert", "speech"]) && !has(&["asr", "transcribe", "to-text"]),
+            _ => false,
+        }
+    }
+
+    /// 名字里的版本号（没有发布时间时比「新」用）：qwen3.8-flash → [3, 8]
+    fn version_numbers(model: &str) -> Vec<u64> {
+        model.split(|c: char| !c.is_ascii_digit()).filter(|part| !part.is_empty()).filter_map(|part| part.parse().ok()).collect()
+    }
+
+    /// 一项能力能选的一个模型（或本地提供方）。id：engine:<引擎 id> / <连接 id>|<模型> / <本地提供方 id>
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct Candidate {
+        id: String,
+        title: String,
+        group: String,
+        local: bool,
+        created: Option<i64>,
+        preferred: bool,
+        automatic: bool,
+    }
+
+    impl Candidate {
+        fn label(&self) -> String {
+            if self.local || self.group == self.title { self.title.clone() } else { format!("{} · {}", self.group, self.title) }
+        }
+
+        fn json(&self) -> Value {
+            json!({ "id": self.id, "title": self.title, "group": self.group, "local": self.local, "created": self.created,
+                "preferred": self.preferred, "automatic": self.automatic, "label": self.label() })
+        }
+    }
+
+    /// 自动挑的先后：本地 → 默认对话模型那家 → 名字带 flash → 发布时间新 → 版本号大 → 名字
+    fn auto_order(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
+        let flash = |candidate: &Candidate| candidate.title.to_lowercase().contains("flash");
+        b.local
+            .cmp(&a.local)
+            .then(b.preferred.cmp(&a.preferred))
+            .then_with(|| flash(b).cmp(&flash(a)))
+            .then_with(|| b.created.unwrap_or(0).cmp(&a.created.unwrap_or(0)))
+            .then_with(|| version_numbers(&b.title).cmp(&version_numbers(&a.title)))
+            .then_with(|| a.title.cmp(&b.title))
+    }
+
+    /// 在线服务的连接（不是本地提供方的条目）
+    fn connections() -> Vec<Value> {
+        entries().into_iter().filter(|entry| !matches!(kind_of(entry), "power" | "script")).collect()
+    }
+
+    fn local_entries() -> Vec<Value> {
+        entries().into_iter().filter(|entry| matches!(kind_of(entry), "power" | "script")).collect()
+    }
+
+    fn has_keys(entry: &Value) -> bool {
+        let secrets = secrets_of(entry);
+        secret_names(entry).iter().all(|name| secrets.contains_key(name))
+    }
+
+    fn choice_of(kind: &str) -> Option<String> {
+        with(|registry| registry.choices.get(kind).and_then(Value::as_str).map(str::to_string)).filter(|id| !id.is_empty())
+    }
+
+    // 已添加服务的模型列表（service-models.json：「接口地址|密钥名」→ {models: [{id, created}], fetched}）；拉到的 6 小时内不重拉，拉不到的 10 分钟内不重试
+
+    struct Listings {
+        loaded: bool,
+        map: Map<String, Value>,
+        fetching: std::collections::HashSet<String>,
+        attempted: HashMap<String, std::time::Instant>,
+    }
+
+    static LISTINGS: LazyLock<Mutex<Listings>> =
+        LazyLock::new(|| Mutex::new(Listings { loaded: false, map: Map::new(), fetching: Default::default(), attempted: HashMap::new() }));
+
+    fn listings_path() -> PathBuf {
+        crate::serve_dir().join("service-models.json")
+    }
+
+    fn listing_key(base: &str, secret: Option<&str>) -> String {
+        format!("{}|{}", base.trim().to_lowercase().trim_end_matches('/'), secret.unwrap_or(""))
+    }
+
+    fn with_listings<T>(change: impl FnOnce(&mut Listings) -> T) -> T {
+        let mut listings = LISTINGS.lock().unwrap();
+        if !listings.loaded {
+            listings.loaded = true;
+            listings.map = crate::read_json_file(&listings_path()).as_object().cloned().unwrap_or_default();
+        }
+        change(&mut listings)
+    }
+
+    fn listing(base: &str, secret: Option<&str>) -> Option<Vec<(String, Option<i64>)>> {
+        let key = listing_key(base, secret);
+        with_listings(|listings| {
+            listings.map.get(&key).map(|item| {
+                item["models"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|model| Some((model["id"].as_str()?.to_string(), model["created"].as_i64())))
+                    .collect()
+            })
+        })
+    }
+
+    fn remember_listing(base: &str, secret: Option<&str>, models: &[(String, Option<i64>)]) {
+        let key = listing_key(base, secret);
+        let models: Vec<Value> = models.iter().map(|(id, created)| json!({ "id": id, "created": created })).collect();
+        with_listings(|listings| {
+            listings.map.insert(key, json!({ "models": models, "fetched": now() }));
+            let _ = std::fs::create_dir_all(crate::serve_dir());
+            let _ = crate::write_json_file(&listings_path(), &Value::Object(listings.map.clone()));
+        });
+        changed();
+    }
+
+    /// 现在就拉（阻塞）：调用能力时这家的列表还没有（刚装、刚升级）用它
+    fn fetch_listing_now(base: &str, secret: Option<&str>) -> bool {
+        let key = secret.and_then(crate::services::secret_value);
+        match crate::services::fetch_model_list(base, key.as_deref()) {
+            Ok(models) => {
+                remember_listing(base, secret, &models);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// 在后台拉一次（拉过的 6 小时内、正在拉、10 分钟内失败过的跳过；force 不管拉过没有）
+    fn refresh_listing(base: &str, secret: Option<&str>, force: bool) {
+        if base.is_empty() || base.starts_with("power://") {
+            return;
+        }
+        let key = listing_key(base, secret);
+        let go = with_listings(|listings| {
+            if listings.fetching.contains(&key) {
+                return false;
+            }
+            let fresh = listings.map.get(&key).and_then(|item| item["fetched"].as_str()).is_some_and(|fetched| {
+                chrono::DateTime::parse_from_rfc3339(fetched).is_ok_and(|at| chrono::Utc::now().signed_duration_since(at).num_hours() < 6)
+            });
+            if !force && fresh {
+                return false;
+            }
+            if listings.attempted.get(&key).is_some_and(|at| at.elapsed() < Duration::from_secs(600)) {
+                return false;
+            }
+            listings.fetching.insert(key.clone());
+            listings.attempted.insert(key.clone(), std::time::Instant::now());
+            true
+        });
+        if !go {
+            return;
+        }
+        let (base, secret) = (base.to_string(), secret.map(str::to_string));
+        std::thread::spawn(move || {
+            fetch_listing_now(&base, secret.as_deref());
+            with_listings(|listings| listings.fetching.remove(&key));
+        });
+    }
+
+    /// 拉一遍已添加服务的模型列表（连接的、能看图的对话模型所在的接口）
+    fn refresh_service_models(force: bool) {
+        for connection in connections() {
+            if enabled(&connection)
+                && let Some((base, secret)) = listing_source(&connection)
+            {
+                refresh_listing(&base, secret.as_deref(), force);
+            }
+        }
+        for engine in crate::services::engines() {
+            if engine["supportsVision"] == true && engine["disabled"] != true {
+                refresh_listing(&text_of(&engine, "baseURL"), crate::services::engine_secret(&engine).as_deref(), force);
+            }
+        }
+    }
+
+    /// 这条连接是哪家已添加的服务
+    fn service_for(connection: &Value) -> Option<crate::services::Service> {
+        crate::services::installed_list()
+            .into_iter()
+            .find(|service| crate::services::provider_for(service).is_some_and(|provider| provider["id"] == connection["id"]))
+    }
+
+    /// 拉这条连接的模型列表用的地址和密钥名：这家有对话模型就用它们的接口地址，没有按后端的默认地址；豆包语音没有模型列表
+    fn listing_source(connection: &Value) -> Option<(String, Option<String>)> {
+        let secret = secret_names(connection).into_iter().next();
+        if let Some(service) = service_for(connection)
+            && let Some(engine) = crate::services::engines_of(&service, &crate::services::engines()).first()
+        {
+            return Some((text_of(engine, "baseURL"), secret));
+        }
+        match kind_of(connection) {
+            "dashscope" => Some((format!("{}/compatible-mode/v1", dashscope_base(connection, &secrets_of(connection))), secret)),
+            "openAICompatible" => Some((option(connection, "baseURL", "https://api.openai.com/v1"), secret)),
+            "volcengineArk" => Some((option(connection, "baseURL", "https://ark.cn-beijing.volces.com/api/v3"), secret)),
+            _ => None,
+        }
+    }
+
+    /// 默认对话模型那家：它的引擎和连接
+    fn preferred_service() -> (std::collections::HashSet<String>, Option<String>) {
+        let Some(engine) = crate::services::default_engine() else { return (Default::default(), None) };
+        let list = crate::services::engines();
+        for service in crate::services::installed_list() {
+            let members = crate::services::engines_of(&service, &list);
+            if members.iter().any(|member| member["id"] == engine["id"]) {
+                let ids = members.iter().map(|member| text_of(member, "id")).collect();
+                return (ids, crate::services::provider_for(&service).map(|provider| text_of(&provider, "id")));
+            }
+        }
+        (std::iter::once(text_of(&engine, "id")).collect(), None)
+    }
+
+    /// 能做这项、但模型列表还没拉到的服务（刚装、刚升级）：工具先给，调用时现拉
+    fn pending_listings(kind: &str) -> Vec<(String, Option<String>)> {
+        if uses_engines(kind) {
+            return Vec::new();
+        }
+        connections()
+            .iter()
+            .filter(|connection| enabled(connection) && allows(connection, kind) && supports(connection, kind) && has_keys(connection))
+            .filter_map(listing_source)
+            .filter(|(base, secret)| listing(base, secret.as_deref()).is_none())
+            .collect()
+    }
+
+    /// 一项能力能选的全部（本地提供方在前）
+    fn candidates(kind: &str) -> Vec<Candidate> {
+        let mut result: Vec<Candidate> = local_entries()
+            .iter()
+            .filter(|entry| enabled(entry) && allows(entry, kind) && supports(entry, kind))
+            .map(|entry| Candidate {
+                id: text_of(entry, "id"),
+                title: text_of(entry, "title"),
+                group: "本机".into(),
+                local: true,
+                created: None,
+                preferred: false,
+                automatic: true,
+            })
+            .collect();
+        let (preferred_engines, preferred_connection) = preferred_service();
+        if uses_engines(kind) {
+            for engine in crate::services::engines() {
+                if engine["supportsVision"] != true || engine["disabled"] == true {
+                    continue;
+                }
+                let secret = crate::services::engine_secret(&engine);
+                if secret.as_deref().is_some_and(|name| crate::services::secret_value(name).is_none()) {
+                    continue;
+                }
+                let (id, base, model) = (text_of(&engine, "id"), text_of(&engine, "baseURL"), text_of(&engine, "model"));
+                let local = base.starts_with("power://");
+                let created = listing(&base, secret.as_deref())
+                    .and_then(|models| models.into_iter().find(|(name, _)| *name == model).and_then(|(_, at)| at));
+                result.push(Candidate {
+                    id: format!("engine:{id}"),
+                    title: model,
+                    group: if local { "本地模型".into() } else { text_of(&engine, "title") },
+                    local,
+                    created,
+                    preferred: preferred_engines.contains(&id),
+                    automatic: !local,
+                });
+            }
+        } else {
+            for connection in connections() {
+                if !enabled(&connection) || !allows(&connection, kind) || !supports(&connection, kind) || !has_keys(&connection) {
+                    continue;
+                }
+                let (id, group) = (text_of(&connection, "id"), text_of(&connection, "title"));
+                let preferred = preferred_connection.as_deref() == Some(id.as_str());
+                match listing_source(&connection) {
+                    // 豆包语音：没有模型列表，按音色自动选资源
+                    None => result.push(Candidate {
+                        id: format!("{id}|"),
+                        title: group.clone(),
+                        group,
+                        local: false,
+                        created: None,
+                        preferred,
+                        automatic: true,
+                    }),
+                    Some((base, secret)) => {
+                        for (model, created) in listing(&base, secret.as_deref()).unwrap_or_default() {
+                            if serves(&model, kind) {
+                                result.push(Candidate {
+                                    id: format!("{id}|{model}"),
+                                    title: model,
+                                    group: group.clone(),
+                                    local: false,
+                                    created,
+                                    preferred,
+                                    automatic: true,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // 手填的（不在模型列表里）也列出来：连接还在、开着、能做这项就算
+        if let Some(choice) = choice_of(kind)
+            && !uses_engines(kind)
+            && !result.iter().any(|candidate| candidate.id == choice)
+            && let Some((connection_id, model)) = choice.split_once('|')
+            && !model.is_empty()
+            && let Some(connection) = entry(connection_id)
+            && !matches!(kind_of(&connection), "power" | "script")
+            && enabled(&connection)
+            && supports(&connection, kind)
+        {
+            result.push(Candidate {
+                id: choice.clone(),
+                title: model.to_string(),
+                group: text_of(&connection, "title"),
+                local: false,
+                created: None,
+                preferred: false,
+                automatic: false,
+            });
+        }
+        result
+    }
+
+    /// 自动挑的顺序（出过「用不了」的错的排除）
+    fn automatic_order(all: Vec<Candidate>) -> Vec<Candidate> {
+        let unusable = with(|registry| registry.unusable.clone());
+        let mut order: Vec<Candidate> =
+            all.into_iter().filter(|candidate| candidate.automatic && !unusable.contains_key(&candidate.id)).collect();
+        order.sort_by(auto_order);
+        order
+    }
+
+    /// 现在用哪个：设置里选的（还在就用它）；没选或选的不在了按自动的顺序挑第一个没出过错的
+    fn current(kind: &str) -> Option<Candidate> {
+        current_in(kind, candidates(kind))
+    }
+
+    fn current_in(kind: &str, all: Vec<Candidate>) -> Option<Candidate> {
+        if let Some(choice) = choice_of(kind)
+            && let Some(chosen) = all.iter().find(|candidate| candidate.id == choice)
+        {
+            return Some(chosen.clone());
+        }
+        automatic_order(all).into_iter().next()
+    }
+
+    /// 没有能选的模型时怎么办
+    fn no_model_hint(kind: &str) -> String {
+        if !pending_listings(kind).is_empty() {
+            return "还在拉已添加服务的模型列表，拉到了就能选（调用时会先拉一次）".into();
+        }
+        if uses_engines(kind) {
+            return "已添加的服务里没有能看图的模型：到 设置 › 服务与密钥 给某家服务加一个能看图的模型（如名字带 vl、flash 的多模态模型），并在模型设置里打开「看图」".into();
+        }
+        let supporting: Vec<Value> = connections().into_iter().filter(|connection| supports(connection, kind)).collect();
+        let open: Vec<&Value> = supporting.iter().filter(|connection| enabled(connection) && allows(connection, kind)).collect();
+        if !open.is_empty() {
+            if open.iter().any(|connection| has_keys(connection)) {
+                return format!("已添加服务的模型列表里没认出{}模型：可以在下面手填模型名，或到 设置 › 能力 装本地能力", kind_title(kind));
+            }
+            let mut missing: Vec<String> = Vec::new();
+            for connection in &open {
+                let secrets = secrets_of(connection);
+                for name in secret_names(connection) {
+                    if !secrets.contains_key(&name) && !missing.contains(&name) {
+                        missing.push(name);
+                    }
+                }
+            }
+            return format!("缺密钥 {}：让用户在 设置 › 服务与密钥 里添加", missing.join("、"));
+        }
+        if !supporting.is_empty() {
+            return "能做这件事的服务被用户关掉了：请用户到 设置 › 服务与密钥 或 设置 › 工具 里打开".into();
+        }
+        format!("还没有能{}的服务：到 设置 › 服务与密钥 添加（如阿里云百炼），或到 设置 › 能力 装本地能力", kind_title(kind))
+    }
+
+    /// 设置 › 工具 里这一项（同 Friday 的 ToolModelState）
+    fn model_state(kind: &str) -> Value {
+        let all = candidates(kind);
+        let choice = choice_of(kind);
+        let current = current_in(kind, all.clone());
+        let unusable = with(|registry| registry.unusable.clone());
+        let note = if let Some(choice) = &choice
+            && current.as_ref().is_none_or(|current| current.id != *choice)
+        {
+            format!("选的「{}」现在不在了，先按自动的用", choice.replace('|', " · "))
+        } else if let Some(reason) = current.as_ref().and_then(|current| unusable.get(&current.id)) {
+            format!("{} 上次用的时候出错：{reason}", current.as_ref().map(Candidate::label).unwrap_or_default())
+        } else if current.is_none() {
+            no_model_hint(kind)
+        } else {
+            String::new()
+        };
+        let manual: Vec<Value> = if uses_engines(kind) {
+            Vec::new()
+        } else {
+            connections()
+                .iter()
+                .filter(|connection| {
+                    enabled(connection) && supports(connection, kind) && has_keys(connection) && kind_of(connection) != "volcengineSpeech"
+                })
+                .map(|connection| json!({ "id": text_of(connection, "id"), "title": text_of(connection, "title") }))
+                .collect()
+        };
+        json!({
+            "kind": kind, "title": kind_title(kind), "symbol": kind_symbol(kind), "toolName": kind_tool(kind), "detail": kind_detail(kind),
+            "usesEngines": uses_engines(kind), "choice": choice.unwrap_or_default(),
+            "current": current.map(|candidate| candidate.json()).unwrap_or(Value::Null),
+            "candidates": all.iter().map(Candidate::json).collect::<Vec<_>>(), "note": note, "connections": manual,
+        })
+    }
+
+    /// 设置里选模型（空 = 自动）
+    fn set_model(kind: &str, id: &str) {
+        let id = id.trim().to_string();
+        with(|registry| {
+            if id.is_empty() {
+                registry.choices.remove(kind);
+            } else {
+                registry.choices.insert(kind.to_string(), json!(id));
+                registry.unusable.remove(&id);
+            }
+            save_choices(registry);
+        });
+        changed();
+    }
+
+    /// 调用时用的条目：连接的一份副本，只填这次选中的模型
+    fn connection_entry(candidate: &Candidate, kind: &str) -> Option<Value> {
+        let (id, model) = candidate.id.split_once('|')?;
+        let mut chosen = entry(id)?;
+        if !chosen["options"].is_object() {
+            chosen["options"] = json!({});
+        }
+        if let Some(options) = chosen["options"].as_object_mut() {
+            for key in MODEL_KEYS {
+                options.remove(key);
+            }
+        }
+        let Some(key) = model_key(kind).filter(|_| !model.is_empty()) else { return Some(chosen) };
+        chosen["options"][key] = json!(model);
+        // 给了参考图时用的：同一家列表里最新的同类编辑 / 图生视频模型，没有就用选中的这个
+        let listed = listing_source(&chosen).and_then(|(base, secret)| listing(&base, secret.as_deref())).unwrap_or_default();
+        let newest = |matches: &dyn Fn(&str) -> bool| {
+            listed
+                .iter()
+                .filter(|(name, _)| matches(&name.to_lowercase()))
+                .max_by(|a, b| (a.1.unwrap_or(0), &a.0).cmp(&(b.1.unwrap_or(0), &b.0)))
+                .map(|(name, _)| name.clone())
+        };
+        if kind == "imageGeneration" {
+            chosen["options"]["imageEditModel"] =
+                json!(newest(&|name| name.contains("image") && name.contains("edit")).unwrap_or_else(|| model.to_string()));
+        } else if kind == "videoGeneration" {
+            chosen["options"]["i2vModel"] = json!(newest(&|name| name.contains("i2v")).unwrap_or_else(|| model.to_string()));
+        }
+        Some(chosen)
+    }
+
+    /// 这次交给谁：后端（本地提供方，或服务连接 + 选中的模型），或能看图的对话模型（引擎 + 密钥）
+    enum Target {
+        Entry(Value, HashMap<String, String>),
+        Engine(Value, Option<String>),
+    }
+
+    /// 内置六项选模型：智能体指定的（候选 id、本地提供方 id，或服务连接 id 在那家里自动挑）优先；否则设置里选的；
+    /// 再否则按自动的顺序挨个查能不能用，取第一个能用的
+    fn resolved_model(kind: &str, preferred: Option<&str>) -> Result<(Target, Candidate), Error> {
+        // 模型列表还没拉到的（刚装、刚升级）：先现拉一次再挑
+        for (base, secret) in pending_listings(kind) {
+            fetch_listing_now(&base, secret.as_deref());
+        }
+        let title = kind_title(kind);
+        let all = candidates(kind);
+        let order: Vec<Candidate> = if let Some(preferred) = preferred {
+            if let Some(found) = all.iter().find(|candidate| candidate.id == preferred) {
+                vec![found.clone()]
+            } else if let Some(named) = entry(preferred) {
+                if matches!(kind_of(&named), "power" | "script") {
+                    let reason = if !enabled(&named) {
+                        "用户停用了这个提供方（设置 › 工具）".to_string()
+                    } else if !allows(&named, kind) {
+                        format!("用户关掉了它的{title}（设置 › 工具）")
+                    } else {
+                        format!("它不支持{title}")
+                    };
+                    return Err(Error::new(format!("「{title}」的提供方「{}」当前不可用：{reason}", text_of(&named, "title"))));
+                }
+                automatic_order(all.iter().filter(|candidate| candidate.id.starts_with(&format!("{preferred}|"))).cloned().collect())
+            } else {
+                let known: Vec<String> = all.iter().take(10).map(|candidate| candidate.id.clone()).collect();
+                return Err(Error::new(format!(
+                    "没有 {preferred} 这个模型或提供方。{title}能用的：{}；一般不用填 provider",
+                    if known.is_empty() { "无".into() } else { known.join("、") }
+                )));
+            }
+        } else if let Some(chosen) = choice_of(kind).and_then(|choice| all.iter().find(|candidate| candidate.id == choice).cloned()) {
+            vec![chosen]
+        } else {
+            automatic_order(all)
+        };
+        if order.is_empty() {
+            // 能做这项的（看图 / 看视频只看本地提供方，在线的看对话模型）都被用户关掉了
+            let supporting: Vec<Value> = entries()
+                .into_iter()
+                .filter(|entry| (!uses_engines(kind) || matches!(kind_of(entry), "power" | "script")) && supports(entry, kind))
+                .collect();
+            if !supporting.is_empty() && !supporting.iter().any(|entry| enabled(entry) && allows(entry, kind)) {
+                return Err(Error::new(format!(
+                    "能做「{title}」的提供方都被用户在 设置 › 工具 里关掉了，不要绕过；如果确实需要，请告诉用户去打开。"
+                )));
+            }
+            return Err(Error::new(format!("「{title}」能力当前没有可用的提供方。{}", configure_hint(kind))));
+        }
+        let mut reasons = Vec::new();
+        for candidate in &order {
+            let reason = if let Some(engine_id) = candidate.id.strip_prefix("engine:") {
+                match crate::services::engines().into_iter().find(|engine| engine["id"] == json!(engine_id)) {
+                    None => "这个模型已经不在了".to_string(),
+                    Some(engine) => {
+                        let name = crate::services::engine_secret(&engine);
+                        let key = name.as_deref().and_then(crate::services::secret_value);
+                        match (&name, &key) {
+                            (Some(name), None) => format!("缺密钥 {name}"),
+                            _ => return Ok((Target::Engine(engine, key), candidate.clone())),
+                        }
+                    }
+                }
+            } else {
+                let found = if candidate.local { entry(&candidate.id) } else { connection_entry(candidate, kind) };
+                match found {
+                    None => {
+                        if candidate.local {
+                            "这个提供方已经不在了".into()
+                        } else {
+                            "这家服务已经移除了".into()
+                        }
+                    }
+                    Some(chosen) => {
+                        let (ready, needs) = availability(&chosen, kind);
+                        if ready {
+                            let secrets = secrets_of(&chosen);
+                            return Ok((Target::Entry(chosen, secrets), candidate.clone()));
+                        }
+                        needs
+                    }
+                }
+            };
+            if order.len() == 1 {
+                return Err(Error::new(format!("「{title}」的提供方「{}」当前不可用：{reason}", candidate.label())));
+            }
+            reasons.push(format!("{}：{reason}", candidate.label()));
+        }
+        Err(Error::new(format!("「{title}」能力当前没有可用的提供方。能选的都用不了：{}", reasons.join("；"))))
+    }
+
     // MARK: 选、跑
 
     /// 这项能力为什么没法用、还能怎么办（给智能体的）
     fn configure_hint(kind: &str) -> String {
-        let all = providers(kind, true);
-        if all.is_empty() && builtin(kind).is_none() {
-            return format!("还没有能做这件事的提供方。可以用 create_provider 写一个实现「{}」的脚本提供方。", kind_title(kind));
+        if builtin(kind).is_some() {
+            return format!("{}（设置 › 工具 › {}）", no_model_hint(kind), kind_title(kind));
         }
+        let all = providers(kind, true);
         if all.is_empty() {
-            let mut lines = Vec::new();
-            for kind_type in ["dashscope", "openAICompatible", "volcengineArk", "volcengineSpeech"] {
-                let blank = json!({ "type": kind_type, "options": {} });
-                if !kinds_for(&blank).iter().any(|raw| raw == kind) {
-                    continue;
-                }
-                let needed = secret_names(&blank);
-                lines.push(format!(
-                    "- {}{}",
-                    type_title(kind_type),
-                    if needed.is_empty() { String::new() } else { format!("：需要密钥 {}", needed.join("、")) }
-                ));
-            }
-            return format!(
-                "还没有任何能做这件事的提供方。可以接入的在线服务：\n{}\n请用户到 设置 › 服务与密钥 里添加。",
-                lines.join("\n")
-            );
+            return format!("还没有能做这件事的提供方。可以用 create_provider 写一个实现「{}」的脚本提供方。", kind_title(kind));
         }
         let names: Vec<String> = all.iter().map(|entry| format!("{}（id: {}）", text_of(entry, "title"), text_of(entry, "id"))).collect();
         format!(
@@ -20307,6 +20955,7 @@ mod caps {
         match error.status {
             401 => Some("密钥不对或已失效（HTTP 401）".into()),
             403 => Some("没有权限（HTTP 403）".into()),
+            404 if lower.contains("model") => Some("模型不存在（HTTP 404）".into()),
             _ => None,
         }
     }
@@ -20383,43 +21032,106 @@ mod caps {
 
     /// 跑一次：(成没成, 给模型看的, 产出的文件)
     fn run(request: Request) -> (bool, String, Vec<String>) {
+        if builtin(&request.kind).is_some() {
+            return run_model(request);
+        }
         let (chosen, secrets) = match resolved(&request.kind, request.provider.as_deref()) {
             Ok(found) => found,
             Err(error) => return (false, error.message, Vec::new()),
         };
-        let title = text_of(&chosen, "title");
-        let outcome = match perform(&request, &chosen, &secrets) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                // 用不了的提供方（余额不足、密钥不对）：直接停用并说明，免得一次次再试
-                if let Some(reason) = unusable(&error) {
-                    let id = text_of(&chosen, "id");
-                    update_entry(&id, |entry| entry["enabled"] = json!(false));
-                    crate::serve_log("caps", &format!("已停用提供方「{title}」：{reason}（{}）", error.message));
-                    return (
-                        false,
-                        format!(
-                            "「{}」的提供方「{title}」当前不可用：{reason}。已经停用了这个提供方（设置 › 工具），不要再试，也不要换个参数重试（有别的提供方的话，再调用会自动改用）；告诉用户：充值或换好密钥后，到 设置 › 工具 里重新打开它。",
-                            kind_title(&request.kind)
-                        ),
-                        Vec::new(),
-                    );
-                }
-                return (false, error.message, Vec::new());
-            }
+        match perform(&request, &chosen, &secrets) {
+            Ok(outcome) => finish(request, outcome, &text_of(&chosen, "title"), &text_of(&chosen, "id")),
+            Err(error) => match unusable(&error) {
+                Some(reason) => (false, disable_provider(&request.kind, &chosen, &reason, &error), Vec::new()),
+                None => (false, error.message, Vec::new()),
+            },
+        }
+    }
+
+    /// 本地提供方用不了（余额不足、密钥不对）：直接停用并说明，免得一次次再试
+    fn disable_provider(kind: &str, chosen: &Value, reason: &str, error: &Error) -> String {
+        let title = text_of(chosen, "title");
+        update_entry(&text_of(chosen, "id"), |entry| entry["enabled"] = json!(false));
+        crate::serve_log("caps", &format!("已停用提供方「{title}」：{reason}（{}）", error.message));
+        format!(
+            "「{}」的提供方「{title}」当前不可用：{reason}。已经停用了这个提供方（设置 › 工具），不要再试，也不要换个参数重试（有别的提供方的话，再调用会自动改用）；告诉用户：充值或换好密钥后，到 设置 › 工具 里重新打开它。",
+            kind_title(kind)
+        )
+    }
+
+    /// 内置六项：交给选中的模型（能看图的对话模型直接看；其余交给本地提供方，或服务连接的后端带上选中的模型）
+    fn run_model(request: Request) -> (bool, String, Vec<String>) {
+        let (target, candidate) = match resolved_model(&request.kind, request.provider.as_deref()) {
+            Ok(found) => found,
+            Err(error) => return (false, error.message, Vec::new()),
         };
+        let label = candidate.label();
+        let result = match &target {
+            Target::Engine(engine, key) => {
+                engine_describe(engine, key.as_deref(), &request).map(|text| Outcome::Text(format!("{text}\n（用的是 {label}）")))
+            }
+            Target::Entry(chosen, secrets) => perform(&request, chosen, secrets),
+        };
+        let error = match result {
+            Ok(outcome) => {
+                let provider = match &target {
+                    Target::Engine(..) => candidate.id.clone(),
+                    Target::Entry(chosen, _) => text_of(chosen, "id"),
+                };
+                return finish(request, outcome, &label, &provider);
+            }
+            Err(error) => error,
+        };
+        let Some(reason) = unusable(&error) else { return (false, error.message, Vec::new()) };
+        if candidate.local {
+            return match &target {
+                Target::Entry(chosen, _) => (false, disable_provider(&request.kind, chosen, &reason, &error), Vec::new()),
+                Target::Engine(..) => (false, error.message, Vec::new()),
+            };
+        }
+        // 服务里的模型用不了：只记下这个模型（自动挑时跳过它），不停掉整家服务（对话还在用它）
+        let title = kind_title(&request.kind);
+        with(|registry| registry.unusable.insert(candidate.id.clone(), reason.clone()));
+        changed();
+        crate::serve_log("caps", &format!("{title}用的「{label}」用不了：{reason}（{}）", error.message));
+        let advice = if choice_of(&request.kind).as_deref() == Some(candidate.id.as_str()) {
+            format!("。这是用户在 设置 › 工具 › {title} 里选的模型：告诉用户换一个模型，或充值、开通后再试，不要换参数重试")
+        } else if let Some(next) = automatic_order(candidates(&request.kind)).first() {
+            format!("。再调用会自动改用 {}，不要换参数重试同一个", next.label())
+        } else {
+            format!("。没有别的能用的模型了：告诉用户充值、开通，或到 设置 › 工具 › {title} 里换一个")
+        };
+        (false, format!("「{title}」的提供方「{label}」当前不可用：{reason}{advice}"), Vec::new())
+    }
+
+    /// 能看图的对话模型看图 / 看视频（本机的大模型先拿到真地址）
+    fn engine_describe(engine: &Value, key: Option<&str>, request: &Request) -> Result<String, Error> {
+        let (mut base, model) = (text_of(engine, "baseURL"), text_of(engine, "model"));
+        let mut key = key.map(str::to_string);
+        let mut extra = None;
+        if base.starts_with("power://") {
+            let point = crate::models::endpoint(&json!({ "baseURL": base, "model": model })).map_err(Error::new)?;
+            base = text_of(&point, "baseURL");
+            key = Some(text_of(&point, "apiKey")).filter(|key| !key.is_empty());
+            extra = point["body"].get("x_friday").cloned();
+        }
+        describe_with(&base, key.as_deref(), &model, request, false, extra)
+    }
+
+    /// 结果交回去：文字直接给；文件存下来；异步任务记下来（生图等一会儿）。source：用的是哪个，provider：任务记的提供方 id
+    fn finish(request: Request, outcome: Outcome, source: &str, provider: &str) -> (bool, String, Vec<String>) {
         match outcome {
             Outcome::Text(text) => (true, text, Vec::new()),
             Outcome::Files(files, note) => match download(&files, &request) {
                 Ok(saved) => {
                     let note = note.unwrap_or_else(|| format!("已生成 {} 个文件。", saved.len()));
-                    (true, format!("{note}（提供方：{title}）\n{}", saved.join("\n")), saved)
+                    (true, format!("{note}（用的是 {source}）\n{}", saved.join("\n")), saved)
                 }
                 Err(error) => (false, error.message, Vec::new()),
             },
             Outcome::Job(remote, note) => {
                 let id = short_job_id();
-                let mut job = json!({ "id": id, "remoteID": remote, "providerID": chosen["id"], "kind": request.kind, "prompt": request.prompt,
+                let mut job = json!({ "id": id, "remoteID": remote, "providerID": provider, "kind": request.kind, "prompt": request.prompt,
                     "createdAt": now(), "status": "pending", "media": [] });
                 if !request.session.is_empty() {
                     job["conversationID"] = json!(crate::upper(&request.session));
@@ -20452,7 +21164,7 @@ mod caps {
                 (
                     true,
                     format!(
-                        "任务已提交（{title}），任务 ID：{id}。{}通常需要 1–5 分钟，请告诉用户正在生成，稍后用 check_job 查询；不要连续轮询。",
+                        "任务已提交（{source}），任务 ID：{id}。{}通常需要 1–5 分钟，请告诉用户正在生成，稍后用 check_job 查询；不要连续轮询。",
                         note.unwrap_or_default()
                     ),
                     Vec::new(),
@@ -20607,6 +21319,15 @@ mod caps {
 
     /// 可选的提供方（写进工具说明，智能体自己挑）
     fn choices_text(kind: &str) -> String {
+        if builtin(kind).is_some() {
+            return match current(kind) {
+                Some(current) => format!(
+                    "\n现在用：{}（用户在 设置 › 工具 里选的模型，没选是自动挑的；provider 一般不填）",
+                    if current.local { format!("本机 {}", current.title) } else { current.label() }
+                ),
+                None => "\n模型列表还在拉，调用时自动挑".into(),
+            };
+        }
         let options: Vec<String> = providers(kind, false)
             .iter()
             .map(|entry| {
@@ -21046,6 +21767,7 @@ mod caps {
             "optionSpecs": option_specs_map,
             "packageFor": package_for,
             "providersDirectory": providers_root().to_string_lossy(),
+            "toolModels": BUILTINS.iter().map(|kind| model_state(kind.raw)).collect::<Vec<_>>(),
         })
     }
 
@@ -21096,6 +21818,12 @@ mod caps {
         reload_packages();
         sync_powers();
         refresh_availability();
+        refresh_service_models(false);
+    }
+
+    /// 接入服务后：拉一遍新服务的模型列表（设置 › 工具 能选它的模型）
+    pub fn refresh_models() {
+        refresh_service_models(false);
     }
 
     /// capabilities.*（设置 › 工具 › 能力提供方看着这台时）
@@ -21103,8 +21831,16 @@ mod caps {
         let id = || params["id"].as_str().filter(|id| !id.is_empty()).map(str::to_string).ok_or((-32602, "缺少参数 id".to_string()));
         let missing = |id: &str| (crate::NOT_FOUND, format!("没有提供方 {id}"));
         match method {
-            "capabilities.state" => {}
+            "capabilities.state" => refresh_service_models(false),
             "capabilities.refreshAvailability" => refresh_availability(),
+            "capabilities.setModel" => {
+                let kind = params["kind"].as_str().unwrap_or("");
+                if builtin(kind).is_none() {
+                    return Err((-32602, format!("没有这项能力：{kind}")));
+                }
+                set_model(kind, params["id"].as_str().unwrap_or(""));
+            }
+            "capabilities.refreshModels" => refresh_service_models(params["force"].as_bool().unwrap_or(false)),
             "capabilities.setEnabled" => {
                 let id = id()?;
                 let on = params["enabled"].as_bool().unwrap_or(true);
