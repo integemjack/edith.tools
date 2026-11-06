@@ -113,7 +113,7 @@ Friday 客户端 ──SSH──▶ edith-friday --attach（一条连接一个�
   「停」（`voice.interrupt`）停下大脑这一轮；打断之后、合成回「已打断」之前到的音频丢掉。一台同时一路：后开的接过来，原来那一路 `active` 变假、说明被谁接过去。
 - **复盘、内置钩子、自我改进**（同 Friday 的 MemoryLearner / BuiltinHooks / PromptEval / PromptImprover）：常驻那份收着全部会话的事件，每一轮记一条
   （用户说的、提示词版本、停止 / 改了重发 / 重试 / 出错这些信号、读过的技能、查到的记忆、调了哪些工具、回答），存在 `~/.edith/friday/learn.json`。
-  - 内置钩子（`hooks.state` 的 `builtin` / `builtinModels`、`hooks.setBuiltin`，默认都开）：「会话第一条消息」附上记忆库和技能的目录（UserPromptSubmit 补的上下文，
+  - 内置钩子（`hooks.state` 的 `builtin` / `builtinModels`、`hooks.setBuiltin`，默认都开）：「会话第一条消息」附上记忆库和技能的目录，用户的规矩（同 Friday v2.97：用户说的偏好、纠正，带「不许」「不要」这类词，不超过 200 字）不看相关度都带、最新的 12 条排最前、标【必须遵守】，不算这一轮放进去的（UserPromptSubmit 补的上下文，
     界面上不显示）；「一轮结束」这段会话全部做完后，用选的模型（自动：快的）整理——记下 / 改掉 / 忘掉 EDITH 的记忆（`memory.json`，`source: auto:turn`）、
     记经验（同 Friday v2.91 起不再建 / 改技能；以前在 `~/.edith/skills/<名字>/` 自动建的「试用」技能照旧转正或遗忘），没整理成的试 3 次。
   - 整理、判定、评测、改进「自动」挑模型时不挑本机的大模型（`power://`，后台活不该把它拉起来占内存），要用它在设置里选。

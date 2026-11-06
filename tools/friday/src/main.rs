@@ -23693,6 +23693,73 @@ mod learn {
                 .collect()
         }
 
+        /// 目录里带几条规矩（新的在前）
+        const RULE_LIMIT: usize = 12;
+        /// 规矩最长几个字：长篇的踩坑记录也带下面这些词，但不是规矩
+        const RULE_LENGTH: usize = 200;
+        const RULE_WORDS: [&str; 19] = [
+            "不许",
+            "不准",
+            "不得",
+            "禁止",
+            "严禁",
+            "永远不",
+            "绝不",
+            "绝对不",
+            "一律不",
+            "不要",
+            "不能",
+            "别再",
+            "别用",
+            "别碰",
+            "别动",
+            "never",
+            "must not",
+            "do not",
+            "don't",
+        ];
+
+        /// 规矩（同 Friday v2.97 的 MemoryItem::isRule，Friday 仓库 qt/docs/MEMORY.md §2）：用户自己定的一句话禁令——用户说的（save_memory 记的
+        /// said、设置里写的 user）偏好、纠正，带「不许」「不要」这类词。新会话得先知道它才不会踩，不能等搜到：目录里不看相关度都带
+        pub fn is_rule(item: &Value) -> bool {
+            let words = text(item, "text").to_lowercase();
+            matches!(text(item, "source"), "" | "said" | "user")
+                && matches!(text(item, "kind"), "preference" | "correction")
+                && words.chars().count() <= RULE_LENGTH
+                && RULE_WORDS.iter().any(|word| words.contains(word))
+        }
+
+        /// 这个项目的和通用的规矩（在用、不常驻：常驻的本来就给全文），新的在前，最多 RULE_LIMIT 条
+        pub fn pick_rules(all: Vec<Value>, project: &str) -> Vec<Value> {
+            let mut rules: Vec<Value> = all
+                .into_iter()
+                .filter(|item| active(item) && item["pinned"] != json!(true) && is_rule(item))
+                .filter(|item| text(item, "project").is_empty() || project.is_empty() || text(item, "project") == project)
+                .collect();
+            rules.sort_by(|a, b| text(b, "updated_at").cmp(text(a, "updated_at")));
+            rules.truncate(RULE_LIMIT);
+            rules
+        }
+
+        pub fn rules(project: &str) -> Vec<Value> {
+            pick_rules(items(), project)
+        }
+
+        /// 目录里给全文的：同 render，规矩在正文开头标出来
+        pub fn render_catalog(items: &[Value]) -> String {
+            let marked: Vec<Value> = items
+                .iter()
+                .map(|item| {
+                    let mut item = item.clone();
+                    if is_rule(&item) {
+                        item["text"] = json!(format!("【必须遵守】{}", text(&item, "text")));
+                    }
+                    item
+                })
+                .collect();
+            render(&marked)
+        }
+
         /// 自动学的：追问比平时多、90 天没用上的归档（用户写的、常驻的不动）
         pub fn forget_stale(base: f64) -> Vec<String> {
             let mut notes = Vec::new();
@@ -24254,10 +24321,16 @@ mod learn {
             return String::new();
         }
         let project = project_of(session);
+        // 用户的规矩：不看这句话提没提到都带，排最前。不算这一轮放进去的（不记进 used）：
+        // 每段对话都带，这段做得好不好和它无关，算进胜负统计是冤枉它
+        let rules = book::rules(&project);
         let mut full: Vec<Value> = book::pinned(&project);
         let mut more = Vec::new();
         let mut full_count = 0;
         for (item, score) in book::scored(request, &project, false, 0.15) {
+            if rules.iter().any(|rule| text(rule, "id") == text(&item, "id")) {
+                continue;
+            }
             if full_count < 3 && score >= 0.35 {
                 full.push(item);
                 full_count += 1;
@@ -24266,7 +24339,7 @@ mod learn {
             }
         }
         let skills = skills::search(request, 3);
-        if full.is_empty() && more.is_empty() && skills.is_empty() {
+        if full.is_empty() && more.is_empty() && rules.is_empty() && skills.is_empty() {
             return String::new();
         }
         // 给了全文的算这一轮放进去过（判定时看它们有没有用）
@@ -24286,7 +24359,8 @@ mod learn {
         });
         book::used(&ids);
         let none = || "（没有）".to_string();
-        let items = if full.is_empty() { none() } else { book::render(&full) };
+        let shown: Vec<Value> = rules.iter().chain(&full).cloned().collect();
+        let items = if shown.is_empty() { none() } else { book::render_catalog(&shown) };
         let more = if more.is_empty() {
             none()
         } else {
@@ -26255,6 +26329,53 @@ path CLAUDE.md
             let ranked = rank("用什么身份提交", &documents);
             assert_eq!(ranked.first().map(|(index, _)| *index), Some(0));
             assert!(rank("", &documents).is_empty());
+        }
+
+        fn memory(id: &str, kind: &str, source: &str, words: &str) -> Value {
+            json!({ "id": id, "kind": kind, "source": source, "text": words, "project": "", "state": "active", "updated_at": "2026-11-05T00:00:00Z" })
+        }
+
+        #[test]
+        fn rules_are_short_bans_the_user_set() {
+            assert!(book::is_rule(&memory("m1", "preference", "said", "不许使用那台 iMac")));
+            assert!(book::is_rule(&memory("m2", "correction", "said", "ctest 永远不加 -j")));
+            assert!(book::is_rule(&memory("m3", "preference", "user", "Never push to main")));
+            assert!(!book::is_rule(&memory("m4", "preference", "said", "回复用中文")));
+            assert!(!book::is_rule(&memory("m5", "fact", "said", "测试机不能关机")));
+            assert!(!book::is_rule(&memory("m6", "preference", "auto:turn", "提交不要带署名")));
+            assert!(!book::is_rule(&memory("m7", "preference", "said", &format!("{}不要", "长".repeat(200)))));
+        }
+
+        #[test]
+        fn rules_scope_order_limit_and_mark() {
+            let mut all: Vec<Value> = (0..15)
+                .map(|index| {
+                    let mut item = memory(&format!("m{index}"), "preference", "said", &format!("第 {index} 台机器不要碰"));
+                    item["updated_at"] = json!(format!("2026-10-{:02}T00:00:00Z", index + 1));
+                    item
+                })
+                .collect();
+            let picked = book::pick_rules(all.clone(), "");
+            assert_eq!(picked.len(), 12);
+            assert_eq!(picked[0]["id"], "m14");
+
+            all.truncate(1);
+            let mut other = memory("p1", "preference", "said", "这个项目不要用 npm");
+            other["project"] = json!("/work/a");
+            let mut held = memory("h1", "preference", "said", "不要改回全局身份");
+            held["pinned"] = json!(true);
+            let mut gone = memory("g1", "preference", "said", "不要用旧接口");
+            gone["state"] = json!("archived");
+            all.extend([other, held, gone]);
+            assert_eq!(book::pick_rules(all.clone(), "/work/a").len(), 2);
+            assert_eq!(book::pick_rules(all.clone(), "/work/b").len(), 1);
+            assert_eq!(book::pick_rules(all, "").len(), 2);
+
+            let rendered = book::render_catalog(&[
+                memory("m1", "preference", "said", "不许使用那台 iMac"),
+                memory("m2", "fact", "said", "测试机是 mac-mini"),
+            ]);
+            assert_eq!(rendered, "- [偏好] 【必须遵守】不许使用那台 iMac [m1]\n- [事实] 测试机是 mac-mini [m2]");
         }
 
         #[test]

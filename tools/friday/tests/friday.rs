@@ -1275,6 +1275,61 @@ fn agent_terminal_pushes_back() {
 
 /// 常驻的那份连着大脑（在那里是能力「friday」，网关是 friday-client）：报浏览器工具、钩子、resident；
 /// PreToolUse 替自己的动作说怎么批准；做动作
+/// 内置钩子「会话第一条消息」：用户的规矩不看这句话提没提到都带、标出来，不算这一轮放进去的（同 Friday v2.97 的 MemoryStore::rules）
+#[test]
+fn catalog_carries_the_users_rules() {
+    let home = scratch("friday-rules");
+    let work = home.join("work");
+    std::fs::create_dir_all(work.join(".git")).unwrap();
+    write_session(&home, &work);
+    // 目录的提示词：平时是 EDITH 跑过之后才有
+    let upstream = home.join("Prompts").join(".upstream");
+    std::fs::create_dir_all(&upstream).unwrap();
+    std::fs::write(upstream.join("prompts-framework.md"), "@@ memory.catalog\n{{items}}\n---\n{{more}}\n---\n{{skills}}\n").unwrap();
+    let memory = |id: &str, kind: &str, source: &str, text: &str| {
+        json!({ "id": id, "kind": kind, "source": source, "text": text, "project": "", "pinned": false, "state": "active", "uses": 0,
+                "created_at": "2026-11-05T00:00:00Z", "updated_at": "2026-11-05T00:00:00Z" })
+    };
+    let items = json!({ "items": [
+        memory("m0001", "preference", "said", "不许使用用户的 iMac：不 ssh、不在上面跑构建"),
+        memory("m0002", "preference", "auto:turn", "提交不要带署名"),
+        memory("m0003", "preference", "said", &format!("踩坑记录：{}不要这样做", "长".repeat(200))),
+    ] });
+    std::fs::write(home.join("memory.json"), items.to_string()).unwrap();
+    let brain = FakeBrain::new();
+    register(&home, &brain, &work);
+    let mut client = Client::start_with(&home, &work, &[("EDITH_FRIDAY_HUB_IDLE", "60")]);
+    let hello = client.send("hello", json!({ "protocol": 1 }));
+    let (mut gateway, mut resident) = (None, None);
+    for _ in 0..2 {
+        let mut link = brain.accept(15).expect("少了一条连接");
+        let reply = link.handshake(json!({ "name": "EDITH", "version": "test" }));
+        match reply["name"].as_str() {
+            Some("friday-client") => gateway = Some(link),
+            Some("friday") => resident = Some(link),
+            other => panic!("不认识的连接 {other:?}：{reply}"),
+        }
+    }
+    let (mut gateway, mut resident) = (gateway.unwrap(), resident.unwrap());
+    let list = gateway.wait_for(10, |message| message["method"] == "sessions.list").unwrap();
+    reply(&mut gateway, &list, json!([]));
+    let agents = gateway.wait_for(10, |message| message["method"] == "agents.list").unwrap();
+    reply(&mut gateway, &agents, json!([]));
+    assert!(client.reply(hello).get("error").is_none());
+
+    // 一段新会话的第一句话，和规矩八竿子打不着
+    let hook =
+        json!({ "hook_event_name": "UserPromptSubmit", "session_id": "6e1d2b3c-4d5e-4f60-9a0b-1c2d3e4f5a6b", "prompt": "今天天气怎么样" });
+    resident.send(json!({ "jsonrpc": "2.0", "id": 1, "method": "hook", "params": hook }));
+    let result = resident.wait_for(10, |message| message["id"] == 1).expect("钩子没回")["result"].clone();
+    let context = result["additionalContext"].as_str().unwrap_or("").to_string();
+    assert!(context.contains("- [偏好] 【必须遵守】不许使用用户的 iMac"), "{result}");
+    assert!(!context.contains("提交不要带署名") && !context.contains("踩坑记录"), "{context}");
+    // 不算放进去：uses 没动
+    let saved: Value = serde_json::from_str(&std::fs::read_to_string(home.join("memory.json")).unwrap()).unwrap();
+    assert_eq!(saved["items"][0]["uses"], 0, "{saved}");
+}
+
 #[test]
 fn resident_part_joins_the_brain() {
     let home = scratch("friday-resident");
