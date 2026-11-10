@@ -40,6 +40,19 @@ fn main() {
     let build = out.ancestors().nth(4).unwrap_or(&out).join("call-engine");
 
     let multi = msvc;
+    // 配置时用的工具链 / 编译器 / 依赖目录：跟构建目录里记下的不一样就重新配置（CI 缓存了构建目录，cargo-zigbuild 的包装脚本
+    // 在带哈希的目录里，换了一次版本 / 哈希，旧 CMakeCache 里写死的编译器路径就没了，CMake 重新生成时报找不到编译器）
+    let inputs = ["CMAKE_TOOLCHAIN_FILE", "CC", "CXX", "AR"]
+        .iter()
+        .map(|name| format!("{name}={}", env::var(format!("{name}_{target_env}")).unwrap_or_default()))
+        .chain([format!("FRIDAY_CALL_DEPS_DIR={}", env::var("FRIDAY_CALL_DEPS_DIR").unwrap_or_default())])
+        .collect::<Vec<_>>()
+        .join("\n");
+    let stamp = build.join("friday-configure.txt");
+    if build.join("CMakeCache.txt").exists() && std::fs::read_to_string(&stamp).ok().as_deref() != Some(inputs.as_str()) {
+        let _ = std::fs::remove_file(build.join("CMakeCache.txt"));
+        let _ = std::fs::remove_dir_all(build.join("CMakeFiles"));
+    }
     if !build.join("CMakeCache.txt").exists() {
         let mut configure = Command::new("cmake");
         configure.arg("-S").arg(&source).arg("-B").arg(&build).arg("-DCMAKE_BUILD_TYPE=Release").arg("-DCMAKE_POLICY_VERSION_MINIMUM=3.5");
@@ -78,6 +91,7 @@ fn main() {
             }
         }
         run(&mut configure, "配置通话内核");
+        std::fs::write(&stamp, &inputs).unwrap_or_else(|error| panic!("写不了 {}：{error}", stamp.display()));
     }
     let jobs = std::thread::available_parallelism().map(|count| count.get()).unwrap_or(4).to_string();
     let mut compile = Command::new("cmake");
