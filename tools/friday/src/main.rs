@@ -794,6 +794,11 @@ fn command_key(expanded: &str) -> String {
 fn shown_user_text(text: &str) -> String {
     // 用户发消息时的钩子（用户配的、内置的目录）补的上下文：接在后面存进了消息，不给人看
     let text = text.split_once("\n\n[用户配的钩子补充的信息]\n").map_or(text, |(said, _)| said);
+    // EDITH 给交来的话附的发出时间（edith.now：「（发出时间：…）」，存进了历史）：给模型看的，不给人看
+    let text = match text.rsplit_once("\n\n") {
+        Some((said, note)) if note.starts_with("（发出时间：") && note.ends_with('）') && !note.contains('\n') => said,
+        _ => text,
+    };
     if let Some((first, rest)) = text.split_once('\n')
         && first.starts_with('（')
         && first.ends_with('）')
@@ -37984,4 +37989,20 @@ fn main() {
     // 输入完了：还没回的回完再走。客户端走了网关就退出，大脑照常干活（在等的批准它会等下一个连上来的）
     drop(sender);
     let _ = worker.join();
+}
+
+#[cfg(test)]
+mod shown_text_tests {
+    use super::shown_user_text;
+
+    #[test]
+    fn hides_sent_time_and_hook_context() {
+        let stored = "写个脚本\n\n（发出时间：2026年11月10日 星期二 09:28）\n\n[用户配的钩子补充的信息]\n[记忆库]";
+        assert_eq!(shown_user_text(stored), "写个脚本");
+        assert_eq!(shown_user_text("写个脚本\n\n（发出时间：2026年11月10日 星期二 09:28）"), "写个脚本");
+        // 补充 / 传来的说明行和发出时间一起去掉
+        assert_eq!(shown_user_text("（用户补充了下面这段）\n再查一下\n\n（发出时间：2026年11月10日 星期二 09:30）"), "再查一下");
+        // 用户自己打的括号段不动
+        assert_eq!(shown_user_text("第一段\n\n（备注）"), "第一段\n\n（备注）");
+    }
 }
