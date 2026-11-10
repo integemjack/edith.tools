@@ -2150,11 +2150,20 @@ fn on_brain_event(params: &Value) {
     let session = params["session"].as_str().unwrap_or("").to_string();
     let turn = params["turn"].as_str().unwrap_or("").to_string();
     let data = &params["data"];
+    let kind = params["type"].as_str().unwrap_or("");
+    // 一段请求成功了 / 额度用完了（EDITH 记在 service-usage.json）：订着设置的客户端重查这家的余额、用量（同 Friday 服务端的 serviceUsage 事件）
+    if kind == "usage" {
+        if STATE.lock().unwrap().config
+            && let Some(key) = data["observedKey"].as_str()
+        {
+            event("serviceUsage", json!({ "changes": [{ "observedKey": key, "observed": data["observed"].as_bool().unwrap_or(false) }] }));
+        }
+        return;
+    }
     // 客人（中转的远程设备）的会话不在 Friday 的列表里
     if stored_session(&session).is_none() {
         return;
     }
-    let kind = params["type"].as_str().unwrap_or("");
     if kind == "agent" || kind == "agent.event" {
         on_agent_event(&session, kind, data);
         return;
@@ -3815,6 +3824,8 @@ fn features() -> Vec<&'static str> {
         "commands",
         "storage",
         "teamModePerConversation",
+        // 这台的请求成功、额度用完 / 恢复时推 serviceUsage 事件（订着 config 的；大脑的 usage 事件转过来，不经常驻那份）
+        "usageEvents",
     ];
     if serve_mode() != "off" {
         list.extend([
@@ -16270,10 +16281,22 @@ mod usage {
     }
 
     /// services.usage：{supported, report?, error?, observed, consoleLogin?}
+    /// EDITH 顺手记下的（每段请求成功的时间、响应头里的限流余量、额度用完 / 余额不足的时间和恢复时间）：
+    /// ~/.edith/service-usage.json，格式和键同 Friday 的 ServiceUsage.observed（键 = 地址小写去掉末尾 / + 「|密钥名」）
+    pub fn observed(base: &str, secret_name: &str) -> Value {
+        let mut key = base.trim().to_lowercase();
+        while key.ends_with('/') {
+            key.pop();
+        }
+        key = format!("{key}|{secret_name}");
+        let file = crate::read_json_file(&crate::edith_home().join("service-usage.json"));
+        file["services"][&key].as_object().map_or_else(|| json!({}), |entry| Value::Object(entry.clone()))
+    }
+
     pub fn request(params: &Value) -> Value {
         let base = params["baseURL"].as_str().unwrap_or("").to_string();
         let custom = params["custom"].as_bool().unwrap_or(false);
-        let mut result = json!({ "supported": can_query(&base, custom), "observed": {} });
+        let mut result = json!({ "supported": can_query(&base, custom), "observed": observed(&base, params["secretName"].as_str().unwrap_or("")) });
         let secret = params["secretName"]
             .as_str()
             .and_then(|name| crate::read_json_file(&crate::edith_home().join("secrets.json"))[name].as_str().map(str::to_string));

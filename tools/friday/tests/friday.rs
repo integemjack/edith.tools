@@ -999,6 +999,16 @@ fn models_secrets_and_turn_settings() {
     runtime_engine(&mut client, "edith");
     client.request("engines.update", json!({ "engine": second }));
     runtime_engine(&mut client, "second");
+    // 大脑记下一段请求的用量（usage 事件）：订着设置的客户端收到 serviceUsage，重查这家的余额、用量（同 Friday 服务端）
+    assert!(hello["server"]["features"].as_array().unwrap().contains(&json!("usageEvents")));
+    let subscribe = client.send("config.subscribe", json!({}));
+    if let Some(listing) = link.wait_for(5, |message| message["method"] == "tools.list") {
+        reply(&mut link, &listing, json!({ "tools": [], "disabled": [] }));
+    }
+    client.reply(subscribe);
+    push(&mut link, SESSION, "t1", "usage", json!({ "observedKey": "https://second.example/v1|SECOND_KEY", "observed": true }));
+    let changed = client.event("serviceUsage", |_| true);
+    assert_eq!(changed["params"]["changes"], json!([{ "observedKey": "https://second.example/v1|SECOND_KEY", "observed": true }]));
 }
 
 #[test]
