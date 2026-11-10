@@ -991,6 +991,14 @@ fn models_secrets_and_turn_settings() {
     assert_eq!(params["images"], json!([shot]));
     reply(&mut link, &sense, json!({ "disposition": "started", "turn": "t1" }));
     client.reply(submit);
+    // 订着的会话：它选的模型没了 / 又加回来（比如连上时还没同步过来），运行状态里的模型跟着推过来
+    let runtime_engine = |client: &mut Client, wanted: &'static str| {
+        client.event("runtime", |params| params["conversationID"].as_str().is_some_and(|id| id.eq_ignore_ascii_case(SESSION)) && params["runtime"]["engine"]["id"] == wanted)
+    };
+    client.request("engines.remove", json!({ "id": "second" }));
+    runtime_engine(&mut client, "edith");
+    client.request("engines.update", json!({ "engine": second }));
+    runtime_engine(&mut client, "second");
 }
 
 #[test]

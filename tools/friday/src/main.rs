@@ -1845,6 +1845,25 @@ fn engine_for(session: &str) -> Value {
     all.into_iter().find(|engine| engine["id"] == json!(id)).unwrap_or_else(|| json!({ "id": ENGINE_ID, "title": "EDITH", "model": "" }))
 }
 
+/// 模型变了（加 / 改 / 删、接入服务、本地模型下好）：推 engines，订着的会话的运行状态里的模型跟着变，一起重推
+/// （不然连上时这台还没有模型、之后才同步过来的，客户端一直按连上时的运行状态认为这段对话没有可用的模型：「在线服务都关掉了」）
+fn engines_event() {
+    event("engines", engines_state());
+    let ids: Vec<String> = {
+        let state = STATE.lock().unwrap();
+        if !state.greeted {
+            return;
+        }
+        state.subscribed.iter().cloned().collect()
+    };
+    let sessions: Vec<Stored> = ids.iter().filter_map(|id| find_session(id)).collect();
+    let state = STATE.lock().unwrap();
+    event("summaries", json!({ "summaries": summaries(&state) }));
+    for session in &sessions {
+        event("runtime", json!({ "conversationID": upper(&session.id), "runtime": runtime(session, &state) }));
+    }
+}
+
 fn engines_state() -> Value {
     let all = engines();
     let config = read_json_file(&config_path());
@@ -1891,7 +1910,7 @@ fn engines_request(method: &str, params: &Value) -> Reply {
             && let Ok(hub) = hub()
             && hub.request("services.installIfKnown", json!({ "name": name }), Duration::from_secs(10)).is_ok()
         {
-            event("engines", engines_state());
+            engines_event();
             config_changed(&["capabilities"]);
         }
         event("secrets", secret_names());
@@ -1950,7 +1969,7 @@ fn engines_request(method: &str, params: &Value) -> Reply {
         config["engines"] = json!(list);
     }
     write_json_file(&path, &config)?;
-    event("engines", engines_state());
+    engines_event();
     Ok(json!({}))
 }
 
@@ -2914,7 +2933,7 @@ fn settings_request(method: &str, params: &Value) -> Reply {
                 META.update(|value| value["teamMode"] = json!(mode));
             }
             if engines_changed {
-                event("engines", engines_state());
+                engines_event();
             }
             // 只听你的声音、声纹的严格程度、说完一句等多久（客户端推过来）：这台的助手的语音、通话照这个
             let mut voice = Map::new();
@@ -4653,7 +4672,7 @@ fn handle(method: &str, params: &Value) -> Reply {
             let wait = if matches!(method, "services.fetchModels" | "services.usage") { 60 } else { 30 };
             let reply = hub.request(method, params.clone(), Duration::from_secs(wait)).map_err(|error| hub_error(&error))?;
             if !matches!(method, "services.fetchModels" | "services.usage") {
-                event("engines", engines_state());
+                engines_event();
                 event("secrets", secret_names());
                 config_changed(&["capabilities"]);
             }
@@ -6035,7 +6054,7 @@ fn on_hub_message(hub: &Arc<Brain>, message: Value) {
         Some(method) if method.starts_with("voice.") => event(method, message["params"].clone()),
         // 本地模型下好了：建了本地引擎、给会话换上了（会话上选的记在 friday.json）
         Some("engines.changed") => {
-            event("engines", engines_state());
+            engines_event();
             if let Some(conversation) = message["params"]["conversationID"].as_str() {
                 changed(&lower(conversation), true);
             }
