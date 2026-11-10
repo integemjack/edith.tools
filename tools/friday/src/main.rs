@@ -3580,6 +3580,10 @@ fn launch_brain(workspace: &Path) -> Result<Value, String> {
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         if let Some(entry) = registry().into_iter().find(|entry| entry["workspace"].as_str() == Some(wanted.as_str())) {
+            // 大脑是这个网关的子进程：它先退（闲够了、升级后换新版本）时要有人收，不然一直留着僵尸进程
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
             return Ok(entry);
         }
         if let Ok(Some(status)) = child.try_wait() {
@@ -6005,7 +6009,12 @@ fn spawn_serve() -> Result<(), String> {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         process.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
     }
-    process.spawn().map(|_| ()).map_err(|error| format!("起不了常驻的那份：{error}"))
+    let mut child = process.spawn().map_err(|error| format!("起不了常驻的那份：{error}"))?;
+    // 常驻那份在起它的网关还在时退了（被新版本请退、闲够了）：收掉，不留僵尸进程
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
 }
 
 /// 常驻那份推来的
