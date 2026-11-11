@@ -993,7 +993,10 @@ fn models_secrets_and_turn_settings() {
     client.reply(submit);
     // 订着的会话：它选的模型没了 / 又加回来（比如连上时还没同步过来），运行状态里的模型跟着推过来
     let runtime_engine = |client: &mut Client, wanted: &'static str| {
-        client.event("runtime", |params| params["conversationID"].as_str().is_some_and(|id| id.eq_ignore_ascii_case(SESSION)) && params["runtime"]["engine"]["id"] == wanted)
+        client.event("runtime", |params| {
+            params["conversationID"].as_str().is_some_and(|id| id.eq_ignore_ascii_case(SESSION))
+                && params["runtime"]["engine"]["id"] == wanted
+        })
     };
     client.request("engines.remove", json!({ "id": "second" }));
     runtime_engine(&mut client, "edith");
@@ -1623,4 +1626,89 @@ fn tool_models_pick_from_services() {
     );
     let file: Value = serde_json::from_str(&std::fs::read_to_string(home.join("friday").join("tool-models.json")).unwrap()).unwrap();
     assert_eq!(file["models"]["imageGeneration"], "openaicompatible|gw-image-old", "{file}");
+}
+
+/// Friday 的 OpenCode 能力（power://opencode）：大脑的 external 事件画成只显示的工具行（OpenCode 的名字和图标），
+/// 存档里回答上的 x_edith_tools 按 offset 插回文字中间；等确认的行点允许 = 在对话里回一句「允许」，之后那行定成已允许
+#[test]
+fn opencode_tool_rows_and_approval() {
+    let home = scratch("friday-opencode");
+    let work = home.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    write_session(&home, &work);
+    let brain = FakeBrain::new();
+    register(&home, &brain, &work);
+    let mut client = Client::start(&home, &work);
+    let hello = client.send("hello", json!({ "protocol": 1, "client": { "name": "test" } }));
+    let mut link = accept(&brain);
+    let list = link.wait_for(10, |message| message["method"] == "sessions.list").unwrap();
+    reply(&mut link, &list, json!([]));
+    let agents = link.wait_for(10, |message| message["method"] == "agents.list").unwrap();
+    reply(&mut link, &agents, json!([]));
+    client.reply(hello);
+    client.request("conversation.subscribe", json!({ "id": SESSION }));
+    client.drain();
+
+    // 正在干：工具行跟着 external 事件出来、变状态
+    push(&mut link, SESSION, "t1", "turn.started", json!({ "text": "看看 a.txt 再删掉" }));
+    push(&mut link, SESSION, "t1", "text", json!({ "text": "先看看。" }));
+    let read = |extra: Value| {
+        let mut tool = json!({ "id": "oc_1", "name": "read", "input": { "filePath": "a.txt" } });
+        tool.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        tool
+    };
+    push(&mut link, SESSION, "t1", "external", read(json!({ "status": "running" })));
+    push(&mut link, SESSION, "t1", "external", read(json!({ "status": "success", "output": "x" })));
+    let message = client.event("message", |params| {
+        tools(&params["message"]).first().is_some_and(|tool| tool["status"] == "succeeded" && tool["result"] == "x")
+    });
+    let tool = &tools(&message["params"]["message"])[0];
+    assert_eq!(
+        (tool["name"].as_str(), tool["title"].as_str(), tool["symbol"].as_str()),
+        (Some("read"), Some("读取文件"), Some("doc.text"))
+    );
+    assert_eq!(tool["external"], true, "{tool}");
+
+    // 做完：存档里的回答带 x_edith_tools，第二个工具停在等确认
+    let shell =
+        json!({ "id": "oc_2", "name": "shell", "input": { "command": "rm a.txt" }, "status": "waiting", "output": "", "offset": 4 });
+    let stored = [
+        json!({ "role": "user", "content": "看看 a.txt 再删掉" }),
+        json!({
+            "role": "assistant",
+            "content": "先看看。OpenCode 想运行命令 rm a.txt，回复「允许」放行",
+            "x_edith_tools": [read(json!({ "status": "success", "output": "x", "offset": 4 })), shell],
+        }),
+    ];
+    append(&home, SESSION, &stored);
+    push(&mut link, SESSION, "t1", "done", json!({ "answer": "", "stopped": false, "error": null }));
+    let done = client.event("conversation", |params| {
+        params["conversation"]["nodes"]
+            .as_array()
+            .unwrap()
+            .last()
+            .is_some_and(|node| tools(node).len() == 2 && node["stats"].get("live").is_none())
+    });
+    let last = nodes(&done).last().unwrap().clone();
+    assert_eq!(kinds(&last), ["text", "tool", "tool", "text"], "{last}");
+    assert_eq!(last["blocks"][0]["kind"]["text"]["_0"], "先看看。");
+    let waiting = tools(&last)[1].clone();
+    assert_eq!((waiting["status"].as_str(), waiting["title"].as_str()), (Some("awaitingApproval"), Some("运行命令")), "{waiting}");
+
+    // 点允许：大脑那边没有这件待确认，网关在对话里回一句「允许」
+    client.drain();
+    let resolve = client.send("runner.resolveApproval", json!({ "eventID": waiting["id"], "approved": true }));
+    let sense = link.wait_for(10, |message| message["method"] == "sense").expect("没在对话里回一句");
+    assert_eq!(sense["params"]["text"], "允许");
+    reply(&mut link, &sense, json!({ "disposition": "started", "turn": "t2" }));
+    assert!(client.reply(resolve).get("error").is_none());
+    let stored = [
+        json!({ "role": "user", "content": "允许\n\n（发出时间：2026年11月12日 星期四 09:00）" }),
+        json!({ "role": "assistant", "content": "删好了" }),
+    ];
+    let done =
+        finish_turn(&mut client, &mut link, &home, "t2", &stored, json!({ "answer": "删好了", "stopped": false, "error": null }), "删好了");
+    let all = nodes(&done);
+    let settled = tools(&all[all.len() - 3])[1].clone();
+    assert_eq!((settled["status"].as_str(), settled["result"].as_str()), (Some("succeeded"), Some("已允许")), "{settled}");
 }

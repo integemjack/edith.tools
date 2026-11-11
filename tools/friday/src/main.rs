@@ -553,6 +553,76 @@ impl Meta {
 
 // MARK: - 历史 → Friday 的消息
 
+/// 别处执行的工具（OpenCode 的智能体跑的，大脑的 external 事件）：卡片里的工具名带这个前缀，画的时候去掉、标 external（只显示）
+const EXTERNAL: &str = "external:";
+/// EDITH 记在回答那条消息上的这一轮 OpenCode 工具活动（[{id, name, input, status, output, offset}]）
+const EXTERNAL_TOOLS: &str = "x_edith_tools";
+
+/// 等用户确认的 OpenCode 工具行：卡片 id → 会话（点了允许 / 拒绝 = 在这段对话里回一句，桥按这句放行或拒绝）
+static EXTERNAL_WAITING: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(Default::default);
+
+/// external 事件的状态 → 卡片的
+fn external_status(status: &str) -> &'static str {
+    match status {
+        "success" => "succeeded",
+        "failed" => "failed",
+        "waiting" => "awaitingApproval",
+        _ => "running",
+    }
+}
+
+/// OpenCode 的工具在卡片上的名字和图标（同 Friday 的 OpenCodeModels.toolLook）
+fn external_look(name: &str) -> (&str, &'static str) {
+    match name {
+        "read" => ("读取文件", "doc.text"),
+        "write" => ("写入文件", "square.and.pencil"),
+        "edit" | "patch" | "multiedit" => ("修改文件", "pencil"),
+        "shell" | "bash" => ("运行命令", "terminal"),
+        "grep" => ("搜索内容", "text.magnifyingglass"),
+        "glob" => ("查找文件", "doc.text.magnifyingglass"),
+        "list" | "ls" => ("列目录", "folder"),
+        "webfetch" => ("打开网页", "globe"),
+        "websearch" => ("搜索网页", "magnifyingglass"),
+        "subagent" | "task" => ("子智能体", "person.2"),
+        "question" => ("提问", "questionmark.circle"),
+        "skill" => ("技能", "sparkles"),
+        "todowrite" | "todoread" => ("待办", "checklist"),
+        "execute" => ("执行代码", "curlybraces"),
+        "" => ("工具", "hammer"),
+        other => (other, "hammer"),
+    }
+}
+
+/// 放行 OpenCode 的确认的话（同桥的 approval()、Friday 的 OpenCodeModels.isApproval）
+const APPROVALS: &[&str] = &[
+    "总是允许",
+    "一直允许",
+    "始终允许",
+    "以后都允许",
+    "always",
+    "允许",
+    "允许一次",
+    "同意",
+    "可以",
+    "好",
+    "好的",
+    "继续",
+    "行",
+    "是",
+    "确认",
+    "yes",
+    "y",
+    "ok",
+    "allow",
+];
+
+/// 用户这句话是不是在放行 OpenCode 的确认（12 个字以内的「允许」「可以」「好」…；附的发出时间不算）
+fn is_approval(reply: &str) -> bool {
+    let said = shown_user_text(reply);
+    let text = said.trim().trim_matches(|c: char| "。！!.，,".contains(c)).to_lowercase();
+    text.chars().count() <= 12 && APPROVALS.contains(&text.as_str())
+}
+
 /// 内置工具在 Friday 卡片上的标题和图标（没有的不写）
 fn tool_look(name: &str) -> Option<(&'static str, &'static str)> {
     // 常驻那份的浏览器工具、定时任务、扩展自己的能力在大脑里叫 friday__*
@@ -655,14 +725,20 @@ fn tool_block(place: Place, card: Card) -> Value {
         None => call_uuid(place.session, place.node, card.call, card.nth),
         Some(agent) => agent_call_uuid(place.session, agent, card.call, card.nth),
     };
+    let external = card.name.strip_prefix(EXTERNAL);
     let mut event = json!({
         "id": id,
-        "name": card.name,
+        "name": external.unwrap_or(card.name),
         "arguments": pretty(card.arguments),
         "status": card.status,
         "result": card.result,
     });
-    if let Some((title, symbol)) = tool_look(card.name) {
+    if let Some(name) = external {
+        let (title, symbol) = external_look(name);
+        event["title"] = json!(title);
+        event["symbol"] = json!(symbol);
+        event["external"] = json!(true);
+    } else if let Some((title, symbol)) = tool_look(card.name) {
         event["title"] = json!(title);
         event["symbol"] = json!(symbol);
     }
@@ -892,6 +968,8 @@ fn group_in(session: &str, owner: &str, history: &[Value], team: &Team) -> Vec<N
     let mut open: HashMap<String, (usize, usize)> = HashMap::new();
     // （第几条消息, 调用 id）→ 用过几次
     let mut uses: HashMap<(usize, String), usize> = HashMap::new();
+    // 等用户确认的 OpenCode 工具行（第几条消息, 第几块）：下一句用户的话定下来（允许了 / 取消了）
+    let mut waiting: Vec<(usize, usize)> = Vec::new();
     for (index, message) in history.iter().enumerate() {
         match message["role"].as_str() {
             Some("tool") => {
@@ -916,6 +994,15 @@ fn group_in(session: &str, owner: &str, history: &[Value], team: &Team) -> Vec<N
                         last.notice.push("交付检查追了一条提醒".into());
                     }
                     continue;
+                }
+                // 回的是 OpenCode 等着的确认：那几行改成已允许（先记成成功，OpenCode 接着跑完的在下一条回答里）/ 已取消
+                if !waiting.is_empty() {
+                    let approved = is_approval(&text);
+                    for (node, block) in waiting.drain(..) {
+                        let event = &mut nodes[node].blocks[block]["kind"]["tool"]["_0"];
+                        event["status"] = json!(if approved { "succeeded" } else { "denied" });
+                        event["result"] = json!(if approved { "已允许" } else { "已取消" });
+                    }
                 }
                 let shown = shown_user_text(&text);
                 // 输入框里打的「/loop …」：记成一问一答（问是命令，答是回复）
@@ -951,8 +1038,44 @@ fn group_in(session: &str, owner: &str, history: &[Value], team: &Team) -> Vec<N
                 if let Some(thinking) = message["reasoning_content"].as_str().filter(|text| !text.trim().is_empty()) {
                     node.blocks.push(text_block(session, &format!("{index}.thinking"), "thinking", thinking));
                 }
-                if let Some(text) = message["content"].as_str().filter(|text| !text.trim().is_empty()) {
-                    node.blocks.push(text_block(session, &format!("{index}.text"), "text", text));
+                let externals = message[EXTERNAL_TOOLS].as_array().map(Vec::as_slice).unwrap_or_default();
+                let content = message["content"].as_str().unwrap_or("");
+                if externals.is_empty() {
+                    if !content.trim().is_empty() {
+                        node.blocks.push(text_block(session, &format!("{index}.text"), "text", content));
+                    }
+                } else {
+                    // OpenCode 的工具活动：按出现时写了几个字插回文字中间
+                    let chars: Vec<char> = content.chars().collect();
+                    let mut from = 0;
+                    for (n, tool) in externals.iter().enumerate() {
+                        let offset = (tool["offset"].as_u64().unwrap_or(0) as usize).clamp(from, chars.len());
+                        let part: String = chars[from..offset].iter().collect();
+                        if !part.trim().is_empty() {
+                            node.blocks.push(text_block(session, &format!("{index}.text.{n}"), "text", &part));
+                        }
+                        from = offset;
+                        let id = tool["id"].as_str().unwrap_or("");
+                        let name = format!("{EXTERNAL}{}", tool["name"].as_str().unwrap_or(""));
+                        // 存档里还是 running 的：这一轮被停下了，算失败
+                        let status = match external_status(tool["status"].as_str().unwrap_or("")) {
+                            "running" => "failed",
+                            status => status,
+                        };
+                        if status == "awaitingApproval" {
+                            waiting.push((position, node.blocks.len()));
+                        }
+                        let nth = uses.entry((position, id.to_string())).or_insert(0);
+                        let result = tool["output"].as_str().unwrap_or("");
+                        let card = Card { call: id, nth: *nth, name: &name, arguments: &tool["input"], status, result, lines: None };
+                        let place = Place { session, owner, node: position, agent: None, team };
+                        node.blocks.push(tool_block(place, card));
+                        *nth += 1;
+                    }
+                    let rest: String = chars[from..].iter().collect();
+                    if !rest.trim().is_empty() {
+                        node.blocks.push(text_block(session, &format!("{index}.text"), "text", &rest));
+                    }
                 }
                 for call in message["tool_calls"].as_array().into_iter().flatten() {
                     let id = call["id"].as_str().unwrap_or("");
@@ -972,6 +1095,15 @@ fn group_in(session: &str, owner: &str, history: &[Value], team: &Team) -> Vec<N
         }
         if let Some(last) = nodes.last_mut() {
             last.end = index + 1;
+        }
+    }
+    // 还等着用户确认的：记下卡片 id（点允许 / 拒绝时按它找到会话）
+    if !waiting.is_empty() {
+        let mut map = EXTERNAL_WAITING.lock().unwrap();
+        for (node, block) in waiting {
+            if let Some(id) = nodes[node].blocks[block]["kind"]["tool"]["_0"]["id"].as_str() {
+                map.insert(upper(id), owner.to_string());
+            }
         }
     }
     nodes
@@ -2271,6 +2403,18 @@ fn on_brain_event(params: &Value) {
                     }
                     "stats" => live.stats(data),
                     "notice" => live.notice(text),
+                    // OpenCode 的智能体跑的工具（只显示）：同一个 id 先 running，再成功 / 失败 / 等确认
+                    "external" => {
+                        let call = data["id"].as_str().unwrap_or("");
+                        if live.find_tool(call).is_none() {
+                            live.push_tool(call, &format!("{EXTERNAL}{}", data["name"].as_str().unwrap_or("")), data["input"].clone());
+                        }
+                        let status = external_status(data["status"].as_str().unwrap_or(""));
+                        live.set_tool(call, status, data["output"].as_str());
+                        if status == "awaitingApproval" {
+                            EXTERNAL_WAITING.lock().unwrap().insert(upper(&live.card_id(&session, call)), session.clone());
+                        }
+                    }
                     _ => {}
                 }
                 state.dirty.insert(session.clone());
@@ -4057,7 +4201,14 @@ fn command_engine(wanted: &str, session: &str) -> Option<String> {
     } else {
         return None;
     };
-    let pool: Vec<friday_core::chooser::Candidate> = all.iter().map(friday_core::chooser::Candidate::from_json).collect();
+    // 按档挑时不挑 OpenCode 的（交给它自己的智能体，命令的内容它不按 Friday 的来）
+    let pool: Vec<friday_core::chooser::Candidate> = all
+        .iter()
+        .map(|engine| {
+            let candidate = friday_core::chooser::Candidate::from_json(engine);
+            friday_core::chooser::Candidate { usable: candidate.usable && !opencode::is_opencode(engine), ..candidate }
+        })
+        .collect();
     let current = engine_for(session)["id"].as_str().unwrap_or("").to_string();
     let index = friday_core::chooser::pick(&pool, tier, Some(&current), false)?;
     Some(pool[index].id.clone()).filter(|id| *id != current)
@@ -4509,7 +4660,13 @@ fn handle(method: &str, params: &Value) -> Reply {
         "runner.resolveApproval" => {
             let event_id = upper(&text_param(params, "eventID")?);
             let approved = params["approved"].as_bool().unwrap_or(false);
-            let pending = STATE.lock().unwrap().approvals.remove(&event_id).ok_or((NOT_FOUND, "会话已经不在等这个了".into()))?;
+            let pending = STATE.lock().unwrap().approvals.remove(&event_id);
+            let Some(pending) = pending else {
+                // OpenCode 等确认的工具行（大脑那边没有待确认，OpenCode 停着等下一句）：在这段对话里回一句，桥按它放行 / 拒绝
+                let session = EXTERNAL_WAITING.lock().unwrap().remove(&event_id).ok_or((NOT_FOUND, "会话已经不在等这个了".to_string()))?;
+                let text = if approved { "允许" } else { "不用了，取消这个操作" };
+                return submit(&json!({ "conversationID": session, "text": text }));
+            };
             let decision = if approved { json!({ "decision": "allow" }) } else { json!({ "decision": "deny", "reason": "" }) };
             pending.brain.write(&json!({ "jsonrpc": "2.0", "id": pending.request["id"], "result": decision }));
             {
@@ -5769,6 +5926,11 @@ fn serve() -> Result<(), String> {
     serve_log("serve", &format!("起来了：{address}（{VERSION}）"));
     powers::start();
     models::start();
+    // OpenCode 的引擎跟着能力开关（启动时对一次）
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_secs(3));
+        opencode::powers_changed();
+    });
     loops::start();
     plugins::start();
     prompt_files::start();
@@ -6772,6 +6934,7 @@ mod powers {
                 if DIRTY.swap(false, Ordering::Relaxed) {
                     crate::notify_all_clients("powers", state());
                     crate::models::powers_changed();
+                    crate::opencode::powers_changed();
                     crate::caps::powers_changed();
                 }
             }
@@ -6798,6 +6961,11 @@ mod powers {
                         .collect()
                 };
                 for id in idle {
+                    // 还有请求在跑（OpenCode 的一轮可能跑很久，期间不再问桥）：不算闲着
+                    if serving(&id) {
+                        touch(&id);
+                        continue;
+                    }
                     crate::serve_log("powers", &format!("本地能力 {id} 闲置 15 分钟，先停掉"));
                     stop(&id);
                 }
@@ -7615,6 +7783,13 @@ mod powers {
 
     pub fn is_installed(id: &str) -> bool {
         MANAGER.lock().unwrap().installed.contains_key(id)
+    }
+
+    /// 它自己说还有请求在跑（GET /v1/info 的 active，OpenCode 的桥报）
+    fn serving(id: &str) -> bool {
+        let address = MANAGER.lock().unwrap().running.get(id).map(|running| (running.url.clone(), running.token.clone()));
+        let Some((url, token)) = address.filter(|(url, _)| !url.is_empty()) else { return false };
+        crate::opencode::get(&url, &token, "/v1/info", 3).is_ok_and(|info| info["active"].as_u64().unwrap_or(0) > 0)
     }
 
     /// 有人在用（客户端设备的桥连着）：别当闲着停掉
@@ -9431,6 +9606,7 @@ mod models {
             "models.state" => Ok(state()),
             "models.refresh" => {
                 std::thread::spawn(rescan);
+                crate::opencode::refresh_if_stale();
                 // 生图 / 生视频的家族在 diffusion 的清单里：还没取到索引就取一次
                 if families().is_empty() && !powers::is_refreshing() {
                     std::thread::spawn(powers::refresh);
@@ -9532,6 +9708,9 @@ mod models {
     pub fn endpoint(params: &Value) -> Result<Value, String> {
         let base = params["baseURL"].as_str().unwrap_or("");
         let power = base.strip_prefix("power://").map(|rest| rest.trim_end_matches('/')).unwrap_or("");
+        if power == crate::opencode::POWER {
+            return crate::opencode::endpoint(params);
+        }
         if power != "llm" {
             return Err(format!("Friday 不认识这个模型地址：{base}"));
         }
@@ -9557,6 +9736,220 @@ mod models {
     /// 有在下的（常驻的那份闲着不退）
     pub fn busy() -> bool {
         MODELS.lock().unwrap().tasks.values().any(|task| task.running)
+    }
+}
+
+// MARK: - OpenCode（Friday.Powers 的 opencode）
+
+mod opencode {
+    //! Friday 的 OpenCode 能力（Friday.Powers 的 opencode Power，桥 friday-opencode；同 Friday 的 OpenCodeModels）：
+    //! 装了、开着时问桥要 OpenCode 里能用的模型（用户在 OpenCode 里登录的服务商、自己配的、免费的），每个在 config.json 建一个引擎
+    //! （baseURL `power://opencode`、model「服务商/模型」、标题「OpenCode · 名字」、supportsTools false）；
+    //! 选了它的会话交给 OpenCode 自己的智能体在工作目录里做，内容实时流回来（大脑见 power://opencode 不发自己的工具、不追问，
+    //! 它跑的工具发成 external 事件，网关画成只显示的工具行）。Power 关了 / 卸了：这些引擎跟着关掉。
+    //! 模型列表在 Power 装好、打开时取一次，之后客户端打开模型菜单（models.refresh）时隔 10 分钟以上再取。
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    use serde_json::{Value, json};
+    use sha2::Digest;
+
+    use crate::powers;
+
+    pub const POWER: &str = "opencode";
+    pub const BASE: &str = "power://opencode";
+
+    struct State {
+        available: Option<bool>,
+        last_refresh: Option<Instant>,
+        refreshing: bool,
+    }
+
+    static STATE: Mutex<State> = Mutex::new(State { available: None, last_refresh: None, refreshing: false });
+
+    fn on() -> bool {
+        powers::is_installed(POWER) && powers::is_enabled(POWER)
+    }
+
+    pub fn is_opencode(engine: &Value) -> bool {
+        engine["baseURL"].as_str() == Some(BASE)
+    }
+
+    fn configured() -> usize {
+        crate::read_json_file(&crate::config_path())["engines"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|engine| is_opencode(engine))
+            .count()
+    }
+
+    /// 本地能力的状态变了（装 / 卸 / 开关；常驻的那份启动时也来一次）：开了去取模型，关了把引擎关掉。
+    /// 启动时已经有 OpenCode 的引擎就先不取（不为这个拉起桥和 OpenCode），等客户端打开模型菜单
+    pub fn powers_changed() {
+        let available = on();
+        let previous = STATE.lock().unwrap().available.replace(available);
+        if previous == Some(available) {
+            return;
+        }
+        set_disabled(!available);
+        if available && (previous.is_some() || configured() == 0) {
+            std::thread::spawn(refresh);
+        }
+    }
+
+    /// 打开模型菜单时：隔 10 分钟以上（或还没取到过）才再取
+    pub fn refresh_if_stale() {
+        if !on() {
+            return;
+        }
+        let state = STATE.lock().unwrap();
+        if state.refreshing || state.last_refresh.is_some_and(|at| at.elapsed() < Duration::from_secs(600)) {
+            return;
+        }
+        drop(state);
+        std::thread::spawn(refresh);
+    }
+
+    /// 问桥要模型列表（桥没在跑就拉起来），config.json 里的 OpenCode 引擎按它增删改
+    pub fn refresh() {
+        {
+            let mut state = STATE.lock().unwrap();
+            if state.refreshing || !on() {
+                return;
+            }
+            state.refreshing = true;
+        }
+        let result = powers::ensure_running(POWER, Duration::from_secs(60)).and_then(|(url, token)| get(&url, &token, "/v1/models", 30));
+        let mut state = STATE.lock().unwrap();
+        state.refreshing = false;
+        match result {
+            Ok(body) => {
+                state.last_refresh = Some(Instant::now());
+                drop(state);
+                apply(body["data"].as_array().map(Vec::as_slice).unwrap_or_default());
+            }
+            Err(error) => {
+                drop(state);
+                crate::serve_log("opencode", &format!("取 OpenCode 的模型失败：{error}"));
+            }
+        }
+    }
+
+    /// 问桥（本机，不走代理）
+    pub fn get(url: &str, token: &str, path: &str, seconds: u64) -> Result<Value, String> {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .proxy(None)
+            .timeout_global(Some(Duration::from_secs(seconds)))
+            .build()
+            .into();
+        let mut request = agent.get(format!("{}{path}", url.trim_end_matches('/')));
+        if !token.is_empty() {
+            request = request.header("Authorization", format!("Bearer {token}"));
+        }
+        let mut response = request.call().map_err(|error| error.to_string())?;
+        let status = response.status().as_u16();
+        let text = response.body_mut().read_to_string().unwrap_or_default();
+        let body: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        if !(200..300).contains(&status) {
+            return Err(body["error"]["message"].as_str().map(str::to_string).unwrap_or_else(|| format!("HTTP {status}")));
+        }
+        Ok(body)
+    }
+
+    /// 一个模型的引擎 id（同一个模型总是同一个 id）
+    fn engine_id(model: &str) -> String {
+        let hash: String = sha2::Sha256::digest(model.to_lowercase().as_bytes()).iter().take(6).map(|byte| format!("{byte:02x}")).collect();
+        format!("opencode-{hash}")
+    }
+
+    fn engine_json(model: &Value) -> Option<Value> {
+        let id = model["id"].as_str().filter(|id| id.contains('/'))?;
+        let name = model["name"].as_str().filter(|name| !name.is_empty()).unwrap_or_else(|| id.rsplit('/').next().unwrap_or(id));
+        let vision = model["input_modalities"].as_array().is_some_and(|inputs| inputs.iter().any(|input| input == "image"));
+        Some(json!({
+            "id": engine_id(id),
+            "title": format!("OpenCode · {name}"),
+            "baseURL": BASE,
+            "apiKeySecret": "none",
+            "model": id,
+            "supportsVision": vision,
+            // OpenCode 用它自己的工具；EDITH 的不发给它
+            "supportsTools": false,
+            "sendsEnableThinking": false,
+            "thinking": "none",
+            "maxConcurrency": 4,
+            "billing": if model["free"] == true { "free" } else { "metered" },
+            "disabled": false,
+        }))
+    }
+
+    /// 按桥报的模型改 config.json：新的加上、有的更新名字 / 看图 / 计费（用户改过的并发等留着），OpenCode 里不再有的删掉
+    fn apply(models: &[Value]) {
+        let wanted: Vec<Value> = models.iter().filter_map(engine_json).collect();
+        let path = crate::config_path();
+        let mut config = crate::read_json_file(&path);
+        if !config.is_object() {
+            config = json!({});
+        }
+        if !config["engines"].is_array() {
+            config["engines"] = json!([]);
+        }
+        let engines = config["engines"].as_array_mut().unwrap();
+        let before = engines.clone();
+        engines.retain(|engine| !is_opencode(engine) || wanted.iter().any(|item| item["id"] == engine["id"]));
+        for engine in &wanted {
+            match engines.iter_mut().find(|item| item["id"] == engine["id"]) {
+                Some(existing) => {
+                    for key in ["title", "baseURL", "model", "supportsVision", "supportsTools", "thinking", "billing", "disabled"] {
+                        existing[key] = engine[key].clone();
+                    }
+                }
+                None => engines.push(engine.clone()),
+            }
+        }
+        if *engines != before && crate::write_json_file(&path, &config).is_ok() {
+            crate::notify_all_clients("engines.changed", json!({}));
+        }
+        crate::serve_log("opencode", &format!("OpenCode 的模型 {} 个", wanted.len()));
+    }
+
+    /// Power 关了 / 卸了：引擎关掉（会话里选着的不删）；又开了：打开
+    fn set_disabled(disabled: bool) {
+        let path = crate::config_path();
+        let mut config = crate::read_json_file(&path);
+        let mut touched = false;
+        for engine in config["engines"].as_array_mut().into_iter().flatten() {
+            if is_opencode(engine) && engine["disabled"].as_bool().unwrap_or(false) != disabled {
+                engine["disabled"] = json!(disabled);
+                touched = true;
+            }
+        }
+        if touched && crate::write_json_file(&path, &config).is_ok() {
+            crate::notify_all_clients("engines.changed", json!({}));
+        }
+    }
+
+    /// model.endpoint（能力协议 §6.6）：power://opencode 的真地址——拉起桥，回地址、令牌、x_friday
+    /// （session：这段会话 / 子智能体 → 一段 OpenCode 会话；cwd：在哪做；permission：会话框下的权限档；toolEvents：工具活动给结构化的）
+    pub fn endpoint(params: &Value) -> Result<Value, String> {
+        let (url, token) = powers::ensure_running(POWER, Duration::from_secs(60))?;
+        let session = params["session"].as_str().unwrap_or("");
+        let key = match params["agent"].as_str().filter(|agent| !agent.is_empty()) {
+            Some(agent) => format!("edith-{session}/{agent}"),
+            None => format!("edith-{session}"),
+        };
+        let mode = params["mode"]
+            .as_str()
+            .filter(|mode| crate::PERMISSION_MODES.contains(mode))
+            .map(str::to_string)
+            .unwrap_or_else(|| crate::permission_mode(session));
+        let mut hints = json!({ "session": key, "permission": mode, "toolEvents": true });
+        if let Some(cwd) = params["cwd"].as_str().filter(|cwd| !cwd.is_empty()) {
+            hints["cwd"] = json!(cwd);
+        }
+        Ok(json!({ "baseURL": format!("{url}/v1"), "apiKey": token, "body": { "x_friday": hints } }))
     }
 }
 
@@ -16296,7 +16689,8 @@ mod usage {
     pub fn request(params: &Value) -> Value {
         let base = params["baseURL"].as_str().unwrap_or("").to_string();
         let custom = params["custom"].as_bool().unwrap_or(false);
-        let mut result = json!({ "supported": can_query(&base, custom), "observed": observed(&base, params["secretName"].as_str().unwrap_or("")) });
+        let mut result =
+            json!({ "supported": can_query(&base, custom), "observed": observed(&base, params["secretName"].as_str().unwrap_or("")) });
         let secret = params["secretName"]
             .as_str()
             .and_then(|name| crate::read_json_file(&crate::edith_home().join("secrets.json"))[name].as_str().map(str::to_string));
@@ -20541,7 +20935,7 @@ mod caps {
             }
         }
         for engine in crate::services::engines() {
-            if engine["supportsVision"] == true && engine["disabled"] != true {
+            if engine["supportsVision"] == true && engine["disabled"] != true && !crate::opencode::is_opencode(&engine) {
                 refresh_listing(&text_of(&engine, "baseURL"), crate::services::engine_secret(&engine).as_deref(), force);
             }
         }
@@ -20615,7 +21009,8 @@ mod caps {
         let (preferred_engines, preferred_connection) = preferred_service();
         if uses_engines(kind) {
             for engine in crate::services::engines() {
-                if engine["supportsVision"] != true || engine["disabled"] == true {
+                // OpenCode 的模型交给它自己的智能体做，不能当看图的模型用
+                if engine["supportsVision"] != true || engine["disabled"] == true || crate::opencode::is_opencode(&engine) {
                     continue;
                 }
                 let secret = crate::services::engine_secret(&engine);

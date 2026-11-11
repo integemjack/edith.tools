@@ -73,6 +73,14 @@ Friday 客户端 ──SSH──▶ edith-friday --attach（一条连接一个�
   从魔搭 / HF 下、强制删。`models.use` 在 EDITH 的 `config.json` 里建本地引擎（`power://llm`、「组织/仓库:量化档」）给会话换上，
   大脑每段请求前问常驻的那份 `model.endpoint`（能力协议 §6.6）：拉起 friday-llm，回地址、令牌、`x_friday`（模型文件、会话、优先级）。
   本地大模型关掉时本地引擎跟着标 `disabled`。生图 / 生视频的模型「使用」后记在 `~/.edith/friday/settings.json`。
+- **OpenCode**（Friday.Powers 的 opencode Power，桥 friday-opencode，协议见 Friday.Powers 的 `docs/opencode-protocol.md`）：装着、开着时
+  常驻的那份问桥 `/v1/models`，每个模型在 `config.json` 建一个引擎（`power://opencode`、「服务商/模型」、标题「OpenCode · 名字」、
+  `supportsTools: false`；OpenCode 里没了的删掉，能力关了标 `disabled`），装好 / 打开时取一次，之后客户端打开模型菜单（`models.refresh`）隔 10 分钟再取。
+  `model.endpoint` 回桥的地址、令牌和 `x_friday`（`session`：`edith-<会话>`，子智能体 `edith-<会话>/<子智能体>`；`cwd`、`permission` 用大脑报的
+  工作目录和这一轮的权限模式；`toolEvents: true`）——活交给 OpenCode 自己的智能体，大脑见 `power://opencode` 不发工具、不追问。
+  网关把大脑的 `external` 事件和存档里回答上的 `x_edith_tools`（按 `offset` 插回文字中间）画成只显示的工具行（`external: true`、OpenCode 的名字和图标）；
+  等确认的行点允许 / 拒绝 = 在对话里回「允许」/「不用了，取消这个操作」（桥按这句放行或拒绝），下一句用户的话把那行定成已允许 / 已取消。
+  闲 15 分钟停 Power 之前先问它的 `/v1/info`：`active` 不为 0（OpenCode 一轮可能跑很久）就不停。看图模型、按档挑命令的模型不挑 OpenCode 的。
 - **定时任务**（`/loop`，`loops.*`）：会话里打 `/loop …` 不交给模型——常驻的那份建、列、停，问答记进会话（EDITH 的 `note`）；
   到点把 loop.run 提示词交给那段会话的大脑（排在手上这一轮之后，照会话选的档位；大脑没在跑就起），这一轮的回答就是这次的结果，
   自己定节奏的按 `/loop next`，智能体建的 `/loop done` 就结束，用户建的只有用户能停；错过的 12 小时内补一次。
