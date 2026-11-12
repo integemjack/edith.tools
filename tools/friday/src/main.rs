@@ -618,6 +618,27 @@ const APPROVALS: &[&str] = &[
 ];
 
 /// 用户这句话是不是在放行 OpenCode 的确认（12 个字以内的「允许」「可以」「好」…；附的发出时间不算）
+/// OpenCode 的 question、Claude Code 的 AskUserQuestion：Friday 把等回答的这一行画成选项卡片（== Friday asksUser）
+fn is_question_tool(name: &str) -> bool {
+    matches!(name.to_lowercase().as_str(), "question" | "askuserquestion")
+}
+
+/// 选项卡片上的回答（{answers: [每题一条], reply}）→ 在对话里回的那句话（桥按它填回答：几题用「；」隔开，跳过的题写「（跳过）」）（== Friday AgentPowers.answerReply）
+fn answer_reply(answer: &Value) -> String {
+    let reply = answer["reply"].as_str().unwrap_or("").trim();
+    if !reply.is_empty() {
+        return reply.to_string();
+    }
+    let answers: Vec<&str> = answer["answers"].as_array().into_iter().flatten().map(|a| a.as_str().unwrap_or("").trim()).collect();
+    if answers.iter().all(|a| a.is_empty()) {
+        return "跳过，你按推荐的定".to_string();
+    }
+    if answers.len() == 1 {
+        return answers[0].to_string();
+    }
+    answers.iter().map(|a| if a.is_empty() { "（跳过）" } else { a }).collect::<Vec<_>>().join("；")
+}
+
 fn is_approval(reply: &str) -> bool {
     let said = shown_user_text(reply);
     let text = said.trim().trim_matches(|c: char| "。！!.，,".contains(c)).to_lowercase();
@@ -996,11 +1017,17 @@ fn group_in(session: &str, owner: &str, history: &[Value], team: &Team) -> Vec<N
                     }
                     continue;
                 }
-                // 回的是 OpenCode 等着的确认：那几行改成已允许（先记成成功，OpenCode 接着跑完的在下一条回答里）/ 已取消
+                // 回的是 OpenCode 等着的确认：那几行改成已允许（先记成成功，OpenCode 接着跑完的在下一条回答里）/ 已取消；
+                // 等回答的提问：这句话就是回答
                 if !waiting.is_empty() {
                     let approved = is_approval(&text);
                     for (node, block) in waiting.drain(..) {
                         let event = &mut nodes[node].blocks[block]["kind"]["tool"]["_0"];
+                        if is_question_tool(event["name"].as_str().unwrap_or("")) {
+                            event["status"] = json!("succeeded");
+                            event["result"] = json!(format!("回答：{}", shown_user_text(&text).trim()));
+                            continue;
+                        }
                         event["status"] = json!(if approved { "succeeded" } else { "denied" });
                         event["result"] = json!(if approved { "已允许" } else { "已取消" });
                     }
@@ -4663,9 +4690,16 @@ fn handle(method: &str, params: &Value) -> Reply {
             let approved = params["approved"].as_bool().unwrap_or(false);
             let pending = STATE.lock().unwrap().approvals.remove(&event_id);
             let Some(pending) = pending else {
-                // OpenCode 等确认的工具行（大脑那边没有待确认，OpenCode 停着等下一句）：在这段对话里回一句，桥按它放行 / 拒绝
+                // OpenCode / Claude Code 等确认的工具行（大脑那边没有待确认，它停着等下一句）：在这段对话里回一句，桥按它放行 / 拒绝；
+                // 带 answer 的是在它的提问卡片上点了选项：回答写成一句话
                 let session = EXTERNAL_WAITING.lock().unwrap().remove(&event_id).ok_or((NOT_FOUND, "会话已经不在等这个了".to_string()))?;
-                let text = if approved { "允许" } else { "不用了，取消这个操作" };
+                let text = if params["answer"].is_object() {
+                    answer_reply(&params["answer"])
+                } else if approved {
+                    "允许".to_string()
+                } else {
+                    "不用了，取消这个操作".to_string()
+                };
                 return submit(&json!({ "conversationID": session, "text": text }));
             };
             let decision = if approved { json!({ "decision": "allow" }) } else { json!({ "decision": "deny", "reason": "" }) };
@@ -9981,7 +10015,8 @@ mod agent_powers {
             .filter(|mode| crate::PERMISSION_MODES.contains(mode))
             .map(str::to_string)
             .unwrap_or_else(|| crate::permission_mode(session));
-        let mut hints = json!({ "session": key, "permission": mode, "toolEvents": true });
+        // questions：Friday 客户端把等回答的提问行画成选项卡片，桥不再在正文里列问题
+        let mut hints = json!({ "session": key, "permission": mode, "toolEvents": true, "questions": true });
         if let Some(cwd) = params["cwd"].as_str().filter(|cwd| !cwd.is_empty()) {
             hints["cwd"] = json!(cwd);
         }

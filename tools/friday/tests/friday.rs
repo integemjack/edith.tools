@@ -1712,3 +1712,76 @@ fn opencode_tool_rows_and_approval() {
     let settled = tools(&all[all.len() - 3])[1].clone();
     assert_eq!((settled["status"].as_str(), settled["result"].as_str()), (Some("succeeded"), Some("已允许")), "{settled}");
 }
+
+/// OpenCode / Claude Code 的提问（question、AskUserQuestion）：等回答的行在客户端画成选项卡片，点了选项
+/// （runner.resolveApproval 带 answer）= 网关把回答拼成一句话在对话里回（几题用「；」隔开），之后那行定成「回答：…」
+#[test]
+fn opencode_question_answered_from_card() {
+    let home = scratch("friday-opencode-question");
+    let work = home.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    write_session(&home, &work);
+    let brain = FakeBrain::new();
+    register(&home, &brain, &work);
+    let mut client = Client::start(&home, &work);
+    let hello = client.send("hello", json!({ "protocol": 1, "client": { "name": "test" } }));
+    let mut link = accept(&brain);
+    let list = link.wait_for(10, |message| message["method"] == "sessions.list").unwrap();
+    reply(&mut link, &list, json!([]));
+    let agents = link.wait_for(10, |message| message["method"] == "agents.list").unwrap();
+    reply(&mut link, &agents, json!([]));
+    client.reply(hello);
+    client.request("conversation.subscribe", json!({ "id": SESSION }));
+    client.drain();
+
+    push(&mut link, SESSION, "t1", "turn.started", json!({ "text": "先问我两个问题" }));
+    let input = json!({ "questions": [
+        { "question": "报告用什么语言？", "header": "语言", "options": [{ "label": "中文" }, { "label": "英文" }] },
+        { "question": "要哪些附件？", "header": "附件", "multiple": true, "options": [{ "label": "表格" }, { "label": "摘要" }] }
+    ]});
+    let question = json!({ "id": "oc_q", "name": "question", "input": input, "status": "waiting", "output": "等你回答", "offset": 0 });
+    let stored = [
+        json!({ "role": "user", "content": "先问我两个问题" }),
+        json!({ "role": "assistant", "content": "", "x_edith_tools": [question] }),
+    ];
+    append(&home, SESSION, &stored);
+    push(&mut link, SESSION, "t1", "done", json!({ "answer": "", "stopped": false, "error": null }));
+    let done = client.event("conversation", |params| {
+        params["conversation"]["nodes"]
+            .as_array()
+            .unwrap()
+            .last()
+            .is_some_and(|node| tools(node).len() == 1 && node["stats"].get("live").is_none())
+    });
+    let waiting = tools(nodes(&done).last().unwrap())[0].clone();
+    assert_eq!(
+        (waiting["status"].as_str(), waiting["name"].as_str(), waiting["external"].as_bool()),
+        (Some("awaitingApproval"), Some("question"), Some(true)),
+        "{waiting}"
+    );
+
+    // 在卡片上点了：第 1 题「中文」，第 2 题「表格、摘要」
+    client.drain();
+    let answer = json!({ "answers": ["中文", "表格、摘要"], "reply": "" });
+    let resolve = client.send("runner.resolveApproval", json!({ "eventID": waiting["id"], "approved": true, "answer": answer }));
+    let sense = link.wait_for(10, |message| message["method"] == "sense").expect("没在对话里回一句");
+    assert_eq!(sense["params"]["text"], "中文；表格、摘要");
+    reply(&mut link, &sense, json!({ "disposition": "started", "turn": "t2" }));
+    assert!(client.reply(resolve).get("error").is_none());
+    let stored = [
+        json!({ "role": "user", "content": "中文；表格、摘要\n\n（发出时间：2026年11月12日 星期四 09:00）" }),
+        json!({ "role": "assistant", "content": "好的，中文，带表格和摘要" }),
+    ];
+    let done = finish_turn(
+        &mut client,
+        &mut link,
+        &home,
+        "t2",
+        &stored,
+        json!({ "answer": "好的，中文，带表格和摘要", "stopped": false, "error": null }),
+        "好的，中文，带表格和摘要",
+    );
+    let all = nodes(&done);
+    let settled = tools(&all[all.len() - 3])[0].clone();
+    assert_eq!((settled["status"].as_str(), settled["result"].as_str()), (Some("succeeded"), Some("回答：中文；表格、摘要")), "{settled}");
+}
