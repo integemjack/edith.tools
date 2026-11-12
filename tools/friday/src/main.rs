@@ -571,25 +571,26 @@ fn external_status(status: &str) -> &'static str {
     }
 }
 
-/// OpenCode 的工具在卡片上的名字和图标（同 Friday 的 OpenCodeModels.toolLook）
+/// OpenCode / Claude Code 的工具在卡片上的名字和图标（同 Friday 的 AgentPowers.toolLook；Claude Code 的 Read、Bash… 按小写认）
 fn external_look(name: &str) -> (&str, &'static str) {
-    match name {
+    match name.to_lowercase().as_str() {
         "read" => ("读取文件", "doc.text"),
         "write" => ("写入文件", "square.and.pencil"),
-        "edit" | "patch" | "multiedit" => ("修改文件", "pencil"),
-        "shell" | "bash" => ("运行命令", "terminal"),
+        "edit" | "patch" | "multiedit" | "notebookedit" => ("修改文件", "pencil"),
+        "shell" | "bash" | "bashoutput" | "powershell" => ("运行命令", "terminal"),
+        "killshell" | "killbash" => ("停止命令", "stop.circle"),
         "grep" => ("搜索内容", "text.magnifyingglass"),
         "glob" => ("查找文件", "doc.text.magnifyingglass"),
         "list" | "ls" => ("列目录", "folder"),
         "webfetch" => ("打开网页", "globe"),
         "websearch" => ("搜索网页", "magnifyingglass"),
-        "subagent" | "task" => ("子智能体", "person.2"),
-        "question" => ("提问", "questionmark.circle"),
+        "subagent" | "task" | "agent" => ("子智能体", "person.2"),
+        "question" | "askuserquestion" => ("提问", "questionmark.circle"),
         "skill" => ("技能", "sparkles"),
         "todowrite" | "todoread" => ("待办", "checklist"),
         "execute" => ("执行代码", "curlybraces"),
         "" => ("工具", "hammer"),
-        other => (other, "hammer"),
+        _ => (name, "hammer"),
     }
 }
 
@@ -4201,12 +4202,12 @@ fn command_engine(wanted: &str, session: &str) -> Option<String> {
     } else {
         return None;
     };
-    // 按档挑时不挑 OpenCode 的（交给它自己的智能体，命令的内容它不按 Friday 的来）
+    // 按档挑时不挑 OpenCode / Claude Code 的（交给它自己的智能体，命令的内容它不按 Friday 的来）
     let pool: Vec<friday_core::chooser::Candidate> = all
         .iter()
         .map(|engine| {
             let candidate = friday_core::chooser::Candidate::from_json(engine);
-            friday_core::chooser::Candidate { usable: candidate.usable && !opencode::is_opencode(engine), ..candidate }
+            friday_core::chooser::Candidate { usable: candidate.usable && !agent_powers::is_agent(engine), ..candidate }
         })
         .collect();
     let current = engine_for(session)["id"].as_str().unwrap_or("").to_string();
@@ -5926,10 +5927,10 @@ fn serve() -> Result<(), String> {
     serve_log("serve", &format!("起来了：{address}（{VERSION}）"));
     powers::start();
     models::start();
-    // OpenCode 的引擎跟着能力开关（启动时对一次）
+    // OpenCode / Claude Code 的引擎跟着能力开关（启动时对一次）
     std::thread::spawn(|| {
         std::thread::sleep(Duration::from_secs(3));
-        opencode::powers_changed();
+        agent_powers::powers_changed();
     });
     loops::start();
     plugins::start();
@@ -6934,7 +6935,7 @@ mod powers {
                 if DIRTY.swap(false, Ordering::Relaxed) {
                     crate::notify_all_clients("powers", state());
                     crate::models::powers_changed();
-                    crate::opencode::powers_changed();
+                    crate::agent_powers::powers_changed();
                     crate::caps::powers_changed();
                 }
             }
@@ -7789,7 +7790,7 @@ mod powers {
     fn serving(id: &str) -> bool {
         let address = MANAGER.lock().unwrap().running.get(id).map(|running| (running.url.clone(), running.token.clone()));
         let Some((url, token)) = address.filter(|(url, _)| !url.is_empty()) else { return false };
-        crate::opencode::get(&url, &token, "/v1/info", 3).is_ok_and(|info| info["active"].as_u64().unwrap_or(0) > 0)
+        crate::agent_powers::get(&url, &token, "/v1/info", 3).is_ok_and(|info| info["active"].as_u64().unwrap_or(0) > 0)
     }
 
     /// 有人在用（客户端设备的桥连着）：别当闲着停掉
@@ -9606,7 +9607,7 @@ mod models {
             "models.state" => Ok(state()),
             "models.refresh" => {
                 std::thread::spawn(rescan);
-                crate::opencode::refresh_if_stale();
+                crate::agent_powers::refresh_if_stale();
                 // 生图 / 生视频的家族在 diffusion 的清单里：还没取到索引就取一次
                 if families().is_empty() && !powers::is_refreshing() {
                     std::thread::spawn(powers::refresh);
@@ -9708,8 +9709,8 @@ mod models {
     pub fn endpoint(params: &Value) -> Result<Value, String> {
         let base = params["baseURL"].as_str().unwrap_or("");
         let power = base.strip_prefix("power://").map(|rest| rest.trim_end_matches('/')).unwrap_or("");
-        if power == crate::opencode::POWER {
-            return crate::opencode::endpoint(params);
+        if let Some(kind) = crate::agent_powers::kind(power) {
+            return crate::agent_powers::endpoint(kind, params);
         }
         if power != "llm" {
             return Err(format!("Friday 不认识这个模型地址：{base}"));
@@ -9739,16 +9740,18 @@ mod models {
     }
 }
 
-// MARK: - OpenCode（Friday.Powers 的 opencode）
+// MARK: - 交给别的智能体做的能力（Friday.Powers 的 opencode、claudecode）
 
-mod opencode {
-    //! Friday 的 OpenCode 能力（Friday.Powers 的 opencode Power，桥 friday-opencode；同 Friday 的 OpenCodeModels）：
-    //! 装了、开着时问桥要 OpenCode 里能用的模型（用户在 OpenCode 里登录的服务商、自己配的、免费的），每个在 config.json 建一个引擎
-    //! （baseURL `power://opencode`、model「服务商/模型」、标题「OpenCode · 名字」、supportsTools false）；
-    //! 选了它的会话交给 OpenCode 自己的智能体在工作目录里做，内容实时流回来（大脑见 power://opencode 不发自己的工具、不追问，
+mod agent_powers {
+    //! Friday 的 OpenCode、Claude Code 能力（Friday.Powers 的 opencode / claudecode Power，桥 friday-opencode / friday-claudecode；
+    //! 同 Friday 的 AgentPowers）：装了、开着时问桥要能用的模型（OpenCode 里登录的服务商、免费模型；Claude Code 的默认 / Fable / Opus /
+    //! Sonnet / Haiku），每个在 config.json 建一个引擎（baseURL `power://<id>`、标题「OpenCode · 名字」「Claude Code · 名字」、
+    //! supportsTools false）；选了它的会话交给那边自己的智能体在工作目录里做，内容实时流回来（大脑见这两个地址不发自己的工具、不追问，
     //! 它跑的工具发成 external 事件，网关画成只显示的工具行）。Power 关了 / 卸了：这些引擎跟着关掉。
     //! 模型列表在 Power 装好、打开时取一次，之后客户端打开模型菜单（models.refresh）时隔 10 分钟以上再取。
-    use std::sync::Mutex;
+    //! Claude Code 用的是这台机器上装的 Claude Code 和它自己的登录（桥只拉起没改过的 claude，不碰凭据）。
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
     use std::time::{Duration, Instant};
 
     use serde_json::{Value, json};
@@ -9756,83 +9759,107 @@ mod opencode {
 
     use crate::powers;
 
-    pub const POWER: &str = "opencode";
-    pub const BASE: &str = "power://opencode";
+    pub struct Kind {
+        /// Power 的 id
+        pub id: &'static str,
+        /// 引擎标题的前缀
+        pub name: &'static str,
+        pub base: &'static str,
+    }
 
+    pub const KINDS: [Kind; 2] = [
+        Kind { id: "opencode", name: "OpenCode", base: "power://opencode" },
+        Kind { id: "claudecode", name: "Claude Code", base: "power://claudecode" },
+    ];
+
+    pub fn kind(power: &str) -> Option<&'static Kind> {
+        KINDS.iter().find(|kind| kind.id == power)
+    }
+
+    #[derive(Default)]
     struct State {
         available: Option<bool>,
         last_refresh: Option<Instant>,
         refreshing: bool,
     }
 
-    static STATE: Mutex<State> = Mutex::new(State { available: None, last_refresh: None, refreshing: false });
+    static STATE: LazyLock<Mutex<HashMap<&'static str, State>>> = LazyLock::new(Default::default);
 
-    fn on() -> bool {
-        powers::is_installed(POWER) && powers::is_enabled(POWER)
+    fn on(kind: &Kind) -> bool {
+        powers::is_installed(kind.id) && powers::is_enabled(kind.id)
     }
 
-    pub fn is_opencode(engine: &Value) -> bool {
-        engine["baseURL"].as_str() == Some(BASE)
+    /// 这个引擎是交给别的智能体做的（OpenCode、Claude Code）
+    pub fn is_agent(engine: &Value) -> bool {
+        engine["baseURL"].as_str().is_some_and(|base| KINDS.iter().any(|kind| kind.base == base))
     }
 
-    fn configured() -> usize {
+    fn configured(kind: &Kind) -> usize {
         crate::read_json_file(&crate::config_path())["engines"]
             .as_array()
             .into_iter()
             .flatten()
-            .filter(|engine| is_opencode(engine))
+            .filter(|engine| engine["baseURL"].as_str() == Some(kind.base))
             .count()
     }
 
     /// 本地能力的状态变了（装 / 卸 / 开关；常驻的那份启动时也来一次）：开了去取模型，关了把引擎关掉。
-    /// 启动时已经有 OpenCode 的引擎就先不取（不为这个拉起桥和 OpenCode），等客户端打开模型菜单
+    /// 启动时已经有它的引擎就先不取（不为这个拉起桥），等客户端打开模型菜单
     pub fn powers_changed() {
-        let available = on();
-        let previous = STATE.lock().unwrap().available.replace(available);
-        if previous == Some(available) {
-            return;
-        }
-        set_disabled(!available);
-        if available && (previous.is_some() || configured() == 0) {
-            std::thread::spawn(refresh);
+        for kind in &KINDS {
+            let available = on(kind);
+            let previous = STATE.lock().unwrap().entry(kind.id).or_default().available.replace(available);
+            if previous == Some(available) {
+                continue;
+            }
+            set_disabled(kind, !available);
+            if available && (previous.is_some() || configured(kind) == 0) {
+                std::thread::spawn(move || refresh(kind));
+            }
         }
     }
 
     /// 打开模型菜单时：隔 10 分钟以上（或还没取到过）才再取
     pub fn refresh_if_stale() {
-        if !on() {
-            return;
+        for kind in &KINDS {
+            if !on(kind) {
+                continue;
+            }
+            let stale = {
+                let mut state = STATE.lock().unwrap();
+                let state = state.entry(kind.id).or_default();
+                !state.refreshing && state.last_refresh.is_none_or(|at| at.elapsed() >= Duration::from_secs(600))
+            };
+            if stale {
+                std::thread::spawn(move || refresh(kind));
+            }
         }
-        let state = STATE.lock().unwrap();
-        if state.refreshing || state.last_refresh.is_some_and(|at| at.elapsed() < Duration::from_secs(600)) {
-            return;
-        }
-        drop(state);
-        std::thread::spawn(refresh);
     }
 
-    /// 问桥要模型列表（桥没在跑就拉起来），config.json 里的 OpenCode 引擎按它增删改
-    pub fn refresh() {
+    /// 问桥要模型列表（桥没在跑就拉起来），config.json 里它的引擎按它增删改
+    fn refresh(kind: &'static Kind) {
         {
             let mut state = STATE.lock().unwrap();
-            if state.refreshing || !on() {
+            let state = state.entry(kind.id).or_default();
+            if state.refreshing || !on(kind) {
                 return;
             }
             state.refreshing = true;
         }
-        let result = powers::ensure_running(POWER, Duration::from_secs(60)).and_then(|(url, token)| get(&url, &token, "/v1/models", 30));
-        let mut state = STATE.lock().unwrap();
-        state.refreshing = false;
-        match result {
-            Ok(body) => {
+        let result = powers::ensure_running(kind.id, Duration::from_secs(60)).and_then(|(url, token)| get(&url, &token, "/v1/models", 30));
+        let ok = {
+            let mut state = STATE.lock().unwrap();
+            let state = state.entry(kind.id).or_default();
+            state.refreshing = false;
+            if result.is_ok() {
                 state.last_refresh = Some(Instant::now());
-                drop(state);
-                apply(body["data"].as_array().map(Vec::as_slice).unwrap_or_default());
             }
-            Err(error) => {
-                drop(state);
-                crate::serve_log("opencode", &format!("取 OpenCode 的模型失败：{error}"));
-            }
+            result.is_ok()
+        };
+        match result {
+            Ok(body) if ok => apply(kind, body["data"].as_array().map(Vec::as_slice).unwrap_or_default()),
+            Ok(_) => {}
+            Err(error) => crate::serve_log("agent-powers", &format!("取 {} 的模型失败：{error}", kind.name)),
         }
     }
 
@@ -9859,35 +9886,44 @@ mod opencode {
     }
 
     /// 一个模型的引擎 id（同一个模型总是同一个 id）
-    fn engine_id(model: &str) -> String {
+    fn engine_id(kind: &Kind, model: &str) -> String {
         let hash: String = sha2::Sha256::digest(model.to_lowercase().as_bytes()).iter().take(6).map(|byte| format!("{byte:02x}")).collect();
-        format!("opencode-{hash}")
+        format!("{}-{hash}", kind.id)
     }
 
-    fn engine_json(model: &Value) -> Option<Value> {
-        let id = model["id"].as_str().filter(|id| id.contains('/'))?;
+    fn engine_json(kind: &Kind, model: &Value) -> Option<Value> {
+        let id = model["id"].as_str().filter(|id| !id.is_empty())?;
+        // OpenCode 的是「服务商/模型」
+        if kind.id == "opencode" && !id.contains('/') {
+            return None;
+        }
         let name = model["name"].as_str().filter(|name| !name.is_empty()).unwrap_or_else(|| id.rsplit('/').next().unwrap_or(id));
         let vision = model["input_modalities"].as_array().is_some_and(|inputs| inputs.iter().any(|input| input == "image"));
+        let billing = match model["billing"].as_str() {
+            Some(billing @ ("plan" | "free" | "metered")) => billing,
+            _ if model["free"] == true => "free",
+            _ => "metered",
+        };
         Some(json!({
-            "id": engine_id(id),
-            "title": format!("OpenCode · {name}"),
-            "baseURL": BASE,
+            "id": engine_id(kind, id),
+            "title": format!("{} · {name}", kind.name),
+            "baseURL": kind.base,
             "apiKeySecret": "none",
             "model": id,
             "supportsVision": vision,
-            // OpenCode 用它自己的工具；EDITH 的不发给它
+            // 它用它自己的工具；EDITH 的不发给它
             "supportsTools": false,
             "sendsEnableThinking": false,
             "thinking": "none",
             "maxConcurrency": 4,
-            "billing": if model["free"] == true { "free" } else { "metered" },
+            "billing": billing,
             "disabled": false,
         }))
     }
 
-    /// 按桥报的模型改 config.json：新的加上、有的更新名字 / 看图 / 计费（用户改过的并发等留着），OpenCode 里不再有的删掉
-    fn apply(models: &[Value]) {
-        let wanted: Vec<Value> = models.iter().filter_map(engine_json).collect();
+    /// 按桥报的模型改 config.json：新的加上、有的更新名字 / 看图 / 计费（用户改过的并发等留着），它那边不再有的删掉
+    fn apply(kind: &Kind, models: &[Value]) {
+        let wanted: Vec<Value> = models.iter().filter_map(|model| engine_json(kind, model)).collect();
         let path = crate::config_path();
         let mut config = crate::read_json_file(&path);
         if !config.is_object() {
@@ -9898,7 +9934,7 @@ mod opencode {
         }
         let engines = config["engines"].as_array_mut().unwrap();
         let before = engines.clone();
-        engines.retain(|engine| !is_opencode(engine) || wanted.iter().any(|item| item["id"] == engine["id"]));
+        engines.retain(|engine| engine["baseURL"].as_str() != Some(kind.base) || wanted.iter().any(|item| item["id"] == engine["id"]));
         for engine in &wanted {
             match engines.iter_mut().find(|item| item["id"] == engine["id"]) {
                 Some(existing) => {
@@ -9912,16 +9948,16 @@ mod opencode {
         if *engines != before && crate::write_json_file(&path, &config).is_ok() {
             crate::notify_all_clients("engines.changed", json!({}));
         }
-        crate::serve_log("opencode", &format!("OpenCode 的模型 {} 个", wanted.len()));
+        crate::serve_log("agent-powers", &format!("{} 的模型 {} 个", kind.name, wanted.len()));
     }
 
     /// Power 关了 / 卸了：引擎关掉（会话里选着的不删）；又开了：打开
-    fn set_disabled(disabled: bool) {
+    fn set_disabled(kind: &Kind, disabled: bool) {
         let path = crate::config_path();
         let mut config = crate::read_json_file(&path);
         let mut touched = false;
         for engine in config["engines"].as_array_mut().into_iter().flatten() {
-            if is_opencode(engine) && engine["disabled"].as_bool().unwrap_or(false) != disabled {
+            if engine["baseURL"].as_str() == Some(kind.base) && engine["disabled"].as_bool().unwrap_or(false) != disabled {
                 engine["disabled"] = json!(disabled);
                 touched = true;
             }
@@ -9931,10 +9967,10 @@ mod opencode {
         }
     }
 
-    /// model.endpoint（能力协议 §6.6）：power://opencode 的真地址——拉起桥，回地址、令牌、x_friday
-    /// （session：这段会话 / 子智能体 → 一段 OpenCode 会话；cwd：在哪做；permission：会话框下的权限档；toolEvents：工具活动给结构化的）
-    pub fn endpoint(params: &Value) -> Result<Value, String> {
-        let (url, token) = powers::ensure_running(POWER, Duration::from_secs(60))?;
+    /// model.endpoint（能力协议 §6.6）：power://opencode、power://claudecode 的真地址——拉起桥，回地址、令牌、x_friday
+    /// （session：这段会话 / 子智能体 → 那边的一段会话；cwd：在哪做；permission：会话框下的权限档；toolEvents：工具活动给结构化的）
+    pub fn endpoint(kind: &Kind, params: &Value) -> Result<Value, String> {
+        let (url, token) = powers::ensure_running(kind.id, Duration::from_secs(60))?;
         let session = params["session"].as_str().unwrap_or("");
         let key = match params["agent"].as_str().filter(|agent| !agent.is_empty()) {
             Some(agent) => format!("edith-{session}/{agent}"),
@@ -20935,7 +20971,7 @@ mod caps {
             }
         }
         for engine in crate::services::engines() {
-            if engine["supportsVision"] == true && engine["disabled"] != true && !crate::opencode::is_opencode(&engine) {
+            if engine["supportsVision"] == true && engine["disabled"] != true && !crate::agent_powers::is_agent(&engine) {
                 refresh_listing(&text_of(&engine, "baseURL"), crate::services::engine_secret(&engine).as_deref(), force);
             }
         }
@@ -21009,8 +21045,8 @@ mod caps {
         let (preferred_engines, preferred_connection) = preferred_service();
         if uses_engines(kind) {
             for engine in crate::services::engines() {
-                // OpenCode 的模型交给它自己的智能体做，不能当看图的模型用
-                if engine["supportsVision"] != true || engine["disabled"] == true || crate::opencode::is_opencode(&engine) {
+                // OpenCode / Claude Code 的模型交给它自己的智能体做，不能当看图的模型用
+                if engine["supportsVision"] != true || engine["disabled"] == true || crate::agent_powers::is_agent(&engine) {
                     continue;
                 }
                 let secret = crate::services::engine_secret(&engine);
