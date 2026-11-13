@@ -21686,7 +21686,7 @@ mod caps {
                 (
                     true,
                     format!(
-                        "任务已提交（{source}），任务 ID：{id}。{}通常需要 1–5 分钟，请告诉用户正在生成，稍后用 check_job 查询；不要连续轮询。",
+                        "任务已提交（{source}），任务 ID：{id}。{}通常需要 1–5 分钟：接着调 check_job（job_id 填 {id}），它会等到做完再返回，拿到结果再交付；不要只告诉用户稍后来查。",
                         note.unwrap_or_default()
                     ),
                     Vec::new(),
@@ -21714,6 +21714,61 @@ mod caps {
             save_jobs(registry);
         });
         changed();
+    }
+
+    /// 没做完时接在进度后面的那句（同 Friday）
+    const JOB_NOT_DONE: &str = "还没做完：再调一次 check_job 接着等，拿到结果再交付。";
+
+    /// check_job 的 wait_seconds：不给按 300，限在 0–600（0 = 只查一次不等）；整数、整数值的小数或纯数字文字都认（同 Friday 的 jobWait）
+    fn job_wait(value: Option<&Value>) -> u64 {
+        let seconds = match value {
+            Some(Value::Number(number)) => {
+                number.as_i64().or_else(|| number.as_f64().filter(|value| value.fract() == 0.0).map(|value| value as i64))
+            }
+            Some(Value::String(text)) => text.trim().parse::<i64>().ok(),
+            _ => None,
+        };
+        seconds.unwrap_or(300).clamp(0, 600) as u64
+    }
+
+    /// 等任务做完再返回（check_job；同 Friday 的 checkJob(_:wait:)）：没做完就每 10 秒再查一次，做完、失败、查不了、到时间才返回。
+    /// 以前查一次就让模型「告诉用户稍后再查」，用户得回来再问一次才拿到视频——和「说一次就交付」相反
+    fn check_job_waiting(id: &str, wait: u64) -> (bool, String, Vec<String>) {
+        let started = std::time::Instant::now();
+        loop {
+            let result = check_job(id);
+            let finished = with(|registry| {
+                registry
+                    .jobs
+                    .iter()
+                    .find(|job| {
+                        job["id"] == id || job["remoteID"] == id || job["id"].as_str().is_some_and(|other| other.eq_ignore_ascii_case(id))
+                    })
+                    .is_none_or(|job| matches!(job["status"].as_str(), Some("succeeded" | "failed")))
+            });
+            let remaining = Duration::from_secs(wait).saturating_sub(started.elapsed());
+            if finished || !result.0 || remaining.is_zero() {
+                return result;
+            }
+            std::thread::sleep(remaining.clamp(Duration::from_secs(1), Duration::from_secs(10)));
+        }
+    }
+
+    #[cfg(test)]
+    mod job_tests {
+        use super::*;
+
+        /// check_job 等多久：不给 300、限在 0–600，整数值的小数和纯数字文字都认
+        #[test]
+        fn wait_seconds() {
+            assert_eq!(job_wait(None), 300);
+            assert_eq!(job_wait(Some(&json!(0))), 0);
+            assert_eq!(job_wait(Some(&json!(30.0))), 30);
+            assert_eq!(job_wait(Some(&json!("900"))), 600);
+            assert_eq!(job_wait(Some(&json!(-5))), 0);
+            assert_eq!(job_wait(Some(&json!(1.5))), 300);
+            assert!(JOB_NOT_DONE.contains("再调一次 check_job 接着等"));
+        }
     }
 
     fn check_job(id: &str) -> (bool, String, Vec<String>) {
@@ -21764,12 +21819,12 @@ mod caps {
             Ok(Poll::Pending(message)) => {
                 let suffix = message.as_ref().map(|message| format!("：{message}")).unwrap_or_default();
                 update_job(&job_id, "pending", message, None);
-                (true, format!("任务 {job_id} 排队中{suffix}。请稍后再查。"), Vec::new())
+                (true, format!("任务 {job_id} 排队中{suffix}。{JOB_NOT_DONE}"), Vec::new())
             }
             Ok(Poll::Running(message)) => {
                 let suffix = message.as_ref().map(|message| format!("：{message}")).unwrap_or_default();
                 update_job(&job_id, "running", message, None);
-                (true, format!("任务 {job_id} 生成中{suffix}。请稍后再查（间隔至少 30 秒）。"), Vec::new())
+                (true, format!("任务 {job_id} 生成中{suffix}。{JOB_NOT_DONE}"), Vec::new())
             }
             Ok(Poll::Failed(reason)) => {
                 update_job(&job_id, "failed", Some(reason.clone()), None);
@@ -21924,7 +21979,9 @@ mod caps {
         let has_packages = with(|registry| !registry.packages.is_empty());
         if usable("videoGeneration") || has_packages || has_active_job {
             actions.push(json!({ "name": "check_job", "description": prompt("tool.check_job"),
-                "parameters": { "type": "object", "properties": { "job_id": property("check_job", "job_id", "string") }, "required": ["job_id"] }, "readOnly": true, "timeoutSeconds": 300 }));
+                // 默认等到任务做完（wait_seconds 最多 600）：动作的时限要比它长
+                "parameters": { "type": "object", "properties": { "job_id": property("check_job", "job_id", "string"),
+                    "wait_seconds": property("check_job", "wait_seconds", "integer") }, "required": ["job_id"] }, "readOnly": true, "timeoutSeconds": 660 }));
         }
         let field = |name: &str, kind: &str| (name.to_string(), property("create_provider", name, kind));
         let properties: Map<String, Value> = [
@@ -22043,7 +22100,7 @@ mod caps {
     pub fn act(action: &str, arguments: &Map<String, Value>, caller: Option<&str>, session: &str) -> (bool, String, Vec<String>) {
         match action {
             "check_job" => match argument(arguments, "job_id") {
-                Some(id) => check_job(&id),
+                Some(id) => check_job_waiting(&id, job_wait(arguments.get("wait_seconds"))),
                 None => (false, "缺少参数 job_id".into(), Vec::new()),
             },
             "create_provider" => create_provider(arguments),
