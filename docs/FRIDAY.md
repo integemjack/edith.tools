@@ -73,16 +73,19 @@ Friday 客户端 ──SSH──▶ edith-friday --attach（一条连接一个�
   从魔搭 / HF 下、强制删。`models.use` 在 EDITH 的 `config.json` 里建本地引擎（`power://llm`、「组织/仓库:量化档」）给会话换上，
   大脑每段请求前问常驻的那份 `model.endpoint`（能力协议 §6.6）：拉起 friday-llm，回地址、令牌、`x_friday`（模型文件、会话、优先级）。
   本地大模型关掉时本地引擎跟着标 `disabled`。生图 / 生视频的模型「使用」后记在 `~/.edith/friday/settings.json`。
-- **OpenCode、Claude Code**（Friday.Powers 的 opencode / claudecode Power，桥 friday-opencode / friday-claudecode，协议见 Friday.Powers 的
-  `docs/opencode-protocol.md`、`docs/claudecode-protocol.md`；交给别的智能体做的能力，`mod agent_powers`）：装着、开着时常驻的那份问桥 `/v1/models`，
-  每个模型在 `config.json` 建一个引擎（`power://opencode` / `power://claudecode`、标题「OpenCode · 名字」「Claude Code · 名字」、`supportsTools: false`；
-  它那边没了的删掉，能力关了标 `disabled`），装好 / 打开时取一次，之后客户端打开模型菜单（`models.refresh`）隔 10 分钟再取。
+- **Claude Code**（Friday.Powers 的 claudecode Power，桥 friday-claudecode，协议见 Friday.Powers 的 `docs/claudecode-protocol.md`；
+  交给别的智能体做的能力，`mod agent_powers`）：装着、开着时常驻的那份问桥 `/v1/models`（桥现问 Claude Code，不写死：它更新出了新模型这里跟着有），
+  每个模型在 `config.json` 建一个引擎（`power://claudecode`、标题「Claude Code · 名字」、`supportsTools: false`、`effortLevels`（它报的这个模型能选的思考档）、
+  `summary`（它的一句说明）；它那边没了的删掉，留下的按它报的顺序排，能力关了标 `disabled`），装好 / 打开时取一次，之后客户端打开模型菜单
+  （`models.refresh`）隔 10 分钟再取。客户端的思考档位按 `effortLevels` 列（关 + 它报的；空 = 只能开 / 关）。
   Claude Code 用的是这台装的 Claude Code 和它自己的登录（桥只拉起没改过的 `claude`，不碰凭据）。
   `model.endpoint` 回桥的地址、令牌和 `x_friday`（`session`：`edith-<会话>`，子智能体 `edith-<会话>/<子智能体>`；`cwd`、`permission` 用大脑报的
-  工作目录和这一轮的权限模式；`toolEvents: true`）——活交给那边自己的智能体，大脑见这两个地址不发工具、不追问。
+  工作目录和这一轮的权限模式；`thinking`：会话选的思考档落到这个模型能选的（`off` / `--effort` 的值 / 不分档的 `on`）；`toolEvents: true`）
+  ——活交给那边自己的智能体，大脑见这个地址不发工具、不追问。
   网关把大脑的 `external` 事件和存档里回答上的 `x_edith_tools`（按 `offset` 插回文字中间）画成只显示的工具行（`external: true`、工具的名字和图标，
   Claude Code 的 `Read`、`Bash`… 按小写认）；等确认的行点允许 / 拒绝 = 在对话里回「允许」/「不用了，取消这个操作」（桥按这句放行或拒绝），
   下一句用户的话把那行定成已允许 / 已取消。闲 15 分钟停 Power 之前先问它的 `/v1/info`：`active` 不为 0（一轮可能跑很久）就不停。
+  2026-11-14 去掉了 OpenCode（同 Friday）：以前它建的 `power://opencode` 引擎常驻的那份起来时删掉，装着的 opencode Power 卸掉、索引里有也不列。
   看图模型、按档挑命令的模型不挑它们。
 - **定时任务**（`/loop`，`loops.*`）：会话里打 `/loop …` 不交给模型——常驻的那份建、列、停，问答记进会话（EDITH 的 `note`）；
   到点把 loop.run 提示词交给那段会话的大脑（排在手上这一轮之后，照会话选的档位；大脑没在跑就起），这一轮的回答就是这次的结果，

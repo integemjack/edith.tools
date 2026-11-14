@@ -1628,11 +1628,11 @@ fn tool_models_pick_from_services() {
     assert_eq!(file["models"]["imageGeneration"], "openaicompatible|gw-image-old", "{file}");
 }
 
-/// Friday 的 OpenCode 能力（power://opencode）：大脑的 external 事件画成只显示的工具行（OpenCode 的名字和图标），
+/// Friday 的 Claude Code 能力（power://claudecode）：大脑的 external 事件画成只显示的工具行（Claude Code 工具的中文名和图标），
 /// 存档里回答上的 x_edith_tools 按 offset 插回文字中间；等确认的行点允许 = 在对话里回一句「允许」，之后那行定成已允许
 #[test]
-fn opencode_tool_rows_and_approval() {
-    let home = scratch("friday-opencode");
+fn agent_tool_rows_and_approval() {
+    let home = scratch("friday-agent-tools");
     let work = home.join("work");
     std::fs::create_dir_all(&work).unwrap();
     write_session(&home, &work);
@@ -1653,7 +1653,7 @@ fn opencode_tool_rows_and_approval() {
     push(&mut link, SESSION, "t1", "turn.started", json!({ "text": "看看 a.txt 再删掉" }));
     push(&mut link, SESSION, "t1", "text", json!({ "text": "先看看。" }));
     let read = |extra: Value| {
-        let mut tool = json!({ "id": "oc_1", "name": "read", "input": { "filePath": "a.txt" } });
+        let mut tool = json!({ "id": "cc_1", "name": "Read", "input": { "file_path": "a.txt" } });
         tool.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
         tool
     };
@@ -1665,18 +1665,18 @@ fn opencode_tool_rows_and_approval() {
     let tool = &tools(&message["params"]["message"])[0];
     assert_eq!(
         (tool["name"].as_str(), tool["title"].as_str(), tool["symbol"].as_str()),
-        (Some("read"), Some("读取文件"), Some("doc.text"))
+        (Some("Read"), Some("读取文件"), Some("doc.text"))
     );
     assert_eq!(tool["external"], true, "{tool}");
 
     // 做完：存档里的回答带 x_edith_tools，第二个工具停在等确认
     let shell =
-        json!({ "id": "oc_2", "name": "shell", "input": { "command": "rm a.txt" }, "status": "waiting", "output": "", "offset": 4 });
+        json!({ "id": "cc_2", "name": "Bash", "input": { "command": "rm a.txt" }, "status": "waiting", "output": "", "offset": 4 });
     let stored = [
         json!({ "role": "user", "content": "看看 a.txt 再删掉" }),
         json!({
             "role": "assistant",
-            "content": "先看看。OpenCode 想运行命令 rm a.txt，回复「允许」放行",
+            "content": "先看看。Claude Code 想运行命令 rm a.txt，回复「允许」放行",
             "x_edith_tools": [read(json!({ "status": "success", "output": "x", "offset": 4 })), shell],
         }),
     ];
@@ -1713,11 +1713,11 @@ fn opencode_tool_rows_and_approval() {
     assert_eq!((settled["status"].as_str(), settled["result"].as_str()), (Some("succeeded"), Some("已允许")), "{settled}");
 }
 
-/// OpenCode / Claude Code 的提问（question、AskUserQuestion）：等回答的行在客户端画成选项卡片，点了选项
+/// Claude Code 的提问（AskUserQuestion）：等回答的行在客户端画成选项卡片，点了选项
 /// （runner.resolveApproval 带 answer）= 网关把回答拼成一句话在对话里回（几题用「；」隔开），之后那行定成「回答：…」
 #[test]
-fn opencode_question_answered_from_card() {
-    let home = scratch("friday-opencode-question");
+fn agent_question_answered_from_card() {
+    let home = scratch("friday-agent-question");
     let work = home.join("work");
     std::fs::create_dir_all(&work).unwrap();
     write_session(&home, &work);
@@ -1739,7 +1739,7 @@ fn opencode_question_answered_from_card() {
         { "question": "报告用什么语言？", "header": "语言", "options": [{ "label": "中文" }, { "label": "英文" }] },
         { "question": "要哪些附件？", "header": "附件", "multiple": true, "options": [{ "label": "表格" }, { "label": "摘要" }] }
     ]});
-    let question = json!({ "id": "oc_q", "name": "question", "input": input, "status": "waiting", "output": "等你回答", "offset": 0 });
+    let question = json!({ "id": "cc_q", "name": "AskUserQuestion", "input": input, "status": "waiting", "output": "等你回答", "offset": 0 });
     let stored = [
         json!({ "role": "user", "content": "先问我两个问题" }),
         json!({ "role": "assistant", "content": "", "x_edith_tools": [question] }),
@@ -1756,7 +1756,7 @@ fn opencode_question_answered_from_card() {
     let waiting = tools(nodes(&done).last().unwrap())[0].clone();
     assert_eq!(
         (waiting["status"].as_str(), waiting["name"].as_str(), waiting["external"].as_bool()),
-        (Some("awaitingApproval"), Some("question"), Some(true)),
+        (Some("awaitingApproval"), Some("AskUserQuestion"), Some(true)),
         "{waiting}"
     );
 

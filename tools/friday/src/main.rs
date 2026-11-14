@@ -553,12 +553,12 @@ impl Meta {
 
 // MARK: - 历史 → Friday 的消息
 
-/// 别处执行的工具（OpenCode 的智能体跑的，大脑的 external 事件）：卡片里的工具名带这个前缀，画的时候去掉、标 external（只显示）
+/// 别处执行的工具（Claude Code 的智能体跑的，大脑的 external 事件）：卡片里的工具名带这个前缀，画的时候去掉、标 external（只显示）
 const EXTERNAL: &str = "external:";
-/// EDITH 记在回答那条消息上的这一轮 OpenCode 工具活动（[{id, name, input, status, output, offset}]）
+/// EDITH 记在回答那条消息上的这一轮 Claude Code 工具活动（[{id, name, input, status, output, offset}]）
 const EXTERNAL_TOOLS: &str = "x_edith_tools";
 
-/// 等用户确认的 OpenCode 工具行：卡片 id → 会话（点了允许 / 拒绝 = 在这段对话里回一句，桥按这句放行或拒绝）
+/// 等用户确认的 Claude Code 工具行：卡片 id → 会话（点了允许 / 拒绝 = 在这段对话里回一句，桥按这句放行或拒绝）
 static EXTERNAL_WAITING: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(Default::default);
 
 /// external 事件的状态 → 卡片的
@@ -571,30 +571,29 @@ fn external_status(status: &str) -> &'static str {
     }
 }
 
-/// OpenCode / Claude Code 的工具在卡片上的名字和图标（同 Friday 的 AgentPowers.toolLook；Claude Code 的 Read、Bash… 按小写认）
+/// Claude Code 的工具在卡片上的名字和图标（同 Friday 的 AgentPowers.toolLook；Claude Code 的 Read、Bash… 按小写认）
 fn external_look(name: &str) -> (&str, &'static str) {
     match name.to_lowercase().as_str() {
         "read" => ("读取文件", "doc.text"),
         "write" => ("写入文件", "square.and.pencil"),
-        "edit" | "patch" | "multiedit" | "notebookedit" => ("修改文件", "pencil"),
-        "shell" | "bash" | "bashoutput" | "powershell" => ("运行命令", "terminal"),
+        "edit" | "multiedit" | "notebookedit" => ("修改文件", "pencil"),
+        "bash" | "bashoutput" | "powershell" => ("运行命令", "terminal"),
         "killshell" | "killbash" => ("停止命令", "stop.circle"),
         "grep" => ("搜索内容", "text.magnifyingglass"),
         "glob" => ("查找文件", "doc.text.magnifyingglass"),
-        "list" | "ls" => ("列目录", "folder"),
+        "ls" => ("列目录", "folder"),
         "webfetch" => ("打开网页", "globe"),
         "websearch" => ("搜索网页", "magnifyingglass"),
-        "subagent" | "task" | "agent" => ("子智能体", "person.2"),
-        "question" | "askuserquestion" => ("提问", "questionmark.circle"),
+        "task" | "agent" => ("子智能体", "person.2"),
+        "askuserquestion" => ("提问", "questionmark.circle"),
         "skill" => ("技能", "sparkles"),
-        "todowrite" | "todoread" => ("待办", "checklist"),
-        "execute" => ("执行代码", "curlybraces"),
+        "todowrite" => ("待办", "checklist"),
         "" => ("工具", "hammer"),
         _ => (name, "hammer"),
     }
 }
 
-/// 放行 OpenCode 的确认的话（同桥的 approval()、Friday 的 OpenCodeModels.isApproval）
+/// 放行 Claude Code 的确认的话（同桥的 approval()、Friday 的 AgentPowers.isApproval）
 const APPROVALS: &[&str] = &[
     "总是允许",
     "一直允许",
@@ -617,10 +616,10 @@ const APPROVALS: &[&str] = &[
     "allow",
 ];
 
-/// 用户这句话是不是在放行 OpenCode 的确认（12 个字以内的「允许」「可以」「好」…；附的发出时间不算）
-/// OpenCode 的 question、Claude Code 的 AskUserQuestion：Friday 把等回答的这一行画成选项卡片（== Friday asksUser）
+/// 用户这句话是不是在放行 Claude Code 的确认（12 个字以内的「允许」「可以」「好」…；附的发出时间不算）
+/// Claude Code 的 AskUserQuestion：Friday 把等回答的这一行画成选项卡片（== Friday asksUser）
 fn is_question_tool(name: &str) -> bool {
-    matches!(name.to_lowercase().as_str(), "question" | "askuserquestion")
+    name.eq_ignore_ascii_case("askuserquestion")
 }
 
 /// 选项卡片上的回答（{answers: [每题一条], reply}）→ 在对话里回的那句话（桥按它填回答：几题用「；」隔开，跳过的题写「（跳过）」）（== Friday AgentPowers.answerReply）
@@ -990,7 +989,7 @@ fn group_in(session: &str, owner: &str, history: &[Value], team: &Team) -> Vec<N
     let mut open: HashMap<String, (usize, usize)> = HashMap::new();
     // （第几条消息, 调用 id）→ 用过几次
     let mut uses: HashMap<(usize, String), usize> = HashMap::new();
-    // 等用户确认的 OpenCode 工具行（第几条消息, 第几块）：下一句用户的话定下来（允许了 / 取消了）
+    // 等用户确认的 Claude Code 工具行（第几条消息, 第几块）：下一句用户的话定下来（允许了 / 取消了）
     let mut waiting: Vec<(usize, usize)> = Vec::new();
     for (index, message) in history.iter().enumerate() {
         match message["role"].as_str() {
@@ -1017,7 +1016,7 @@ fn group_in(session: &str, owner: &str, history: &[Value], team: &Team) -> Vec<N
                     }
                     continue;
                 }
-                // 回的是 OpenCode 等着的确认：那几行改成已允许（先记成成功，OpenCode 接着跑完的在下一条回答里）/ 已取消；
+                // 回的是 Claude Code 等着的确认：那几行改成已允许（先记成成功，Claude Code 接着跑完的在下一条回答里）/ 已取消；
                 // 等回答的提问：这句话就是回答
                 if !waiting.is_empty() {
                     let approved = is_approval(&text);
@@ -1073,7 +1072,7 @@ fn group_in(session: &str, owner: &str, history: &[Value], team: &Team) -> Vec<N
                         node.blocks.push(text_block(session, &format!("{index}.text"), "text", content));
                     }
                 } else {
-                    // OpenCode 的工具活动：按出现时写了几个字插回文字中间
+                    // Claude Code 的工具活动：按出现时写了几个字插回文字中间
                     let chars: Vec<char> = content.chars().collect();
                     let mut from = 0;
                     for (n, tool) in externals.iter().enumerate() {
@@ -2035,8 +2034,11 @@ fn engines_state() -> Value {
     })
 }
 
-/// 思考档位（同 Friday 的 EngineConfig::thinkingLevels）
+/// 思考档位（同 Friday 的 EngineConfig::thinkingLevels；Claude Code 的模型按它报的 effortLevels）
 fn thinking_levels(engine: &Value) -> Vec<&'static str> {
+    if let Some(efforts) = engine["effortLevels"].as_array() {
+        return agent_powers::levels(efforts);
+    }
     match engine["thinking"].as_str().unwrap_or("none") {
         "toggle" | "thinkingType" => vec!["off", "medium"],
         "effort" => vec!["off", "low", "medium", "high"],
@@ -2431,7 +2433,7 @@ fn on_brain_event(params: &Value) {
                     }
                     "stats" => live.stats(data),
                     "notice" => live.notice(text),
-                    // OpenCode 的智能体跑的工具（只显示）：同一个 id 先 running，再成功 / 失败 / 等确认
+                    // Claude Code 的智能体跑的工具（只显示）：同一个 id 先 running，再成功 / 失败 / 等确认
                     "external" => {
                         let call = data["id"].as_str().unwrap_or("");
                         if live.find_tool(call).is_none() {
@@ -4229,7 +4231,7 @@ fn command_engine(wanted: &str, session: &str) -> Option<String> {
     } else {
         return None;
     };
-    // 按档挑时不挑 OpenCode / Claude Code 的（交给它自己的智能体，命令的内容它不按 Friday 的来）
+    // 按档挑时不挑 Claude Code 的（交给它自己的智能体，命令的内容它不按 Friday 的来）
     let pool: Vec<friday_core::chooser::Candidate> = all
         .iter()
         .map(|engine| {
@@ -4690,7 +4692,7 @@ fn handle(method: &str, params: &Value) -> Reply {
             let approved = params["approved"].as_bool().unwrap_or(false);
             let pending = STATE.lock().unwrap().approvals.remove(&event_id);
             let Some(pending) = pending else {
-                // OpenCode / Claude Code 等确认的工具行（大脑那边没有待确认，它停着等下一句）：在这段对话里回一句，桥按它放行 / 拒绝；
+                // Claude Code 等确认的工具行（大脑那边没有待确认，它停着等下一句）：在这段对话里回一句，桥按它放行 / 拒绝；
                 // 带 answer 的是在它的提问卡片上点了选项：回答写成一句话
                 let session = EXTERNAL_WAITING.lock().unwrap().remove(&event_id).ok_or((NOT_FOUND, "会话已经不在等这个了".to_string()))?;
                 let text = if params["answer"].is_object() {
@@ -5961,9 +5963,10 @@ fn serve() -> Result<(), String> {
     serve_log("serve", &format!("起来了：{address}（{VERSION}）"));
     powers::start();
     models::start();
-    // OpenCode / Claude Code 的引擎跟着能力开关（启动时对一次）
+    // Claude Code 的引擎跟着能力开关（启动时对一次）；去掉了的 Claude Code 的引擎删掉
     std::thread::spawn(|| {
         std::thread::sleep(Duration::from_secs(3));
+        agent_powers::remove_retired();
         agent_powers::powers_changed();
     });
     loops::start();
@@ -6582,6 +6585,10 @@ mod powers {
 
     impl Spec {
         fn parse(value: &Value) -> Option<Spec> {
+            // 不再提供的（OpenCode）：索引里还有也不列
+            if value["id"].as_str().is_some_and(|id| RETIRED.contains(&id)) {
+                return None;
+            }
             let models = value["models"]
                 .as_array()
                 .into_iter()
@@ -6943,6 +6950,9 @@ mod powers {
         serde_json::from_slice(&std::fs::read(path).ok()?).ok()
     }
 
+    /// 不再提供的 Power（2026-11-14 去掉 OpenCode，同 Friday）：索引里还有也不列，装着的起来时卸掉
+    pub const RETIRED: [&str; 1] = ["opencode"];
+
     /// 起来时：读装了的、缓存的索引，清掉没人用的运行库；20 秒后取索引、之后每 6 小时，每分钟看一次闲着的进程
     pub fn start() {
         {
@@ -6962,6 +6972,12 @@ mod powers {
                 manager.runtimes = parse_runtimes(&index);
             }
             cleanup_runtimes(&manager);
+        }
+        // 不再提供的 Power 装着的卸掉（同 Friday 的 PowerManager.retired）
+        for id in RETIRED {
+            if is_installed(id) {
+                uninstall(id);
+            }
         }
         std::thread::spawn(|| {
             loop {
@@ -6996,7 +7012,7 @@ mod powers {
                         .collect()
                 };
                 for id in idle {
-                    // 还有请求在跑（OpenCode 的一轮可能跑很久，期间不再问桥）：不算闲着
+                    // 还有请求在跑（Claude Code 的一轮可能跑很久，期间不再问桥）：不算闲着
                     if serving(&id) {
                         touch(&id);
                         continue;
@@ -7820,7 +7836,7 @@ mod powers {
         MANAGER.lock().unwrap().installed.contains_key(id)
     }
 
-    /// 它自己说还有请求在跑（GET /v1/info 的 active，OpenCode 的桥报）
+    /// 它自己说还有请求在跑（GET /v1/info 的 active，Claude Code 的桥报）
     fn serving(id: &str) -> bool {
         let address = MANAGER.lock().unwrap().running.get(id).map(|running| (running.url.clone(), running.token.clone()));
         let Some((url, token)) = address.filter(|(url, _)| !url.is_empty()) else { return false };
@@ -9774,16 +9790,16 @@ mod models {
     }
 }
 
-// MARK: - 交给别的智能体做的能力（Friday.Powers 的 opencode、claudecode）
+// MARK: - 交给别的智能体做的能力（Friday.Powers 的 claudecode）
 
 mod agent_powers {
-    //! Friday 的 OpenCode、Claude Code 能力（Friday.Powers 的 opencode / claudecode Power，桥 friday-opencode / friday-claudecode；
-    //! 同 Friday 的 AgentPowers）：装了、开着时问桥要能用的模型（OpenCode 里登录的服务商、免费模型；Claude Code 的默认 / Fable / Opus /
-    //! Sonnet / Haiku），每个在 config.json 建一个引擎（baseURL `power://<id>`、标题「OpenCode · 名字」「Claude Code · 名字」、
-    //! supportsTools false）；选了它的会话交给那边自己的智能体在工作目录里做，内容实时流回来（大脑见这两个地址不发自己的工具、不追问，
-    //! 它跑的工具发成 external 事件，网关画成只显示的工具行）。Power 关了 / 卸了：这些引擎跟着关掉。
-    //! 模型列表在 Power 装好、打开时取一次，之后客户端打开模型菜单（models.refresh）时隔 10 分钟以上再取。
+    //! Friday 的 Claude Code 能力（Friday.Powers 的 claudecode Power，桥 friday-claudecode；同 Friday 的 AgentPowers）：装了、开着时问桥要
+    //! 能用的模型（桥现问 Claude Code，不写死：它更新出了新模型这里跟着有），每个在 config.json 建一个引擎（baseURL `power://claudecode`、
+    //! 标题「Claude Code · 名字」、supportsTools false、它报的能选的思考档 effortLevels 和一句说明 summary）；选了它的会话交给那边自己的
+    //! 智能体在工作目录里做，内容实时流回来（大脑见这个地址不发自己的工具、不追问，它跑的工具发成 external 事件，网关画成只显示的工具行）。
+    //! Power 关了 / 卸了：这些引擎跟着关掉。模型列表在 Power 装好、打开时取一次，之后客户端打开模型菜单（models.refresh）时隔 10 分钟以上再取。
     //! Claude Code 用的是这台机器上装的 Claude Code 和它自己的登录（桥只拉起没改过的 claude，不碰凭据）。
+    //! 2026-11-14 去掉了 OpenCode（同 Friday）：以前它建的 power://opencode 引擎启动时删掉（remove_retired），装着的 opencode 卸掉（powers::RETIRED）。
     use std::collections::HashMap;
     use std::sync::{LazyLock, Mutex};
     use std::time::{Duration, Instant};
@@ -9801,10 +9817,55 @@ mod agent_powers {
         pub base: &'static str,
     }
 
-    pub const KINDS: [Kind; 2] = [
-        Kind { id: "opencode", name: "OpenCode", base: "power://opencode" },
-        Kind { id: "claudecode", name: "Claude Code", base: "power://claudecode" },
-    ];
+    pub const KINDS: [Kind; 1] = [Kind { id: "claudecode", name: "Claude Code", base: "power://claudecode" }];
+
+    /// 去掉了的能力（OpenCode）以前建的引擎：常驻的那份起来时删掉
+    pub fn remove_retired() {
+        let path = crate::config_path();
+        let mut config = crate::read_json_file(&path);
+        let Some(engines) = config["engines"].as_array_mut() else { return };
+        let before = engines.len();
+        engines.retain(|engine| engine["baseURL"].as_str() != Some("power://opencode"));
+        if engines.len() != before && crate::write_json_file(&path, &config).is_ok() {
+            crate::notify_all_clients("engines.changed", json!({}));
+        }
+    }
+
+    /// 从低到高的思考档（同 Friday 的 ThinkingLevel：以前的 ultra 按高）
+    fn rank(level: &str) -> u8 {
+        match level {
+            "off" => 0,
+            "low" => 1,
+            "medium" => 2,
+            "high" | "ultra" => 3,
+            "xhigh" => 4,
+            "max" => 5,
+            _ => 2,
+        }
+    }
+
+    /// 它报的能选的思考档（引擎的 effortLevels）→ 可选的档位（同 friday.core 的 effort_thinking_levels）：关 + 它报的（按从低到高）；
+    /// 报的是空的（不分档，如 Haiku）= 只能开 / 关
+    pub fn levels(efforts: &[Value]) -> Vec<&'static str> {
+        let known: Vec<&'static str> = ["low", "medium", "high", "xhigh", "max"].into_iter().filter(|level| efforts.iter().any(|e| e == level)).collect();
+        if known.is_empty() { vec!["off", "medium"] } else { std::iter::once("off").chain(known).collect() }
+    }
+
+    /// 发给桥的思考档（x_friday.thinking；同 Friday 的 AgentPowers.thinkingHint）：会话选的档落到这个模型能选的档上——关着 = off，
+    /// 不分档的 = on，其余 = --effort 的值；引擎没有 effortLevels（旧版的桥）= 不传
+    pub fn thinking_hint(level: &str, engine: &Value) -> Option<String> {
+        let efforts = engine["effortLevels"].as_array()?;
+        if level == "off" {
+            return Some("off".into());
+        }
+        if efforts.is_empty() {
+            return Some("on".into());
+        }
+        let levels = levels(efforts);
+        let on: Vec<&str> = levels.iter().copied().filter(|l| *l != "off").collect();
+        let fitted = on.iter().rev().find(|l| rank(l) <= rank(level)).or(on.first()).copied().unwrap_or("medium");
+        Some(fitted.to_string())
+    }
 
     pub fn kind(power: &str) -> Option<&'static Kind> {
         KINDS.iter().find(|kind| kind.id == power)
@@ -9823,7 +9884,7 @@ mod agent_powers {
         powers::is_installed(kind.id) && powers::is_enabled(kind.id)
     }
 
-    /// 这个引擎是交给别的智能体做的（OpenCode、Claude Code）
+    /// 这个引擎是交给别的智能体做的（Claude Code）
     pub fn is_agent(engine: &Value) -> bool {
         engine["baseURL"].as_str().is_some_and(|base| KINDS.iter().any(|kind| kind.base == base))
     }
@@ -9927,18 +9988,14 @@ mod agent_powers {
 
     fn engine_json(kind: &Kind, model: &Value) -> Option<Value> {
         let id = model["id"].as_str().filter(|id| !id.is_empty())?;
-        // OpenCode 的是「服务商/模型」
-        if kind.id == "opencode" && !id.contains('/') {
-            return None;
-        }
-        let name = model["name"].as_str().filter(|name| !name.is_empty()).unwrap_or_else(|| id.rsplit('/').next().unwrap_or(id));
+        let name = model["name"].as_str().filter(|name| !name.is_empty()).unwrap_or(id);
         let vision = model["input_modalities"].as_array().is_some_and(|inputs| inputs.iter().any(|input| input == "image"));
         let billing = match model["billing"].as_str() {
             Some(billing @ ("plan" | "free" | "metered")) => billing,
             _ if model["free"] == true => "free",
             _ => "metered",
         };
-        Some(json!({
+        let mut engine = json!({
             "id": engine_id(kind, id),
             "title": format!("{} · {name}", kind.name),
             "baseURL": kind.base,
@@ -9948,14 +10005,23 @@ mod agent_powers {
             // 它用它自己的工具；EDITH 的不发给它
             "supportsTools": false,
             "sendsEnableThinking": false,
+            // 思考档不走 reasoning_effort：按它报的能选的档列（effortLevels），选的档放进 x_friday.thinking（endpoint）
             "thinking": "none",
             "maxConcurrency": 4,
             "billing": billing,
             "disabled": false,
-        }))
+        });
+        if let Some(efforts) = model["efforts"].as_array() {
+            engine["effortLevels"] = json!(efforts.iter().filter(|level| level.is_string()).collect::<Vec<_>>());
+        }
+        if let Some(summary) = model["description"].as_str().map(str::trim).filter(|text| !text.is_empty()) {
+            engine["summary"] = json!(summary);
+        }
+        Some(engine)
     }
 
-    /// 按桥报的模型改 config.json：新的加上、有的更新名字 / 看图 / 计费（用户改过的并发等留着），它那边不再有的删掉
+    /// 按桥报的模型改 config.json：新的加上、有的更新名字 / 看图 / 计费 / 思考档 / 说明（用户改过的并发等留着），它那边不再有的删掉，
+    /// 留下的按它报的顺序排（各占原来的位置）
     fn apply(kind: &Kind, models: &[Value]) {
         let wanted: Vec<Value> = models.iter().filter_map(|model| engine_json(kind, model)).collect();
         let path = crate::config_path();
@@ -9975,8 +10041,24 @@ mod agent_powers {
                     for key in ["title", "baseURL", "model", "supportsVision", "supportsTools", "thinking", "billing", "disabled"] {
                         existing[key] = engine[key].clone();
                     }
+                    for key in ["effortLevels", "summary"] {
+                        match engine.get(key) {
+                            Some(value) => existing[key] = value.clone(),
+                            None => {
+                                existing.as_object_mut().map(|object| object.remove(key));
+                            }
+                        }
+                    }
                 }
                 None => engines.push(engine.clone()),
+            }
+        }
+        let places: Vec<usize> = (0..engines.len()).filter(|&i| engines[i]["baseURL"].as_str() == Some(kind.base)).collect();
+        let ordered: Vec<Value> =
+            wanted.iter().filter_map(|item| engines.iter().find(|engine| engine["id"] == item["id"]).cloned()).collect();
+        if ordered.len() == places.len() {
+            for (place, engine) in places.into_iter().zip(ordered) {
+                engines[place] = engine;
             }
         }
         if *engines != before && crate::write_json_file(&path, &config).is_ok() {
@@ -10001,8 +10083,9 @@ mod agent_powers {
         }
     }
 
-    /// model.endpoint（能力协议 §6.6）：power://opencode、power://claudecode 的真地址——拉起桥，回地址、令牌、x_friday
-    /// （session：这段会话 / 子智能体 → 那边的一段会话；cwd：在哪做；permission：会话框下的权限档；toolEvents：工具活动给结构化的）
+    /// model.endpoint（能力协议 §6.6）：power://claudecode 的真地址——拉起桥，回地址、令牌、x_friday
+    /// （session：这段会话 / 子智能体 → 那边的一段会话；cwd：在哪做；permission：会话框下的权限档；thinking：会话选的思考档落到这个模型
+    /// 能选的；toolEvents：工具活动给结构化的）
     pub fn endpoint(kind: &Kind, params: &Value) -> Result<Value, String> {
         let (url, token) = powers::ensure_running(kind.id, Duration::from_secs(60))?;
         let session = params["session"].as_str().unwrap_or("");
@@ -10020,7 +10103,37 @@ mod agent_powers {
         if let Some(cwd) = params["cwd"].as_str().filter(|cwd| !cwd.is_empty()) {
             hints["cwd"] = json!(cwd);
         }
+        let model = params["model"].as_str().unwrap_or("");
+        let engine = crate::engines().into_iter().find(|engine| engine["baseURL"].as_str() == Some(kind.base) && engine["model"] == model);
+        let level = crate::META.setting(session, "thinking").unwrap_or_else(|| "off".into());
+        if let Some(thinking) = engine.and_then(|engine| thinking_hint(&level, &engine)) {
+            hints["thinking"] = json!(thinking);
+        }
         Ok(json!({ "baseURL": format!("{url}/v1"), "apiKey": token, "body": { "x_friday": hints } }))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn thinking_from_reported_efforts() {
+            let opus = json!({ "effortLevels": ["low", "medium", "high", "xhigh", "max"] });
+            assert_eq!(levels(opus["effortLevels"].as_array().unwrap()), ["off", "low", "medium", "high", "xhigh", "max"]);
+            assert_eq!(thinking_hint("max", &opus).as_deref(), Some("max"));
+            assert_eq!(thinking_hint("off", &opus).as_deref(), Some("off"));
+            assert_eq!(thinking_hint("ultra", &opus).as_deref(), Some("high"));
+            let old = json!({ "effortLevels": ["low", "medium", "high"] });
+            assert_eq!(thinking_hint("max", &old).as_deref(), Some("high"));
+            let haiku = json!({ "effortLevels": [] });
+            assert_eq!(levels(&[]), ["off", "medium"]);
+            assert_eq!(thinking_hint("high", &haiku).as_deref(), Some("on"));
+            // 旧版的桥不报：不传
+            assert_eq!(thinking_hint("high", &json!({})), None);
+            let engine = engine_json(&KINDS[0], &json!({ "id": "opus[1m]", "name": "Opus (1M context)", "description": "Opus 5 with 1M context", "efforts": ["low", "max"] })).unwrap();
+            assert_eq!((engine["title"].as_str(), engine["effortLevels"].clone(), engine["summary"].as_str()),
+                       (Some("Claude Code · Opus (1M context)"), json!(["low", "max"]), Some("Opus 5 with 1M context")));
+        }
     }
 }
 
@@ -21080,7 +21193,7 @@ mod caps {
         let (preferred_engines, preferred_connection) = preferred_service();
         if uses_engines(kind) {
             for engine in crate::services::engines() {
-                // OpenCode / Claude Code 的模型交给它自己的智能体做，不能当看图的模型用
+                // Claude Code 的模型交给它自己的智能体做，不能当看图的模型用
                 if engine["supportsVision"] != true || engine["disabled"] == true || crate::agent_powers::is_agent(&engine) {
                     continue;
                 }
