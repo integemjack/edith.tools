@@ -76,7 +76,7 @@ Friday 客户端 ──SSH──▶ edith-friday --attach（一条连接一个�
 - **Claude Code**（Friday.Powers 的 claudecode Power，桥 friday-claudecode，协议见 Friday.Powers 的 `docs/claudecode-protocol.md`；
   交给别的智能体做的能力，`mod agent_powers`）：装着、开着时常驻的那份问桥 `/v1/models`（桥现问 Claude Code，不写死：它更新出了新模型这里跟着有），
   每个模型在 `config.json` 建一个引擎（`power://claudecode`、标题「Claude Code · 名字」、`supportsTools: false`、`effortLevels`（它报的这个模型能选的思考档）、
-  `summary`（它的一句说明）；它那边没了的删掉，留下的按它报的顺序排，能力关了标 `disabled`），装好 / 打开时取一次，之后客户端打开模型菜单
+  `summary`（它的一句说明）、`group`（`overflow` = 其他版本，客户端放进「更多版本」）；它那边没了的删掉，留下的按它报的顺序排，能力关了标 `disabled`），装好 / 打开时取一次，之后客户端打开模型菜单
   （`models.refresh`）隔 10 分钟再取。客户端的思考档位按 `effortLevels` 列（关 + 它报的；空 = 只能开 / 关）。
   Claude Code 用的是这台装的 Claude Code 和它自己的登录（桥只拉起没改过的 `claude`，不碰凭据）。
   `model.endpoint` 回桥的地址、令牌和 `x_friday`（`session`：`edith-<会话>`，子智能体 `edith-<会话>/<子智能体>`；`cwd`、`permission` 用大脑报的
@@ -85,6 +85,7 @@ Friday 客户端 ──SSH──▶ edith-friday --attach（一条连接一个�
   网关把大脑的 `external` 事件和存档里回答上的 `x_edith_tools`（按 `offset` 插回文字中间）画成只显示的工具行（`external: true`、工具的名字和图标，
   Claude Code 的 `Read`、`Bash`… 按小写认）；等确认的行点允许 / 拒绝 = 在对话里回「允许」/「不用了，取消这个操作」（桥按这句放行或拒绝），
   下一句用户的话把那行定成已允许 / 已取消。闲 15 分钟停 Power 之前先问它的 `/v1/info`：`active` 不为 0（一轮可能跑很久）就不停。
+  额度：客户端的 `services.usage` 带 baseURL `power://claudecode` 时问这台桥的 `/v1/usage`（claude 的 `get_usage`，就是 `/usage`），回 Friday 的额度报告。
   2026-11-14 去掉了 OpenCode（同 Friday）：以前它建的 `power://opencode` 引擎常驻的那份起来时删掉，装着的 opencode Power 卸掉、索引里有也不列。
   看图模型、按档挑命令的模型不挑它们。
 - **定时任务**（`/loop`，`loops.*`）：会话里打 `/loop …` 不交给模型——常驻的那份建、列、停，问答记进会话（EDITH 的 `note`）；

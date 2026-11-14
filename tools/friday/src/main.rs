@@ -9871,6 +9871,19 @@ mod agent_powers {
         KINDS.iter().find(|kind| kind.id == power)
     }
 
+    /// 地址是 power://<能力> 的那个能力
+    pub fn kind_for_base(base: &str) -> Option<&'static Kind> {
+        KINDS.iter().find(|kind| kind.base == base.trim())
+    }
+
+    /// 额度（services.usage 的 power://claudecode，同 Friday 的 ServiceUsage agentPower）：拉起桥问 GET /v1/usage（它让 claude 用自己的登录查
+    /// /usage），回 Friday 的额度报告
+    pub fn usage(kind: &Kind) -> Result<Value, String> {
+        let (url, token) = powers::ensure_running(kind.id, Duration::from_secs(60))?;
+        let body = get(&url, &token, "/v1/usage", 60)?;
+        Ok(body["report"].clone())
+    }
+
     #[derive(Default)]
     struct State {
         available: Option<bool>,
@@ -10017,6 +10030,10 @@ mod agent_powers {
         if let Some(summary) = model["description"].as_str().map(str::trim).filter(|text| !text.is_empty()) {
             engine["summary"] = json!(summary);
         }
+        // 其他版本（Opus 4.7、Sonnet 4.6……）：客户端的模型菜单放进「更多版本」
+        if model["group"] == "overflow" {
+            engine["group"] = json!("overflow");
+        }
         Some(engine)
     }
 
@@ -10041,7 +10058,7 @@ mod agent_powers {
                     for key in ["title", "baseURL", "model", "supportsVision", "supportsTools", "thinking", "billing", "disabled"] {
                         existing[key] = engine[key].clone();
                     }
-                    for key in ["effortLevels", "summary"] {
+                    for key in ["effortLevels", "summary", "group"] {
                         match engine.get(key) {
                             Some(value) => existing[key] = value.clone(),
                             None => {
@@ -10133,6 +10150,10 @@ mod agent_powers {
             let engine = engine_json(&KINDS[0], &json!({ "id": "opus[1m]", "name": "Opus (1M context)", "description": "Opus 5 with 1M context", "efforts": ["low", "max"] })).unwrap();
             assert_eq!((engine["title"].as_str(), engine["effortLevels"].clone(), engine["summary"].as_str()),
                        (Some("Claude Code · Opus (1M context)"), json!(["low", "max"]), Some("Opus 5 with 1M context")));
+            assert!(engine.get("group").is_none());
+            let older = engine_json(&KINDS[0], &json!({ "id": "claude-opus-4-7", "name": "Opus 4.7", "group": "overflow", "efforts": ["low"] })).unwrap();
+            assert_eq!((older["title"].as_str(), older["group"].as_str()), (Some("Claude Code · Opus 4.7"), Some("overflow")));
+            assert!(kind_for_base("power://claudecode").is_some() && kind_for_base("power://opencode").is_none());
         }
     }
 }
@@ -16872,6 +16893,18 @@ mod usage {
 
     pub fn request(params: &Value) -> Value {
         let base = params["baseURL"].as_str().unwrap_or("").to_string();
+        // Claude Code（power://claudecode）：问这台的桥 /v1/usage，不用密钥（同 Friday）
+        if let Some(kind) = crate::agent_powers::kind_for_base(&base) {
+            let mut result = json!({ "supported": true, "observed": observed(&base, "") });
+            if params["observedOnly"] != true {
+                match crate::agent_powers::usage(kind) {
+                    Ok(report) if report.is_object() => result["report"] = report,
+                    Ok(_) => {}
+                    Err(error) => result["error"] = json!(error),
+                }
+            }
+            return result;
+        }
         let custom = params["custom"].as_bool().unwrap_or(false);
         let mut result =
             json!({ "supported": can_query(&base, custom), "observed": observed(&base, params["secretName"].as_str().unwrap_or("")) });
