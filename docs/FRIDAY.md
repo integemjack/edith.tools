@@ -28,6 +28,11 @@ Friday 客户端 ──SSH──▶ edith-friday --attach（一条连接一个�
 - **批准**：网关连大脑时说自己能批准、是全权的连接。大脑要批准的事变成 Friday 的「待确认」（卡片上的「允许执行 / 拒绝」、
   侧边栏的手、`attention`），客户端点了回给大脑。卡片是连上之前出的，就按批准请求补一张。
 - **用户打的字**：交给大脑时说是 `kind: "user"`，模型看到的同终端里打的一样，不标「由能力传来」。
+- **助手替用户发的**（`runner.submit` 的 `from: {kind: "assistant", label}`，客户端的助手发给这台的会话；这台自己的助手发的落款是「助手」）：
+  落款交给大脑（`sense` 的 `from`），它给模型的那段前面加一行转达说明（「」里是用户原话，其余是助手的建议、用户没点过头；同 Friday 的
+  relayNote）；落款以「· 用户已确认」结尾的（用户在卡片上点了「是 / 开始」才发的）写成「用户看过、点了同意」，以「· 原话」结尾的不加。
+  会话里这条用户消息不显示那行说明、带 `sentBy`（落款）；`activity` 的 `started` 报 `by: "assistant"`（「· 原话」的算 `user`）、
+  `request` 是那句话（最多 600 字）——客户端的助手按它记「助手派的」、自己让它接着做了几轮。
 - **子智能体**：EDITH 推的 `agent` / `agent.event` 拼成 Friday 的样子（同 Friday 的 SubAgentRunner）：`delegate_task` 那张卡片就是那个子智能体
   （名字、运行记录、状态、交回的结果），并联 / 工作流的卡片里每个子智能体一张子卡片，往下派的照样嵌进去；在跑的进 Agent 树（`team` 事件，
   id 是它的卡片 id，上级是派它的那张卡片、主智能体派的是会话）。做完的从 EDITH 存的运行记录（`agents/<会话>/<id>.json`）读回来。
@@ -151,14 +156,44 @@ Friday 客户端 ──SSH──▶ edith-friday --attach（一条连接一个�
     `instructions`，id 记在 `~/.edith/friday/assistant/state.json`）。用户说的话交给它，后面附上「[现在]」和状态板；助手在回时用户又说话就打断它带上这句重来
     （`urgency: interrupt`）；它的回复边写边进日志，回「（不说）」的标 silent。以「#短号」开头的话原样发给那段会话、不经过大脑。
   - **管会话的工具**是常驻那份的动作，只给助手会话（动作的 `sessions`）：`list_sessions`、`create_session`（在某个目录开会话、交任务）、`send_to_session`
-    （默认排到下一轮，`interject` 补进正在做的这一轮）、`read_session`、`manage_session`（停下、关注、改名）、`post_detail`（给看的内容）；记事用 EDITH 的
-    `save_memory` / `search_memory`，定时用 `loop`。
+    （默认排到下一轮，`interject` 补进正在做的这一轮；`extra: true` 是用户要的范围之外、它自己想到还可以做的，不直接发，见下面「做完的每一轮都核对」）、
+    `read_session`、`manage_session`（停下、关注、改名）、`post_detail`（给看的内容）；记事用 EDITH 的 `save_memory` / `search_memory`，定时用 `loop`。
+    助手发给会话的话落款「助手」（`sense` 的 `from`）：会话里那句前面带转达说明。人设改了（这份升级了、名字换了）时第一次交话前用 `sessions.create`
+    把助手会话的专用系统提示换成新的（旧的大脑不认，照旧用原来的）。
   - **状态板**：这台全部会话现在的样子（在跑 / 等确认 / 在问你 / 出错 / 空闲，在跑哪个工具、最后一句、短号、助手派的、用户在等的），代码维护，
     80 毫秒合并推一次（`assistant.board`）。「等确认」靠 EDITH 的 `approval` 事件；回执上的「批准 / 拒绝」（`assistant.resolveApproval`）由客户端连着的网关
     认出手上那件待确认来答。
   - **回执和分诊**：一轮做完按代码模板写（`完成｜机器｜标题 #短号`、挑出来的一句、改了几个文件 · 跑了几条命令 · 用时），不过模型；出错、在问你、等确认、
     卡住（在跑 5 分钟没动静，有工具在跑时 15 分钟）立即，助手派的、关注的、30 分钟内提到过的「用户在等」及时——这两级叫醒助手（每小时最多 30 次，
     客户端前台正看着那段会话时不叫），带上交给它的和它最后的回答让它核对；别的只上状态板、记日志。推送（`assistant.push`）按推送规则（默认要紧的）。
+  - **做完的每一轮都核对、没做到的接着做**（同 Friday 2026-11-24，Friday 仓库 qt/docs/ASSISTANT.md §19）：
+    - 正常做完的一轮（简报是完成）**不管是谁发起的、客户端是不是正看着都叫醒助手**（到了每小时上限时照上面的分）；推不推照旧只看原来的分——
+      只是为了核对才交给助手的那些本来就不推。回执后面给助手：`交给它的：…`（用户的原话，最多 600 字；助手自己让它接着做时这句不换）、
+      `它最后的回答（节选）：…`、`（这是你自己让它接着做的第 N 轮，上一轮你让它做的是：「…」）`（到了上限、没进展时写明别再续）。EDITH 没有任务状态，
+      「还没做完的步骤」不带。
+    - 人设：没做到的用 `send_to_session` 让它接着做、这次不出声；做到了说一两句（问答、闲聊的不说）；用户没要、但值得接着做的带 `extra: true`；
+      要用户拍板的问用户。
+    - **没有用户的新话、只是来了回执时（助手会话的这一轮是回执叫醒的），助手给会话发话由代码拦**（`continue_refusal`，工具结果以「没发：」开头）：
+      同一段会话用户没再对它说话时最多连着 3 轮（`MAX_CONTINUES`；用户在界面里接着说了、经助手转了话、`#短号` 直达了、点了卡片上的「是 / 开始」
+      都从头算）；接着做的那一轮没改文件、没跑命令、没派子智能体，回答也跟上一轮差不多（开头 400 字相邻两字一组的 Dice ≥ 0.8）就不再续；
+      它已经又开了一轮（在跑、等确认，或者最后一次做完的时间跟这条回执对不上）不发；被停下的不续；这次回执说的是一段做完的会话时，
+      只能发给它、或用户让盯着的（助手派的、关注的、30 分钟内问过的）。
+    - **开关关着先问**：设置 `autoContinue`（默认开，`assistant.settings.update`）关着时，助手让刚做完的那段接着做的那句不发，记成一张卡片——
+      日志里一条说明的 `data.question`：`{id, state: pending|answered|closed, answer?, session, machineID, conversationID,
+      questions: [{question: "是否按下面的继续做？\n…", options: [是, 否]}], proposal, proposalFrom, proposalExtra?}`（同 Friday 的卡片，客户端的助手页照样画按钮）。
+      `assistant.answerQuestion {id, answer: {answers, reply?}, source?}`：选了第一个选项（是）才把那句发给会话，落款「助手 · 用户已确认」，记一条
+      「已让 … 接着做（你点了「是」）」；选了别的什么也不做；`reply`（直接回了一句别的）当成用户的话交给助手。答过了、关掉了、找不到回错误 `3`。
+    - **范围之外的**：`send_to_session` 带 `extra: true` 的不管开关都不直接发，成一张「还可以做的」卡片（`proposalExtra`，只有「开始」），点了才发；
+      这种不受上限和「没进展」限制，其余几条照拦。那段会话又开了一轮，还挂着的卡片关掉（「它已经接着做别的了」）。还挂着的卡片附在交给助手的
+      每句话后面（`[等用户点头的卡片]`）。
+    - 聊天工具里卡片单独一条：「#3f2a 登录页 做完了一轮：/ 是否按下面的继续做？/ … / 1. 是 / 2. 否」，能加按钮的带一行「是 / 否」或「开始」
+      （回调 `qa:<卡片>:0:<选项>`，同 Friday）；点了在聊天里回一句结果（那条消息改不了，按钮还在，再点回「已经回答过了」）。不点也行：引用回复那条
+      （编号、选项名，或者自己写一句——交给助手），或者这个聊天只有一张在等时回编号 / 选项名。不是聊天工具里引起的，推到开了「通知」的渠道，
+      客户端收一条 `assistant.push`。
+    - 测试：单元 `assistant::tests::{same_answers_mean_no_progress, continue_note_says_which_round, own_continues_are_gated,
+      question_cards_read_like_fridays}`、`channels::tests::replies_pick_an_option`、`shown_text_tests::relayed_note_is_hidden_and_gives_the_sender`，
+      集成 `finished_turns_are_reviewed_and_continued`（假大脑：做完 → 核对 → 接着做 → 没进展拦下 → 关开关出卡片 → 点「是」→ 又开一轮关掉另一张）。
+      聊天工具里的按钮只编过、没用真的 SChat 点过。
   - **聊天工具渠道**（`assistant.channels.*`，同 Friday 的 ChannelHub）：SChat 机器人（`/bot/v1` 长轮询；服务器是 HTTPS 自签证书时按 SPKI 指纹认，
     第一次连上记下 `options.pin`，之后对不上不连）、Telegram（Bot API 长轮询）、脚本渠道（`options.script`，stdin / stdout 一行一个 JSON：出
     `{type: "send", chatKey, text, replyTo, buttons}`，入 `{type: "message", chatKey, senderID, senderName, text, group, replyTo}`）。配置在
@@ -297,7 +332,7 @@ cp edith ~/.friday-server/bin/                            # 或者 edith 在 PAT
 | 实时语音（特性 `voice`） | `voice.start` / `stop` / `state` / `feed` / `held` / `interrupt` / `playing` / `played`、`voice.state` / `voice.audio` / `voice.clearAudio` / `voice.duck` 事件 |
 | 自我改进（特性 `improve`） | `improve.get` / `run` / `runSelf` / `setEnabled` / `setEngine` / `setRepository` / `accept` / `dismiss` / `push` / `discard`、`improve` 事件 |
 | 客户端的助手看这台的会话（特性 `activity`） | `activity.subscribe` / `unsubscribe`、`activity` / `activity.assistant` 事件 |
-| 助手（特性 `assistant`） | `assistant.status` / `subscribe` / `unsubscribe` / `history` / `say` / `stop` / `settings.update` / `presence` / `resolveApproval` / `clear` / `memory.list`、`assistant.entry` / `board` / `state` / `push` / `reset` 事件 |
+| 助手（特性 `assistant`） | `assistant.status` / `subscribe` / `unsubscribe` / `history` / `say` / `stop` / `settings.update` / `presence` / `resolveApproval` / `answerQuestion`（等用户点头才让会话接着做的卡片）/ `clear` / `memory.list`、`assistant.entry` / `board` / `state` / `push` / `reset` 事件 |
 | 助手的聊天工具 | `assistant.channels.list` / `add` / `update` / `remove` / `removeOwner` / `removeGroup` / `bindCode`、`assistant.channels` 事件 |
 | 助手的通话（SChat 渠道的语音 / 视频电话、P2P 文字、远程工作通道） | 渠道列表的 `calls` / `callsReady`、`options.calls`；设置的 `answerCalls` / `callPolicy` / `quietStart` / `quietEnd` |
 | 客户端设备（特性 `clientDevices`） | hello 的 `features` / `clientDevices.kinds`、`device.*` 反向请求（id `"s:N"`）和通知、工作通道上的 `friday-serial:` / `friday-tcp:` 通道 |
@@ -305,7 +340,8 @@ cp edith ~/.friday-server/bin/                            # 或者 edith 在 PAT
 
 还不行的（回 `-32601` 没有，或错误 `4` 说明原因；`server.features` 不报，客户端就不显示）：
 
-- 渠道里批准工具调用（`approveFromChannels`）、流式回复（SChat streams、Telegram 草稿）、发文件和语音回复、问题卡片还没有；
+- 渠道里批准工具调用（`approveFromChannels`）、流式回复（SChat streams、Telegram 草稿）、发文件和语音回复还没有；问题卡片只有等用户点头才让
+  会话接着做的那两种（「是 / 否」「开始」），会话的 `ask_user`、助手自己问的还没有，卡片答完也不改那条消息（按钮还在）、不带 SChat 的问题卡片样式；
   助手回答会话的 `ask_user` 问题、附件读取还没有。
   不带 `calls` 特性的包（Linux 的 x86、armv7、armv6、riscv64、loong64、ppc64le、s390x）不能打电话、不能连工作通道（渠道列表 `calls: false`；
   客户端设备只有 SSH 进来的反向请求）。
