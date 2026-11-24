@@ -35225,7 +35225,7 @@ mod pty {
     /// 开一个（id 是客户端给的；watcher：开它的连接，开好就接着它）。command 起好后打进去回车
     pub fn open(id: &str, session: &str, cwd: &Path, cols: u16, rows: u16, command: Option<&str>, watcher: &str) -> Result<Value, String> {
         let (program, args) = shell();
-        let terminal = create(id, session, cwd, cols, rows, &program, &args, command, Some(watcher), None)?;
+        let terminal = create(id, session, cwd, cols, rows, &program, &args, command, Some(watcher), None, &[])?;
         if let Some(command) = command.filter(|command| !command.trim().is_empty()) {
             if cfg!(windows) {
                 // PowerShell 起得慢（windows-arm64 上好几秒），起好之前写进去的会被吞掉：等它出过提示符、安静 1.5 秒再写
@@ -35264,12 +35264,20 @@ mod pty {
             vec!["-l".into(), "-i".into(), "-c".into(), command.to_string()]
         };
         let echo = format!("\x1b[2m$\x1b[0m {command}\r\n");
-        let terminal = create(id, session, cwd, 120, 30, &program, &args, Some(command), None, Some(echo.as_bytes()))?;
+        let terminal = create(id, session, cwd, 120, 30, &program, &args, Some(command), None, Some(echo.as_bytes()), AGENT_ENVIRONMENT)?;
         changed();
         Ok(terminal.info())
     }
 
-    /// 起 shell、登记、开读输出和等退出的线程。seed：先放进重放里的字（智能体的终端写的那行 `$ 命令`）
+    /// 智能体的终端另外带的环境变量（同 Friday 的 `LocalTerminal::shellEnvironment` / `TerminalStore.shellEnvironment`，2026-11-24）：
+    /// `-i` 读 rc，装了 oh-my-zsh、它的更新检查到期（默认 13 天）时会在 shell 开头问「Would you like to update? [Y/n]」等一个按键，
+    /// 没人按，命令不执行、没有输出、shell 也不退出，终端一直「运行中」。`DISABLE_AUTO_UPDATE=true` 让它的 check_for_upgrade.sh 不检查
+    /// （rc 里用 `zstyle ':omz:update' mode` 写明了方式的不看它）。不设 `DISABLE_UPDATE_PROMPT`：那是「不问、直接更新」。
+    /// 客户端开的终端（open）不带，照旧看到提问
+    const AGENT_ENVIRONMENT: &[(&str, &str)] = &[("DISABLE_AUTO_UPDATE", "true")];
+
+    /// 起 shell、登记、开读输出和等退出的线程。seed：先放进重放里的字（智能体的终端写的那行 `$ 命令`）；
+    /// environment：在继承来的环境上另外带的变量
     #[allow(clippy::too_many_arguments)]
     fn create(
         id: &str,
@@ -35282,6 +35290,7 @@ mod pty {
         command: Option<&str>,
         watcher: Option<&str>,
         seed: Option<&[u8]>,
+        environment: &[(&str, &str)],
     ) -> Result<Arc<Terminal>, String> {
         if id.is_empty() || TERMINALS.lock().unwrap().contains_key(id) {
             return Err(format!("终端 id 不对或已经有了：{id}"));
@@ -35289,7 +35298,7 @@ mod pty {
         let (cols, rows) = (cols.max(2), rows.max(1));
         let title = Path::new(program).file_stem().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| program.to_string());
         let cwd = if cwd.is_dir() { cwd.to_path_buf() } else { crate::user_home() };
-        let (pty, reader, waiter) = spawn(program, args, &cwd, cols, rows)?;
+        let (pty, reader, waiter) = spawn(program, args, &cwd, cols, rows, environment)?;
         let terminal = Arc::new(Terminal {
             id: id.to_string(),
             session: session.to_string(),
@@ -35381,7 +35390,7 @@ mod pty {
     type Spawned = (Box<dyn Pty>, Box<dyn Read + Send>, Box<dyn FnOnce() -> Option<i32> + Send>);
 
     #[cfg(unix)]
-    fn spawn(program: &str, args: &[String], cwd: &Path, cols: u16, rows: u16) -> Result<Spawned, String> {
+    fn spawn(program: &str, args: &[String], cwd: &Path, cols: u16, rows: u16, environment: &[(&str, &str)]) -> Result<Spawned, String> {
         use std::os::fd::{FromRawFd, OwnedFd};
         use std::os::unix::process::CommandExt;
 
@@ -35417,6 +35426,7 @@ mod pty {
             .current_dir(cwd)
             .env("TERM", "xterm-256color")
             .env("COLORTERM", "truecolor")
+            .envs(environment.iter().copied())
             .stdin(slave.try_clone().map_err(|error| error.to_string())?)
             .stdout(slave.try_clone().map_err(|error| error.to_string())?)
             .stderr(slave.try_clone().map_err(|error| error.to_string())?);
@@ -35563,8 +35573,9 @@ mod pty {
         }
     }
 
+    /// environment 在 Windows 上不用：shell 是 PowerShell（不读 oh-my-zsh），环境照旧整个继承（CreateProcessW 不给环境块）
     #[cfg(windows)]
-    fn spawn(program: &str, args: &[String], cwd: &Path, cols: u16, rows: u16) -> Result<Spawned, String> {
+    fn spawn(program: &str, args: &[String], cwd: &Path, cols: u16, rows: u16, _environment: &[(&str, &str)]) -> Result<Spawned, String> {
         use conpty::*;
         use std::os::windows::ffi::OsStrExt;
         use std::os::windows::io::FromRawHandle;
@@ -35702,6 +35713,46 @@ mod pty {
             assert_eq!(list().iter().find(|item| item["id"] == json!(id)).unwrap()["cols"], 100);
             close(&id).unwrap();
             assert!(list().iter().all(|item| item["id"] != json!(id)));
+        }
+
+        /// 终端打出过的字里出现 needle（等到 seconds 秒）；返回到那时为止的字
+        fn output_until(id: &str, needle: &str, seconds: u64) -> String {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+            loop {
+                let replay = attach(id, "nobody").unwrap();
+                let data = {
+                    use base64::Engine;
+                    base64::engine::general_purpose::STANDARD.decode(replay["data"].as_str().unwrap()).unwrap()
+                };
+                let text = String::from_utf8_lossy(&data).into_owned();
+                if text.contains(needle) || std::time::Instant::now() > deadline {
+                    return text;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+
+        /// 智能体的终端关掉 oh-my-zsh 的更新检查（到期时它在 shell 开头等一个按键，命令一直不跑）；客户端开的不带
+        #[test]
+        fn agent_shell_skips_oh_my_zsh_update() {
+            assert!(AGENT_ENVIRONMENT.contains(&("DISABLE_AUTO_UPDATE", "true")));
+            // 不设「不问、直接更新」
+            assert!(AGENT_ENVIRONMENT.iter().all(|(name, _)| *name != "DISABLE_UPDATE_PROMPT"));
+            let dir = std::env::temp_dir();
+            let print = r#"echo "omz-update=[$DISABLE_AUTO_UPDATE]""#;
+            // 真起一个智能体的终端：变量到了 shell 里（屏幕第一行写的那行命令是原样的变量名，展开成 true 的是 shell 打的）
+            let agent = format!("test-omz-agent-{}", std::process::id());
+            open_agent(&agent, "s1", &dir, print).unwrap();
+            let text = output_until(&agent, "omz-update=[true]", 20);
+            assert!(text.contains("omz-update=[true]"), "{text}");
+            close(&agent).unwrap();
+            // 不另外带变量的（客户端开的走这条）：还是继承来的值。用不读 rc 的 /bin/sh，不受这台机器 shell 配置的影响
+            let inherited = format!("omz-update=[{}]", std::env::var("DISABLE_AUTO_UPDATE").unwrap_or_default());
+            let plain = format!("test-omz-plain-{}", std::process::id());
+            create(&plain, "s1", &dir, 80, 24, "/bin/sh", &["-c".to_string(), print.to_string()], None, None, None, &[]).unwrap();
+            let text = output_until(&plain, &inherited, 20);
+            assert!(text.contains(&inherited), "{text}");
+            close(&plain).unwrap();
         }
     }
 }

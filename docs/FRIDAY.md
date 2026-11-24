@@ -53,6 +53,9 @@ Friday 客户端 ──SSH──▶ edith-friday --attach（一条连接一个�
 - **终端**：常驻的那份开伪终端跑 shell（macOS / Linux 的 posix_openpt，Windows 的 ConPTY），客户端断了照常跑，接上来重放最近 512 KB 的输出。
 - **智能体的终端**（0.12，同 Friday v2.88）：常驻的那份在大脑里开 `run_in_terminal` / `read_terminal` / `close_terminal`（模型那边叫 `friday__*`，
   批准同 run_shell：删除类自动模式也问）。shell 只跑这条命令（Unix `$SHELL -l -i -c`、Windows PowerShell `-EncodedCommand`），屏幕第一行写一行淡色的 `$ 命令`，
+  Unix 上环境里另外带 `DISABLE_AUTO_UPDATE=true`（同 Friday 2026-11-24：`-i` 读 rc，装了 oh-my-zsh、它的更新检查到期时会在 shell 开头问
+  「Would you like to update? [Y/n]」等一个按键，没人按命令就一直不跑；不设「不问直接更新」的 `DISABLE_UPDATE_PROMPT`，rc 里用
+  `zstyle ':omz:update' mode` 写明了方式的管不到；客户端开的终端不带，照旧看到提问），
   客户端的终端卡片、后台任务里看得见（`terminals` 里带 `command`）。命令还在跑时**主动给开它的会话发内容**：打出带 `::friday::` 的行（送标记后面的字）、
   匹配 `notify_on` 的行、跑完（退出码、跑了多久、最后 40 行）、用户把还在跑的关了——经能力协议的 `sense`（`kind: "command"`、`urgency: "interject"`：
   大脑在干这段会话就塞进下一步，闲着就马上开一轮）送回去；一秒内的几行合成一条（`EDITH_FRIDAY_TERM_BATCH_MS`），一个终端最多 30 次
