@@ -23417,6 +23417,8 @@ mod voice {
         speaker: Option<wsclient::Writer>,
         /// 用户插话：念着的压低了
         ducked: bool,
+        /// 开口了、这句还没定稿（final / speech_end 之前）：算还在说（同 Friday AssistantCalls::hearing()）
+        hearing: bool,
         /// 本地语音能算声纹（听写带 speaker）
         speaker_supported: bool,
         /// 正按声纹过滤（voice.state 的 filtering）
@@ -23593,6 +23595,7 @@ mod voice {
             transcriber: Some(transcriber),
             speaker: Some(speaker),
             ducked: false,
+            hearing: false,
             speaker_supported: supported,
             filtering: filtering(supported, to_call),
             enrolling: None,
@@ -23613,6 +23616,7 @@ mod voice {
                 match event["type"].as_str() {
                     Some("speech_start") => {
                         let duck = with(generation, |voice| {
+                            voice.hearing = true;
                             let duck = voice.speaking && !voice.ducked;
                             voice.ducked |= duck;
                             duck
@@ -23622,7 +23626,10 @@ mod voice {
                         }
                     }
                     Some("partial") => {
-                        with(generation, |voice| voice.caption = event["text"].as_str().unwrap_or("").to_string());
+                        with(generation, |voice| {
+                            voice.hearing = true;
+                            voice.caption = event["text"].as_str().unwrap_or("").to_string();
+                        });
                         emit_state();
                     }
                     Some("final") => {
@@ -23634,6 +23641,7 @@ mod voice {
                         };
                         let held = with(generation, |voice| {
                             voice.caption.clear();
+                            voice.hearing = false;
                             if voice.held && !said.is_empty() {
                                 voice.pending.push_str(&said);
                             }
@@ -23643,10 +23651,17 @@ mod voice {
                         if held == Some(false) && !said.is_empty() {
                             heard_sentence(generation, &said, vector, duration);
                         }
+                        // 这句定稿了（有字时 final 代替 speech_end，原来压低的要等念完才放回来）：交出去的念着的已经停了；
+                        // 没交的（附和、杂音、不像你的、随身攒着等它说完的）接着照常念（同 Friday：附和、咳嗽不停）
+                        let unduck = with(generation, |voice| std::mem::take(&mut voice.ducked));
+                        if unduck == Some(true) {
+                            emit("voice.duck", json!({ "on": false }));
+                        }
                     }
                     Some("speech_end") => {
                         let unduck = with(generation, |voice| {
                             voice.caption.clear();
+                            voice.hearing = false;
                             std::mem::take(&mut voice.ducked)
                         });
                         if unduck == Some(true) {
@@ -23857,8 +23872,9 @@ mod voice {
             }
         }
         // 随身模式：它在念 / 在想时用户又开口，多半是在跟旁边的人说话——不打断它，攒着等它说完再交，交了由它判断要不要回；
-        // 叫它停的（「停」「别说了」）照样当场打断
-        if busy && call && crate::assistant::ambient() && !is_stop(said) {
+        // 叫它停的（「停」「别说了」）照样当场打断。前面还攒着没交的（等你这句说完）：这句接在后面一起交，不抢到前面
+        let holding = with(generation, |voice| voice.ambient_waiting).unwrap_or(false);
+        if (busy || holding) && call && crate::assistant::ambient() && !is_stop(said) {
             hold_until_idle(generation, said, data);
             return;
         }
@@ -23873,7 +23889,7 @@ mod voice {
     ];
 
     /// 整句（只看字母、数字、汉字，英文不分大小写）是不是叫它停：表里的词，或者表里一个词叠几遍
-    fn is_stop(said: &str) -> bool {
+    pub fn is_stop(said: &str) -> bool {
         let words: Vec<char> = said.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect();
         if words.is_empty() {
             return false;
@@ -23888,7 +23904,8 @@ mod voice {
         })
     }
 
-    /// 随身模式：用户这句先攒着（几句接在一起），它不在念、不在想、喇叭放完了再交（每 400 毫秒看一次；这一路没了就不交了）
+    /// 随身模式：用户这句先攒着（几句接在一起），它不在念、不在想、喇叭放完了、用户这会儿没在说（下一句还没定稿就等它，
+    /// 同 Friday hearing()）再交（每 400 毫秒看一次；这一路没了就不交了）
     fn hold_until_idle(generation: u64, said: &str, data: Value) {
         let start = with(generation, |voice| {
             if voice.ambient_held.is_empty() {
@@ -23907,7 +23924,7 @@ mod voice {
             loop {
                 std::thread::sleep(Duration::from_millis(400));
                 let ready = with(generation, |voice| {
-                    if voice.speaking || voice.turn.is_some() || voice.playing {
+                    if voice.speaking || voice.turn.is_some() || voice.playing || voice.hearing {
                         return None;
                     }
                     voice.ambient_waiting = false;
@@ -29019,6 +29036,109 @@ mod assistant {
         block
     }
 
+    // MARK: - 被用户的新话打断、还没回完的（同 Friday 859287d9，Friday 仓库 qt/docs/ASSISTANT.md §16.3.4）
+    //
+    // 用户说话时助手在回：EDITH 停下手上这轮、带着新话重来。被停下的那一轮用户的话还在历史里，但后面没有回复（多半还没出字），
+    // 前一句就像回过了，大脑只回最后一句（.51 那通「每天12点清理系统磁盘」→「说你们两个」）。打断时把那一轮要回的几句记成还没回完的，
+    // 连着打断的累加（最多 UNFINISHED_LIMIT 句），新的一轮在用户的话前面列一段「[还没回完的]」；那一轮回完了就不再带。叫停的不算。
+
+    /// 连着被打断时「还没回完的」最多带几句（再早的只在历史里；同 Friday kUnfinishedLimit）
+    const UNFINISHED_LIMIT: usize = 6;
+    /// 「[还没回完的]」那一块括号里的说明（== Friday ContextBuilder::unfinishedNote()，逐字一致）
+    const UNFINISHED_NOTE: &str = "你回这几句时被用户接着说的打断了，还没回完：这次和下面用户新说的一起回。上面已经做了的别重做；用户新说的改了主意、叫你别做了，就按新的";
+
+    /// 交给助手会话的一句用户的话
+    #[derive(Clone, Debug, PartialEq)]
+    struct Said {
+        at: chrono::DateTime<chrono::Local>,
+        source: String,
+        text: String,
+    }
+
+    /// 交给助手会话、还没做完的用户的一轮
+    #[derive(Default, Debug)]
+    struct Asked {
+        /// 它带着的还没回完的（被它打断的那几轮要回的）
+        unfinished: Vec<Said>,
+        /// 这一轮用户说的
+        said: Vec<Said>,
+        /// 大脑报这一轮开始了（没开始的还排在大脑的队列里）
+        started: bool,
+    }
+
+    /// 交给助手会话、还没做完的用户的那几轮（轮 id，按交的先后）：sense 回话后记下，turn.started 记开始，done 拿掉
+    static ASKED: LazyLock<Mutex<Vec<(String, Asked)>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+    /// 用户的话一句句交：打断时要看清前一句在回还是还排着
+    static SUBMITTING: Mutex<()> = Mutex::new(());
+
+    /// 用户的新话要打断正在回的：还没做完的用户那几轮（在回的、排着还没开始的）要回的话都算还没回完的，按先后、只留最后 UNFINISHED_LIMIT 句。
+    /// 返回这些话和排着还没开始的轮——EDITH 的打断把新话插到队列最前面，排着的会在新话之后再回一遍，要从队列里拿掉
+    fn take_unfinished(asked: &mut Vec<(String, Asked)>) -> (Vec<Said>, Vec<String>) {
+        let mut items: Vec<Said> = Vec::new();
+        let mut queued = Vec::new();
+        for (turn, entry) in asked.drain(..) {
+            for said in entry.unfinished.into_iter().chain(entry.said) {
+                if !items.contains(&said) {
+                    items.push(said);
+                }
+            }
+            if !entry.started {
+                queued.push(turn);
+            }
+        }
+        let extra = items.len().saturating_sub(UNFINISHED_LIMIT);
+        items.drain(..extra);
+        (items, queued)
+    }
+
+    /// 给助手看的来源（短的：「桌面端」「SChat 通话」；同 Friday ContextBuilder::sourceLabel）
+    fn source_label(source: &str) -> String {
+        if let Some(channel) = source.strip_prefix("call:") {
+            return format!("{} 通话", source_label(channel));
+        }
+        if let Some(channel) = source.strip_prefix("p2ptext:") {
+            return format!("{} P2P 文字", source_label(channel));
+        }
+        match source {
+            "" | "desktop" => "桌面端".into(),
+            "voice" => "语音".into(),
+            "receipt" => "会话动静".into(),
+            other if other.starts_with("loop:") => "定时任务".into(),
+            other if crate::channels::is_channel(other) => crate::channels::title(other),
+            other => other.into(),
+        }
+    }
+
+    /// 「[还没回完的]」那一块（没有就是空串）：一行一句「- 06:35 （SChat 通话）每天12点清理系统磁盘」
+    fn unfinished_block(items: &[Said]) -> String {
+        if items.is_empty() {
+            return String::new();
+        }
+        let lines: Vec<String> = items
+            .iter()
+            .map(|item| {
+                let text = item.text.trim();
+                let text = if text.is_empty() { "（只发了附件，没说话）".to_string() } else { truncate(text, 600) };
+                format!("- {}（{}）{text}", item.at.format("%H:%M "), source_label(&item.source))
+            })
+            .collect();
+        format!("[还没回完的]（{UNFINISHED_NOTE}）\n{}", lines.join("\n"))
+    }
+
+    /// 这一轮做完了：拿掉记着的；还没回完的那几句有从别处说的（聊天工具、P2P 文字、电话）——回复也发过去（同 Friday 的 targets）
+    fn finished_asked(turn: &str, source: &str) -> Vec<String> {
+        let mut asked = ASKED.lock().unwrap();
+        let Some(index) = asked.iter().position(|(id, _)| id == turn) else { return Vec::new() };
+        let (_, entry) = asked.remove(index);
+        let mut sources: Vec<String> = Vec::new();
+        for said in entry.unfinished {
+            if said.source != source && !sources.contains(&said.source) && !matches!(said.source.as_str(), "" | "desktop" | "voice") {
+                sources.push(said.source);
+            }
+        }
+        sources
+    }
+
     /// 交给助手会话：user 是用户说的（urgency 按在不在回话定），receipt 是叫醒的动静（排队）
     pub fn submit(words: &str, source: &str, urgency: &str) -> Result<String, String> {
         submit_with(words, source, urgency, &[])
@@ -29026,10 +29146,30 @@ mod assistant {
 
     /// 同 submit，带上图片（这台上的路径：EDITH 在模型能看图时随这段话给它）
     pub fn submit_with(words: &str, source: &str, urgency: &str, images: &[String]) -> Result<String, String> {
+        let kind = if source == "receipt" { "receipt" } else { "user" };
+        let _serial = (kind == "user").then(|| SUBMITTING.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
         let (brain, session) = session()?;
         let reacting = crate::TURNS.lock().unwrap().iter().any(|(_, id)| *id == session);
         let urgency = if urgency == "auto" { if reacting { "interrupt" } else { "queue" } } else { urgency };
-        let kind = if source == "receipt" { "receipt" } else { "user" };
+        // 打断正在回的：那一轮（和排在它后面还没开始的）要回的几句记成还没回完的，跟这句一起交；排着的从大脑的队列里拿掉。
+        // 叫停的（「停」「别说了」）不算：那几句就不回了。打断到时那一轮正好回完了也会算进来——说明里写了「上面已经做了的别重做」
+        let unfinished = if kind == "user" && urgency == "interrupt" && !crate::voice::is_stop(words) {
+            let (items, queued) = take_unfinished(&mut ASKED.lock().unwrap());
+            for turn in queued {
+                let _ = brain.request("sessions.dequeue", json!({ "id": session, "turn": turn }), Duration::from_secs(10));
+            }
+            items
+        } else {
+            Vec::new()
+        };
+        let block = unfinished_block(&unfinished);
+        // say() 把附件列在原话后面：记的只是原话（附件在历史里）
+        let said = Said {
+            at: chrono::Local::now(),
+            source: source.to_string(),
+            text: words.split("\n\n[附件]\n").next().unwrap_or("").trim().to_string(),
+        };
+        let words = if block.is_empty() { words.to_string() } else { format!("{block}\n\n[用户说]\n{words}") };
         // 用户说话时带上这之前旁边的人说的（声纹认出不是用户的；只给一次，之后它在助手会话的历史里）
         let ambient_on = ambient();
         let heard_before = if kind == "user" {
@@ -29055,12 +29195,24 @@ mod assistant {
         }
         let reply = brain.request("sense", request, Duration::from_secs(30))?;
         let turn = text(&reply, "turn").to_string();
+        let disposition = text(&reply, "disposition");
         // 这一轮从哪来（补充进正在回的那一轮的不算）
-        if text(&reply, "disposition") != "interjected" && !turn.is_empty() {
+        if disposition != "interjected" && !turn.is_empty() {
             SOURCES.lock().unwrap().insert(turn.clone(), source.to_string());
             let mut current = REPLY.lock().unwrap();
             if current.turn == turn {
                 current.source = source.to_string();
+            }
+        }
+        // 用户的这一轮要回的：做完前又被打断就算还没回完的（只记下来的不算）
+        if kind == "user" && !turn.is_empty() && disposition != "noted" {
+            let mut asked = ASKED.lock().unwrap();
+            match asked.iter_mut().find(|(id, _)| *id == turn) {
+                Some((_, entry)) => entry.said.push(said),
+                None => {
+                    let started = disposition == "started" || REPLY.lock().unwrap().turn == turn;
+                    asked.push((turn.clone(), Asked { unfinished, said: vec![said], started }));
+                }
             }
         }
         Ok(turn)
@@ -29103,6 +29255,9 @@ mod assistant {
                 reply.entry = None;
                 reply.details.clear();
                 drop(reply);
+                if let Some((_, asked)) = ASKED.lock().unwrap().iter_mut().find(|(id, _)| id == turn) {
+                    asked.started = true;
+                }
                 reacting_changed();
             }
             "text" => {
@@ -29144,6 +29299,7 @@ mod assistant {
                 };
                 // 这一轮核对完了（§19）
                 REVIEWS.lock().unwrap().remove(turn);
+                let elsewhere = finished_asked(turn, &source);
                 let answer = text(data, "answer").to_string();
                 let mut item =
                     finished.unwrap_or_else(|| entry("assistant", if source == "receipt" { "" } else { &source }, "", json!({})));
@@ -29177,31 +29333,12 @@ mod assistant {
                         crate::channels::push(text(&item, "text"), "reply", None);
                         crate::calls::text_push(text(&item, "text"));
                     }
-                    // 电话里说的：回复念出来了，长内容发到那个聊天里
-                    if let Some(channel) = source.strip_prefix("call:") {
-                        let details = text(&item["data"], "details");
-                        if !details.trim().is_empty() {
-                            crate::channels::deliver_reply(channel, "", details);
+                    deliver(&source, &item, silent);
+                    // 一起回的还没回完的那几句有从别处说的：回完了也发过去
+                    if !silent && data["stopped"] != json!(true) && data["error"].as_str().is_none_or(str::is_empty) {
+                        for target in &elsewhere {
+                            deliver(target, &item, silent);
                         }
-                    }
-                    // P2P 文字里打的：回复发回通道
-                    if source.starts_with("p2ptext:") {
-                        let mut reply = if silent { String::new() } else { text(&item, "text").to_string() };
-                        let details = text(&item["data"], "details");
-                        if !details.trim().is_empty() {
-                            reply = if reply.is_empty() { details.to_string() } else { format!("{reply}\n\n{details}") };
-                        }
-                        if !reply.trim().is_empty() {
-                            crate::calls::text_reply(&source, &reply);
-                        }
-                    }
-                    // 聊天工具里说的：回到那个渠道
-                    if crate::channels::is_channel(&source) {
-                        crate::channels::deliver_reply(
-                            &source,
-                            if silent { "" } else { text(&item, "text") },
-                            text(&item["data"], "details"),
-                        );
                     }
                 } else {
                     record(&item);
@@ -29215,6 +29352,32 @@ mod assistant {
                 reacting_changed();
             }
             _ => {}
+        }
+    }
+
+    /// 助手的回复送回说话的地方（桌面端、语音的就在助手页上 / 念出来了，不用送）
+    fn deliver(source: &str, item: &Value, silent: bool) {
+        // 电话里说的：回复念出来了，长内容发到那个聊天里
+        if let Some(channel) = source.strip_prefix("call:") {
+            let details = text(&item["data"], "details");
+            if !details.trim().is_empty() {
+                crate::channels::deliver_reply(channel, "", details);
+            }
+        }
+        // P2P 文字里打的：回复发回通道
+        if source.starts_with("p2ptext:") {
+            let mut reply = if silent { String::new() } else { text(item, "text").to_string() };
+            let details = text(&item["data"], "details");
+            if !details.trim().is_empty() {
+                reply = if reply.is_empty() { details.to_string() } else { format!("{reply}\n\n{details}") };
+            }
+            if !reply.trim().is_empty() {
+                crate::calls::text_reply(source, &reply);
+            }
+        }
+        // 聊天工具里说的：回到那个渠道
+        if crate::channels::is_channel(source) {
+            crate::channels::deliver_reply(source, if silent { "" } else { text(item, "text") }, text(&item["data"], "details"));
         }
     }
 
@@ -29994,6 +30157,72 @@ mod assistant {
             assert!(overheard_block(&lines, 5).is_empty() && overheard_block(&[], OVERHEARD_CHARS).is_empty());
         }
 
+        /// 被用户的新话打断时还没回完的（同 Friday 859287d9）：在回的、排着还没开始的那几轮要回的话按先后并起来（带着的在前），
+        /// 只留最后 6 句；排着的要从大脑的队列里拿掉；列成「[还没回完的]」一块，说明和 Friday 逐字一致
+        #[test]
+        fn unfinished_words_pile_up() {
+            use chrono::TimeZone;
+            let said = |minute: u32, source: &str, text: &str| Said {
+                at: chrono::Local.with_ymd_and_hms(2026, 11, 25, 6, minute, 0).unwrap(),
+                source: source.into(),
+                text: text.into(),
+            };
+            let mut asked = vec![
+                (
+                    "a2".to_string(),
+                    Asked {
+                        unfinished: vec![said(34, "call:no-such-channel", "你做那个做那个推期我")],
+                        said: vec![said(35, "call:no-such-channel", "每天12点清理系统磁盘")],
+                        started: true,
+                    },
+                ),
+                ("a3".to_string(), Asked { unfinished: Vec::new(), said: vec![said(36, "desktop", "说你们两个")], started: false }),
+            ];
+            let (items, queued) = take_unfinished(&mut asked);
+            assert!(asked.is_empty());
+            assert_eq!(queued, vec!["a3".to_string()]);
+            let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
+            assert_eq!(texts, ["你做那个做那个推期我", "每天12点清理系统磁盘", "说你们两个"]);
+            assert_eq!(
+                unfinished_block(&items[1..]),
+                format!(
+                    "[还没回完的]（{UNFINISHED_NOTE}）\n- 06:35 （no-such-channel 通话）每天12点清理系统磁盘\n- 06:36 （桌面端）说你们两个"
+                )
+            );
+            assert_eq!(
+                UNFINISHED_NOTE,
+                "你回这几句时被用户接着说的打断了，还没回完：这次和下面用户新说的一起回。上面已经做了的别重做；用户新说的改了主意、叫你别做了，就按新的"
+            );
+            assert!(unfinished_block(&[]).is_empty());
+            assert!(
+                unfinished_block(&[said(40, "p2ptext:no-such-channel", " ")])
+                    .ends_with("- 06:40 （no-such-channel P2P 文字）（只发了附件，没说话）")
+            );
+            // 连着打断很多次：只留最后 6 句
+            let mut asked: Vec<(String, Asked)> = (0..4)
+                .map(|i| {
+                    let entry = Asked {
+                        said: vec![
+                            said(i * 2, "voice", &format!("第{}句", i * 2)),
+                            said(i * 2 + 1, "voice", &format!("第{}句", i * 2 + 1)),
+                        ],
+                        ..Default::default()
+                    };
+                    (format!("t{i}"), Asked { started: true, ..entry })
+                })
+                .collect();
+            let (items, queued) = take_unfinished(&mut asked);
+            assert!(queued.is_empty());
+            assert_eq!(
+                items.iter().map(|item| item.text.clone()).collect::<Vec<_>>(),
+                ["第2句", "第3句", "第4句", "第5句", "第6句", "第7句"]
+            );
+            assert_eq!(
+                (source_label("loop:desktop"), source_label("voice"), source_label("")),
+                ("定时任务".into(), "语音".into(), "桌面端".into())
+            );
+        }
+
         /// §19 续做的那一轮有没有进展：两轮的回答差不多（不看空白、标点）才算没进展
         #[test]
         fn same_answers_mean_no_progress() {
@@ -30635,9 +30864,13 @@ mod channels {
 
     /// 给助手看的来源：「SChat（聊天工具）」
     pub fn label(source: &str) -> String {
+        format!("{}（聊天工具：回复会转成纯文本发过去，别用表格、标题这类排版）", title(source))
+    }
+
+    /// 渠道的名字（没起名的用种类：「SChat」「微信」）
+    pub fn title(source: &str) -> String {
         let channel = channel(source).unwrap_or_default();
-        let title = Some(text(&channel, "name")).filter(|name| !name.is_empty()).unwrap_or(kind_title(text(&channel, "kind")));
-        format!("{title}（聊天工具：回复会转成纯文本发过去，别用表格、标题这类排版）")
+        Some(text(&channel, "name")).filter(|name| !name.is_empty()).unwrap_or(kind_title(text(&channel, "kind"))).to_string()
     }
 
     // MARK: - 状态（连没连上）

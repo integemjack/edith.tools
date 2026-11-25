@@ -254,6 +254,24 @@ Friday 客户端 ──SSH──▶ edith-friday --attach（一条连接一个�
       （`voice::hold_until_idle`，每 400 毫秒看一次）；叫它停的（「停」「别说了」「等一下」…，同 Friday 的 BargeIn 叫停词，`voice::is_stop`）照样当场打断。
     - 测试：单元 `voice::ambient_tests::stop_words`，集成 `ambient_calls_mark_call_words_and_keep_more_overheard`。电话里攒着等它说完再交那一段没有端到端测
       （要真的通话内核和本地语音）。
+  - **被新话打断时没回完的、通话听写**（同 Friday 859287d9，Friday 仓库 qt/docs/ASSISTANT.md §16.3.4）：
+    - 以前：用户说话时助手在回，EDITH 停下那一轮、带着新话重来；被停下的那一轮用户的话留在助手会话的历史里，后面却没有回复（多半还没出字），
+      前一句就像回过了，大脑只回最后一句（同 .51 那通「每天12点清理系统磁盘」→「说你们两个」）。
+    - 现在打断时那一轮要回的几句记成还没回完的（`assistant::ASKED`：sense 回话后按轮记下这次说的和它带着的还没回完的，`turn.started` 记开始，`done` 拿掉），
+      连着打断的累加（最多 6 句，`UNFINISHED_LIMIT`）；新的一轮在用户的话前面列一段
+      `[还没回完的]（你回这几句时被用户接着说的打断了，还没回完：这次和下面用户新说的一起回。上面已经做了的别重做；用户新说的改了主意、叫你别做了，就按新的）`
+      （说明同 Friday 的 `ContextBuilder::unfinishedNote()`，逐字一致）+ 一行一句「- 06:35 （SChat 通话）…」，再接 `[用户说]` 和这次说的；历史照旧。
+      叫停的（`voice::is_stop`）不带；那一轮回完了就不再带。回完了回复也发到那几句来的聊天工具、P2P 文字（电话里的发长内容），同 Friday 的 targets。
+    - EDITH 停下一轮要等模型的下一段（第一个字还没来时要等一会儿），这时用户又说一句：打断把新话插到队列最前面，前一句那一轮还排着、会在新话之后再回一遍——
+      所以打断时还排着没开始的那几轮用 `sessions.dequeue` 拿掉，它们的话也算还没回完的。打断到时那一轮正好回完了也会算进来（说明里写了「上面已经做了的别重做」）。
+    - 通话听写这边本来就是流式的（通话和语音模式共用一条本地语音的实时听写 `/v1/realtime/transcribe`，声纹跟着 `final` 来），Friday 这次改掉的
+      「断句后存 WAV 整句听写」这边没有。跟着改的两处：开口后、这句定稿前（`final` / `speech_end` 之前）算还在说（`Voice::hearing`，同 Friday 的 `hearing()`）——
+      随身模式攒着的等你这句说完再一起交，前面还攒着时新定稿的一句接在后面、不抢到前面；有字的一句 `final` 代替了 `speech_end`，原来压低的念完才放回来，
+      现在定稿就放回来（交出去的念着的已经停了，附和、杂音、不像你的、攒着的接着照常念）。
+    - 不照搬的：Friday 通话的第二档（实时字幕听着在说事先停下）——这里一直是开口压低、交给助手时才掐掉，附和、咳嗽本来就不停；实时听写出错时 Friday 改回整句听写，
+      这里没有整句听写（通话要本地语音的实时听写和合成，没装时接通了说「通话里听不了、说不了」），出错照旧记在 voice.state 的 error。
+    - 测试：单元 `assistant::tests::unfinished_words_pile_up`，集成 `interrupted_words_are_answered_with_the_next_ones`（连着打断三句、第三次带前两句；
+      还排着的那一轮被拿掉、它那句也带上；回完了不带；叫停不带）。通话里那两处没有端到端测（要真的通话内核和本地语音）。
   - **远程工作通道**（`callType: "work"`，Friday 仓库 qt/docs/REMOTE.md §2「WebRTC 工作通道」；SChat 桌面客户端扫码登录后这样连这台）：只认建这个机器人的人
     （`/bot/v1/me` 的 `botOwnerId`，还得是绑定的主人），别的回 `user_rejected`；每个 requestId 一条，同一个人的几台可以同时连。先拿 TURN、建好连接再回 accepted，
     客户端建 DataChannel `friday-work`、出 offer；通道开了这边起一个网关子进程（`edith-friday --attach`，环境变量 `EDITH_FRIDAY_CHANNEL=work`），通道上的消息

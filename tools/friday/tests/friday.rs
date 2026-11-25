@@ -2154,3 +2154,137 @@ fn finished_turns_are_reviewed_and_continued() {
         "{text}"
     );
 }
+
+/// 被用户的新话打断时没回完的（同 Friday 859287d9，Friday 仓库 qt/docs/ASSISTANT.md §16.3.4；.51 那通电话：「你做那个做那个推期我」→
+/// 「每天12点清理系统磁盘」→「说你们两个」，每句都在助手还没出字时打断前一句，大脑只回了最后一句）：助手在回时用户又说一句，EDITH 停下那一轮、
+/// 带着新话重来——那一轮要回的几句列在新话前面的「[还没回完的]」里，连着打断的累加；还排着没开始的那一轮从大脑的队列里拿掉
+/// （打断把新话插到最前面，不拿掉它会在新话之后再回一遍）；回完了就不再带；叫停的不带
+#[test]
+fn interrupted_words_are_answered_with_the_next_ones() {
+    let home = scratch("friday-unfinished");
+    let work = home.join("work");
+    std::fs::create_dir_all(work.join(".git")).unwrap();
+    write_session(&home, &work);
+    let brain = FakeBrain::new();
+    register(&home, &brain, &work);
+    let mut client = Client::start_with(&home, &work, &[("EDITH_FRIDAY_HUB_IDLE", "60")]);
+    let hello = client.send("hello", json!({ "protocol": 1 }));
+    let (mut gateway, mut resident) = (None, None);
+    for _ in 0..2 {
+        let mut link = brain.accept(15).expect("少了一条连接");
+        let reply = link.handshake(json!({ "name": "EDITH", "version": "test" }));
+        match reply["name"].as_str() {
+            Some("friday-client") => gateway = Some(link),
+            Some("friday") => resident = Some(link),
+            other => panic!("不认识的连接 {other:?}：{reply}"),
+        }
+    }
+    let (mut gateway, mut resident) = (gateway.unwrap(), resident.unwrap());
+    let list = gateway.wait_for(10, |message| message["method"] == "sessions.list").unwrap();
+    reply(&mut gateway, &list, json!([]));
+    let agents = gateway.wait_for(10, |message| message["method"] == "agents.list").unwrap();
+    reply(&mut gateway, &agents, json!([]));
+    assert!(client.reply(hello).get("error").is_none());
+    assert_eq!(client.request("assistant.settings.update", json!({ "enabled": true }))["config"]["enabled"], true);
+
+    // 助手会话（第一次交话时建；存档由这里替大脑写，之后接着用它）
+    let assistant = std::cell::RefCell::new(String::new());
+    // 用户说一句：大脑那头回 sense（disposition、这一轮叫 turn）；返回交给助手的 sense 和这之前从队列里拿掉的轮
+    let sensed = |client: &mut Client,
+                  resident: &mut Link,
+                  words: &str,
+                  source: &str,
+                  disposition: &str,
+                  turn: &str|
+     -> (Value, Vec<String>) {
+        let said = client.send("assistant.say", json!({ "text": words, "source": source }));
+        let mut dequeued = Vec::new();
+        loop {
+            let message = resident
+                .wait_for(15, |message| {
+                    ["sessions.create", "sessions.dequeue", "sense"].contains(&message["method"].as_str().unwrap_or(""))
+                })
+                .expect("没交给助手");
+            match message["method"].as_str() {
+                Some("sessions.create") => {
+                    let id = message["params"]["id"].as_str().unwrap().to_string();
+                    let meta = json!({ "type": "meta", "id": id, "cwd": work.to_string_lossy(), "owner": "#assistant", "created": "2026-11-25T06:30:00+08:00" });
+                    std::fs::write(sessions_dir(&home).join(format!("{id}.jsonl")), format!("{meta}\n")).unwrap();
+                    *assistant.borrow_mut() = id;
+                    reply(resident, &message, json!({}));
+                }
+                Some("sessions.dequeue") => {
+                    assert_eq!(message["params"]["id"].as_str(), Some(assistant.borrow().as_str()), "{message}");
+                    dequeued.push(message["params"]["turn"].as_str().unwrap_or("").to_string());
+                    reply(resident, &message, json!({ "removed": true }));
+                }
+                _ => {
+                    let session = assistant.borrow().clone();
+                    assert_eq!(message["params"]["session"].as_str(), Some(session.as_str()));
+                    reply(resident, &message, json!({ "session": session, "disposition": disposition, "turn": turn }));
+                    assert!(client.reply(said).get("error").is_none());
+                    // 这一轮记下来是在 sense 回话后
+                    std::thread::sleep(Duration::from_millis(300));
+                    return (message["params"].clone(), dequeued);
+                }
+            }
+        }
+    };
+    // 替大脑报：这一轮开始了 / 做完了（被打断的 stopped）
+    let event = |resident: &mut Link, turn: &str, kind: &str, data: Value| {
+        let session = assistant.borrow().clone();
+        push(resident, &session, turn, kind, data);
+        std::thread::sleep(Duration::from_millis(300));
+    };
+    let stopped = json!({ "answer": "", "stopped": true, "error": null });
+    let header = |text: &str| text.split("\n\n").next().unwrap_or("").to_string();
+    let lines = |text: &str| -> Vec<String> {
+        header(text).lines().skip(1).map(|line| line.split_once('）').map(|(_, said)| said.to_string()).unwrap_or_default()).collect()
+    };
+    let note = "[还没回完的]（你回这几句时被用户接着说的打断了，还没回完：这次和下面用户新说的一起回。上面已经做了的别重做；用户新说的改了主意、叫你别做了，就按新的）";
+
+    // 第一句：助手闲着，排队交、不带
+    let (first, _) = sensed(&mut client, &mut resident, "你做那个做那个推期我", "call:schat-1", "started", "a1");
+    assert_eq!(first["urgency"], "queue");
+    let text = first["text"].as_str().unwrap();
+    assert!(text.starts_with("你做那个做那个推期我\n\n[现在] ") && !text.contains("还没回完"), "{text}");
+    event(&mut resident, "a1", "turn.started", json!({ "text": text, "origin": { "kind": "user" } }));
+
+    // 第二句：助手还在想（没出字），打断它；第一句列在「[还没回完的]」里，后面才是这次说的
+    let (second, _) = sensed(&mut client, &mut resident, "每天12点清理系统磁盘", "call:schat-1", "interrupted", "a2");
+    assert_eq!(second["urgency"], "interrupt");
+    let text = second["text"].as_str().unwrap();
+    assert!(text.starts_with(&format!("{note}\n- ")), "{text}");
+    assert!(text.contains("（schat-1 通话）你做那个做那个推期我\n\n[用户说]\n每天12点清理系统磁盘\n\n[现在] "), "{text}");
+    event(&mut resident, "a1", "done", stopped.clone());
+    event(&mut resident, "a2", "turn.started", json!({ "text": text, "origin": { "kind": "user" } }));
+
+    // 第三句又打断：前两句都在「[还没回完的]」里，按先后
+    let (third, dequeued) = sensed(&mut client, &mut resident, "说你们两个", "call:schat-1", "interrupted", "a3");
+    assert_eq!(third["urgency"], "interrupt");
+    let text = third["text"].as_str().unwrap();
+    assert!(text.starts_with(note), "{text}");
+    assert_eq!(lines(text), ["你做那个做那个推期我", "每天12点清理系统磁盘"], "{text}");
+    assert!(text.contains("\n\n[用户说]\n说你们两个\n\n[现在] "), "{text}");
+    assert!(dequeued.is_empty(), "在回的那一轮不用拿掉：{dequeued:?}");
+
+    // 大脑还没停下第二轮（还在等模型的第一个字），第三轮还排着：又说一句——排着的第三轮从队列里拿掉，它那句也算没回完的
+    let (fourth, dequeued) = sensed(&mut client, &mut resident, "顺便看看明天天气", "desktop", "interrupted", "a4");
+    assert_eq!(dequeued, ["a3"]);
+    let text = fourth["text"].as_str().unwrap();
+    assert_eq!(lines(text), ["你做那个做那个推期我", "每天12点清理系统磁盘", "说你们两个"], "{text}");
+    assert!(text.contains("\n\n[用户说]\n顺便看看明天天气\n\n[现在] ") && !text.contains("（桌面端）"), "{text}");
+    event(&mut resident, "a2", "done", stopped.clone());
+    event(&mut resident, "a4", "turn.started", json!({ "text": text, "origin": { "kind": "user" } }));
+    event(&mut resident, "a4", "done", json!({ "answer": "清理磁盘的定时任务建好了；明天晴。", "stopped": false, "error": null }));
+
+    // 回完了：下一句不再带
+    let (fifth, _) = sensed(&mut client, &mut resident, "谢谢", "desktop", "started", "a5");
+    assert_eq!(fifth["urgency"], "queue");
+    assert!(fifth["text"].as_str().unwrap().starts_with("谢谢\n\n[现在] "), "{fifth}");
+    event(&mut resident, "a5", "turn.started", json!({ "text": "谢谢", "origin": { "kind": "user" } }));
+    // 叫停的：打断，但不带（那几句就不回了）
+    let (stop, dequeued) = sensed(&mut client, &mut resident, "停停停", "call:schat-1", "interrupted", "a6");
+    assert_eq!(stop["urgency"], "interrupt");
+    assert!(stop["text"].as_str().unwrap().starts_with("停停停\n\n[现在] ") && dequeued.is_empty(), "{stop}");
+}
