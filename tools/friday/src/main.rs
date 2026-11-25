@@ -2374,8 +2374,7 @@ fn on_brain_event(params: &Value) {
                 state.generating.insert(session.clone());
                 // 助手替用户发的（说是 user、又带了落款；直达的原话算用户自己说的）：客户端的助手按它记「助手派的」、
                 // 自己让它接着做了几轮（Friday 仓库 qt/docs/ASSISTANT.md §19：by 是 user 才从头算）
-                let relayed = data["origin"]["kind"] == "user"
-                    && data["origin"]["from"].as_str().is_some_and(|from| !from.trim().is_empty() && !from.trim().ends_with("· 原话"));
+                let relayed = relayed_origin(&data["origin"]);
                 let by = if from_agent.is_some() {
                     "agent"
                 } else if relayed {
@@ -2385,6 +2384,7 @@ fn on_brain_event(params: &Value) {
                 };
                 if let Some(live) = state.live.get_mut(&session) {
                     live.tally.by = by.into();
+                    live.tally.relayed = from_agent.is_none() && relayed;
                 }
                 // 这一轮是哪句话引起的（最多 600 字）：助手的状态板记成「交给它的」，做完时大脑对照着核对
                 let request = data["text"].as_str().unwrap_or("").chars().take(600).collect::<String>();
@@ -2436,6 +2436,10 @@ fn on_brain_event(params: &Value) {
                     // 干活时补充的话塞进来了：另起一段
                     "input" => {
                         let interjected = from_agent.is_none();
+                        // 最后那条回答回的是这句了：用户自己补充的问的是用户，助手转达来的问的是助手（子智能体交回的不算）
+                        if interjected {
+                            live.tally.relayed = relayed_origin(&data["origin"]);
+                        }
                         live.segments.push(Segment { text: text.to_string(), from_agent, interjected, ..Default::default() });
                         structure = true;
                     }
@@ -2606,6 +2610,8 @@ struct Tally {
     failed: i64,
     agents: i64,
     by: String,
+    /// 最后那条回答回的那句是助手派 / 转达的（relayed_origin）：回答里问的是派活的助手，简报不判「在问你」
+    relayed: bool,
     last_tool: Option<Instant>,
 }
 
@@ -2657,20 +2663,23 @@ fn plain(text: &str) -> String {
 fn turn_brief(session: &str, live: &Live, done: &Value) -> Value {
     let answer = plain(done["answer"].as_str().unwrap_or(""));
     let error = done["error"].as_str().filter(|error| !error.is_empty());
-    let asks = answer.trim_end().ends_with(['？', '?']);
+    let asks = answer.trim_end().ends_with(['？', '?']) && error.is_none() && done["stopped"] != true;
+    // 助手派 / 转达的一轮问的是派活的助手（relayed_origin）：照常算完成，问句留在 question 里给助手看
+    // （Friday 仓库 TurnBrief::make 的 relayed，2026-11-25：.51 上助手派的会话收尾「等你统一决定」被判成在问用户，用户哪里都找不到）
+    let asks_user = asks && !live.tally.relayed;
     let status = if error.is_some() {
         "error"
     } else if done["stopped"] == true {
         "stopped"
-    } else if asks {
+    } else if asks_user {
         "question"
     } else {
         "done"
     };
-    // 挑一句：问句挑最后一句，别的挑第一句
+    // 挑一句：在问用户时挑最后一句（问句），别的挑第一句
     let sentences: Vec<&str> =
         answer.split_inclusive(['。', '！', '？', '!', '?', '\n']).map(str::trim).filter(|line| !line.is_empty()).collect();
-    let picked = if asks { sentences.last() } else { sentences.first() };
+    let picked = if asks_user { sentences.last() } else { sentences.first() };
     let line = error.map(str::to_string).unwrap_or_else(|| picked.map(|line| line.chars().take(80).collect()).unwrap_or_default());
     let mut brief = json!({
         "messageID": message_uuid(session, live.node + 2 * (live.segments.len() - 1) + 1),
@@ -2687,9 +2696,15 @@ fn turn_brief(session: &str, live: &Live, done: &Value) -> Value {
         "answer": answer.chars().take(1200).collect::<String>(),
     });
     if asks {
-        brief["question"] = json!(line);
+        brief["question"] = json!(sentences.last().map(|line| line.chars().take(80).collect::<String>()).unwrap_or_default());
     }
     brief
+}
+
+/// 这句话是助手派 / 转达的：说是 user、又带了落款（「· 原话」直达的算用户自己说的；定时任务、子智能体交回的 kind 不是 user）。
+/// 回答它的那一轮里问的、等拍板的是派活的助手、不是用户（同 Friday 的 AgentRunner::askedByAssistant）
+fn relayed_origin(origin: &Value) -> bool {
+    origin["kind"] == "user" && origin["from"].as_str().is_some_and(|from| !from.trim().is_empty() && !from.trim().ends_with("· 原话"))
 }
 
 /// 推一条动静给订了的客户端（标题、工作目录按正在干的那一轮记的，没有就读存档）
@@ -27748,6 +27763,8 @@ mod assistant {
         status: String,
         /// 这一轮是谁开始的：user / agent / assistant / loop
         by: String,
+        /// 最后那条回答回的那句是助手派 / 转达的（crate::relayed_origin，干活时的补充跟着换）：回答里问的是派活的助手，不判「在问你」
+        relayed: bool,
         /// 最近一次交给它的话（最多 600 字）：做完时大脑对照着核对。助手派的是助手说的那句，用户自己说的是用户那句；
         /// 助手自己让它接着做时不换（那句记在 last_continue）：下一轮核对时对的还是用户要的
         request: String,
@@ -28003,19 +28020,24 @@ mod assistant {
         let answer = crate::plain(text(done, "answer"));
         let error = done["error"].as_str().filter(|error| !error.is_empty());
         let last = answer.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or("");
-        let asks = last.trim_end().ends_with(['？', '?']) || ["等你", "你确认", "你拍板", "请确认"].iter().any(|mark| last.contains(mark));
+        let asks = (last.trim_end().ends_with(['？', '?'])
+            || ["等你", "你确认", "你拍板", "请确认"].iter().any(|mark| last.contains(mark)))
+            && error.is_none()
+            && done["stopped"] != json!(true);
+        // 助手派 / 转达的一轮问的是派活的助手：照常算完成，问句留给大脑看（同 Friday TurnBrief::make 的 relayed，2026-11-25）
+        let asks_user = asks && !track.relayed;
         let status = if error.is_some() {
             "error"
         } else if done["stopped"] == json!(true) {
             "stopped"
-        } else if asks {
+        } else if asks_user {
             "question"
         } else {
             "done"
         };
         let line = if let Some(error) = error {
             truncate(error, 80)
-        } else if asks {
+        } else if asks_user {
             truncate(last, 80)
         } else {
             let conclusion = answer.lines().find_map(|line| line.trim().strip_prefix("结论：").map(str::to_string));
@@ -28032,7 +28054,7 @@ mod assistant {
         json!({
             "status": status, "line": line, "filesChanged": track.files.len(), "commands": track.commands, "commandsFailed": track.failed,
             "subAgents": track.agents, "seconds": track.started.map_or(0, |started| started.elapsed().as_secs()), "finishedAt": now_iso(),
-            "answer": truncate(&answer, 1200), "question": if asks { line.clone() } else { String::new() },
+            "answer": truncate(&answer, 1200), "question": if asks { truncate(last, 80) } else { String::new() },
         })
     }
 
@@ -28480,6 +28502,15 @@ mod assistant {
                 if let Some(answer) = brief["answer"].as_str().filter(|answer| !answer.is_empty()) {
                     note += &format!("\n它最后的回答（节选）：\n{answer}");
                 }
+                // 助手派 / 转达的一轮最后问的、等拍板的是派活的助手（简报是完成、问句还在）：没有问题卡片，用户那边看不到在问他（同 Friday）
+                if text(brief, "status") == "done"
+                    && let Some(question) = brief["question"].as_str().filter(|question| !question.is_empty())
+                {
+                    let who = if track.by == "assistant" { "派活的你" } else { "派活的助手" };
+                    note += &format!(
+                        "\n它最后问的是{who}、不是用户（没有问题卡片，用户看不到）：{question}\n（你能定的直接 send_to_session 回它；要用户拍板的再问用户）"
+                    );
+                }
                 // 这是助手自己让它接着做的第几轮、还能不能再续
                 note += &continue_note(&track);
                 finished = Some(Finished {
@@ -28538,6 +28569,7 @@ mod assistant {
                         cwd: old.cwd,
                         status: "running".into(),
                         by: by.into(),
+                        relayed: crate::relayed_origin(&data["origin"]),
                         started: Some(Instant::now()),
                         last_event: Some(Instant::now()),
                         dispatched: old.dispatched,
@@ -28580,6 +28612,12 @@ mod assistant {
                 });
                 // 它又开了一轮（用户自己接着说了、别处让它做了）：还挂着的「要不要接着做」不用答了
                 close_offers(session, "它已经接着做别的了");
+            }
+            // 干活时补充的话：最后那条回答回的是它了（子智能体交回的不算）
+            "input" => {
+                if data["origin"]["kind"] != "agent" {
+                    with_track(session, |track| track.relayed = crate::relayed_origin(&data["origin"]));
+                }
             }
             "tool" => {
                 let name = text(data, "name").to_string();
@@ -29791,6 +29829,27 @@ mod assistant {
             );
             let asked = super::brief(&Track::default(), &json!({ "answer": "做好了。\n\n要我提交吗？" }));
             assert_eq!((asked["status"].as_str(), asked["line"].as_str()), (Some("question"), Some("要我提交吗？")));
+            // 助手派 / 转达的一轮（.51 #ac6c 股市热门抓取，2026-11-25）：「等你统一决定」等的是派活的助手——照常算完成，问句留给大脑
+            let waiting = json!({ "answer": "报告写好了，200 条。\n\n满足这两点后可以接 loop，等你统一决定何时开启。" });
+            let own = super::brief(&Track::default(), &waiting);
+            assert_eq!(own["status"], "question");
+            let relayed = super::brief(&Track { relayed: true, ..Default::default() }, &waiting);
+            assert_eq!(
+                (relayed["status"].as_str(), relayed["question"].as_str()),
+                (Some("done"), Some("满足这两点后可以接 loop，等你统一决定何时开启。")),
+                "{relayed}"
+            );
+            assert!(receipt_text("#ac6c", &track, &relayed).starts_with("完成｜"));
+            // 被停、出错的不带问句
+            let stopped = super::brief(&Track::default(), &json!({ "answer": "做好了。\n\n要我提交吗？", "stopped": true }));
+            assert_eq!((stopped["status"].as_str(), stopped["question"].as_str()), (Some("stopped"), Some("")));
+            assert!(crate::relayed_origin(&json!({ "kind": "user", "from": "助手" })));
+            assert!(crate::relayed_origin(&json!({ "kind": "user", "from": "Friday 个人助理 · 用户已确认" })));
+            assert!(!crate::relayed_origin(&json!({ "kind": "user", "from": "Friday 个人助理 · SChat · 原话" })));
+            assert!(
+                !crate::relayed_origin(&json!({ "kind": "user" }))
+                    && !crate::relayed_origin(&json!({ "kind": "loop", "from": "定时任务 #3" }))
+            );
         }
 
         /// 旁边的人说的拼成一块：一个标题、一行一句；从新往旧按字数取，超了的更早的不带
