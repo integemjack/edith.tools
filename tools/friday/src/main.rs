@@ -25265,6 +25265,8 @@ mod learn {
             return Err("没有可用的模型".into());
         }
         let history = [json!({ "role": "user", "content": user })];
+        // 引擎 id：这个模型说过不接受的参数、思考关不掉 / 只认某几档（friday-core 按引擎记住的）拼请求体时照着来
+        let engine_id = field("id");
         let thinking = Some(field("thinking"))
             .filter(|thinking| !thinking.is_empty())
             .unwrap_or_else(|| friday_core::engines::inferred_thinking(&base, engine["sendsEnableThinking"] == json!(true)).to_string());
@@ -25276,6 +25278,7 @@ mod learn {
             base_url: base.clone(),
             thinking,
             extra_body: field("extraBody"),
+            engine_id: engine_id.clone(),
             x_friday,
             ..Default::default()
         });
@@ -25284,8 +25287,28 @@ mod learn {
             object.remove("stream_options");
         }
         let url = crate::capnet::endpoint(&base, "chat/completions").map_err(|error| error.message)?;
-        let reply =
-            crate::capnet::json("POST", &url, &crate::capnet::bearer(Some(&key)), Some(&body), 600).map_err(|error| error.message)?;
+        let headers = crate::capnet::bearer(Some(&key));
+        let mut attempts = 0;
+        let reply = loop {
+            let payload = serde_json::to_vec(&body).unwrap_or_default();
+            let response =
+                crate::capnet::send("POST", &url, &headers, Some(("application/json", payload)), 600).map_err(|error| error.message)?;
+            if response.ok() {
+                break response.json();
+            }
+            let text = response.text(4000);
+            // 被打回的（不接受的可选参数、思考关不掉 / 只认某几档，2026-11-26 智谱 glm-5.3 的 1210 让一轮结束的整理一直失败）：
+            // 同对话那边经 friday-core 改了再发（记在引擎上，之后拼的请求体照着来）；要换 Responses 接口的不换，照常报错
+            attempts += 1;
+            if attempts <= 2
+                && let Some(fixed) = friday_core::chat_request::refused(response.status as i64, &text, &body, &engine_id)
+                && fixed["responses"] != json!(true)
+            {
+                body = fixed["body"].clone();
+                continue;
+            }
+            return Err(crate::capnet::Error::http(response.status, &text).message);
+        };
         let content = &reply["choices"][0]["message"]["content"];
         let answer = match content {
             Value::String(text) => text.clone(),
@@ -27511,6 +27534,65 @@ path CLAUDE.md
     mod tests {
         use super::*;
 
+        /// 2026-11-26 整理用的模型思考关不掉（智谱 glm-5.3 的 1210）：complete() 经 friday-core 的 refused 改成开着思考、最低一档再发
+        #[test]
+        fn complete_retries_when_thinking_cannot_be_off() {
+            use std::io::{Read, Write};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let seen = std::sync::Arc::new(Mutex::new(Vec::<Value>::new()));
+            let log = seen.clone();
+            std::thread::spawn(move || {
+                for stream in listener.incoming().take(3) {
+                    let mut stream = stream.unwrap();
+                    let mut data = Vec::new();
+                    let mut buffer = [0u8; 8192];
+                    let body = loop {
+                        let read = stream.read(&mut buffer).unwrap_or(0);
+                        data.extend_from_slice(&buffer[..read]);
+                        let Some(end) = data.windows(4).position(|window| window == b"\r\n\r\n") else { continue };
+                        let head = String::from_utf8_lossy(&data[..end]).to_lowercase();
+                        let length = head
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:").map(|value| value.trim().parse::<usize>().unwrap_or(0)))
+                            .unwrap_or(0);
+                        if data.len() >= end + 4 + length || read == 0 {
+                            break serde_json::from_slice::<Value>(&data[end + 4..]).unwrap_or(Value::Null);
+                        }
+                    };
+                    let off = body["thinking"]["type"] == "disabled" || body["reasoning_effort"] == "medium";
+                    log.lock().unwrap().push(body);
+                    let (status, reply) = if off {
+                        (
+                            "400 Bad Request",
+                            r#"{"error":{"code":"1210","message":"该模型始终思考，不支持关闭思考；请使用 low、high 或 max。"}}"#
+                                .to_string(),
+                        )
+                    } else {
+                        (
+                            "200 OK",
+                            json!({ "choices": [{ "message": { "role": "assistant", "content": "{\"memories\":[]}" } }] }).to_string(),
+                        )
+                    };
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                        reply.len()
+                    );
+                }
+            });
+            let engine = json!({ "id": "test-always-thinks", "baseURL": format!("http://127.0.0.1:{port}/v1"), "model": "glm-5.3",
+                                 "thinking": "thinkingType", "apiKeySecret": "" });
+            assert_eq!(complete(&engine, "", "整理一下"), Ok("{\"memories\":[]}".to_string()));
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 2, "{seen:?}");
+            assert_eq!(seen[0]["thinking"], json!({ "type": "disabled" }));
+            assert_eq!((seen[1]["thinking"].clone(), seen[1]["reasoning_effort"].clone()), (json!({ "type": "enabled" }), json!("low")));
+            // 记在引擎上：下一次一开始就照着拼，不再先被拒一回
+            drop(seen);
+            assert!(complete(&engine, "", "再整理一下").is_ok());
+        }
+
         #[test]
         fn assistant_organizes_with_the_writer() {
             // 助手会话的整理用助手设置里的「写回」；没选、别的会话照 设置 › 钩子 选的
@@ -29115,11 +29197,23 @@ mod assistant {
                     with_track(session, |track| track.relayed = crate::relayed_origin(&data["origin"]));
                 }
             }
+            // 2026-11-26 额度用完 / 余额不足在等恢复（大脑在 notice 里带 quota）：标「等额度」——不算卡住、不出回执（同 Friday）；
+            // 以前一直当在跑，5 分钟后报「卡住了｜好一阵没动静」
+            "notice" if data["quota"].is_object() => {
+                with_track(session, |track| {
+                    track.last_event = Some(Instant::now());
+                    track.tool = None;
+                    if matches!(track.status.as_str(), "running" | "quota") {
+                        track.status = "quota".into();
+                    }
+                });
+            }
             "tool" => {
                 let name = text(data, "name").to_string();
                 let arguments = data["arguments"].clone();
                 with_track(session, |track| {
                     track.last_event = Some(Instant::now());
+                    resume_from_quota(track);
                     let summary = ["path", "command", "url", "query", "task"].iter().find_map(|key| arguments[*key].as_str()).unwrap_or("");
                     match name.as_str() {
                         "write_file" | "edit_file" => {
@@ -29140,6 +29234,7 @@ mod assistant {
                 let failed = data["ok"] == json!(false) && text(data, "name") == "run_shell";
                 with_track(session, |track| {
                     track.last_event = Some(Instant::now());
+                    resume_from_quota(track);
                     track.tool = None;
                     if failed {
                         track.failed += 1;
@@ -29147,8 +29242,13 @@ mod assistant {
                 });
             }
             "text" | "thinking" | "stats" => {
-                if let Some(track) = BOARD.lock().unwrap().tracks.get_mut(session) {
+                let waited = BOARD.lock().unwrap().tracks.get_mut(session).is_some_and(|track| {
                     track.last_event = Some(Instant::now());
+                    track.status == "quota"
+                });
+                // 额度恢复了、接着做了：回到在跑（状态板跟着变）
+                if waited {
+                    with_track(session, resume_from_quota);
                 }
             }
             "approval" => {
@@ -29222,6 +29322,13 @@ mod assistant {
     }
 
     /// 在跑的好一阵没动静（ASSISTANT.md §4.1：300 秒；有工具在跑时 15 分钟）：报一次「卡住了」
+    /// 等额度的会话又有了动静（额度恢复、接着做了）：回到在跑
+    fn resume_from_quota(track: &mut Track) {
+        if track.status == "quota" {
+            track.status = "running".into();
+        }
+    }
+
     fn check_stalled() {
         let stalled: Vec<(String, Track)> = {
             let mut board = BOARD.lock().unwrap();
@@ -29790,9 +29897,10 @@ mod assistant {
     pub fn actions() -> Vec<Value> {
         let Some(session) = session_id() else { return Vec::new() };
         let string = |description: &str| json!({ "type": "string", "description": description });
+        // always：一直给助手那段会话（edith 2026-11-26 起认）——不然要先 load_tools 取回，设了每次最多调用工具几轮（默认 2）时第一次用只剩一轮（同 Friday：助手的工具都直接给）
         let define = |name: &str, description: &str, properties: Value, required: &[&str], read_only: bool| {
             json!({
-                "name": name, "description": description, "readOnly": read_only, "timeoutSeconds": 60, "sessions": [session],
+                "name": name, "description": description, "readOnly": read_only, "timeoutSeconds": 60, "sessions": [session], "always": true,
                 "parameters": { "type": "object", "properties": properties, "required": required },
             })
         };

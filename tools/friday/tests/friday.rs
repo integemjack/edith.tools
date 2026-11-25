@@ -2541,6 +2541,67 @@ fn assistant_permission_switches() {
     finish(&mut resident, "a4");
 }
 
+/// 2026-11-26 会话额度用完 / 余额不足在等恢复（大脑的 notice 带 quota）：状态板标「等额度」，不算卡住；又有动静（恢复了、接着做）回到在跑。
+/// 以前一直当在跑，5 分钟后报「卡住了｜好一阵没动静」（239 上智谱套餐到期时实测）
+#[test]
+fn quota_waits_show_on_the_board() {
+    let home = scratch("friday-quota-board");
+    let work = home.join("work");
+    std::fs::create_dir_all(work.join(".git")).unwrap();
+    write_session(&home, &work);
+    let brain = FakeBrain::new();
+    register(&home, &brain, &work);
+    let mut client = Client::start_with(&home, &work, &[("EDITH_FRIDAY_HUB_IDLE", "60")]);
+    let hello = client.send("hello", json!({ "protocol": 1 }));
+    let (mut gateway, mut resident) = (None, None);
+    for _ in 0..2 {
+        let mut link = brain.accept(15).expect("少了一条连接");
+        let reply = link.handshake(json!({ "name": "EDITH", "version": "test" }));
+        match reply["name"].as_str() {
+            Some("friday-client") => gateway = Some(link),
+            Some("friday") => resident = Some(link),
+            other => panic!("不认识的连接 {other:?}：{reply}"),
+        }
+    }
+    let (mut gateway, mut resident) = (gateway.unwrap(), resident.unwrap());
+    let list = gateway.wait_for(10, |message| message["method"] == "sessions.list").unwrap();
+    reply(&mut gateway, &list, json!([]));
+    let agents = gateway.wait_for(10, |message| message["method"] == "agents.list").unwrap();
+    reply(&mut gateway, &agents, json!([]));
+    assert!(client.reply(hello).get("error").is_none());
+    client.request("assistant.settings.update", json!({ "enabled": true }));
+    client.request("assistant.subscribe", json!({ "count": 1 }));
+    let status = |client: &mut Client, wanted: &str| {
+        let board = client.event("assistant.board", |params| {
+            params["board"]["machines"][0]["entries"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|entry| entry["conversationID"] == SESSION.to_uppercase() && entry["status"] == wanted)
+        });
+        board["params"]["board"]["machines"][0]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["conversationID"] == SESSION.to_uppercase())
+            .unwrap()["statusText"]
+            .as_str()
+            .unwrap_or("")
+            .to_string()
+    };
+    push(&mut resident, SESSION, "t1", "turn.started", json!({ "text": "整理一下笔记", "origin": { "kind": "user" } }));
+    status(&mut client, "running");
+    let quota = json!({ "text": "余额不足或欠费，充值后会自动接着做：17:14（30 分钟后）再试一次", "quota": { "kind": "balance", "resumeAt": "2026-11-26T09:14:00Z" } });
+    push(&mut resident, SESSION, "t1", "notice", quota);
+    assert_eq!(status(&mut client, "quota"), "等额度");
+    // 只是普通的说明（重试、压了上下文）不改状态；恢复了又吐字：回到在跑
+    push(&mut resident, SESSION, "t1", "notice", json!({ "text": "上下文太长，压短了重发" }));
+    push(&mut resident, SESSION, "t1", "text", json!({ "text": "接着做了" }));
+    status(&mut client, "running");
+    push(&mut resident, SESSION, "t1", "done", json!({ "answer": "整理好了", "stopped": false, "error": null }));
+    status(&mut client, "idle");
+}
+
 /// 被用户的新话打断时没回完的（同 Friday 859287d9，Friday 仓库 qt/docs/ASSISTANT.md §16.3.4；.51 那通电话：「你做那个做那个推期我」→
 /// 「每天12点清理系统磁盘」→「说你们两个」，每句都在助手还没出字时打断前一句，大脑只回了最后一句）：助手在回时用户又说一句，EDITH 停下那一轮、
 /// 带着新话重来——那一轮要回的几句列在新话前面的「[还没回完的]」里，连着打断的累加；还排着没开始的那一轮从大脑的队列里拿掉

@@ -25,7 +25,7 @@ regex = "1"
 # 视频通话里对方摄像头的画面存成 PNG 交给助手
 flate2 = "1"
 # Friday 的规则（脚本工具的存储格式、提示词……），同 EDITH 用的那一版
-friday-core = { git = "https://github.com/integemjack/friday.core", rev = "607791651fbe4c2c780391fbe06d3c952c02cb4f" }
+friday-core = { git = "https://github.com/integemjack/friday.core", rev = "4126240666396d772a101034455934af3d856a60" }
 
 [features]
 # 助手的语音 / 视频通话、P2P 文字：编通话内核（call/，C++，要 CMake）静态链进来；CI 在编得了的平台上打开（.github/workflows/tool.yml 的 features）
