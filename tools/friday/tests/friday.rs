@@ -2155,6 +2155,125 @@ fn finished_turns_are_reviewed_and_continued() {
     );
 }
 
+/// 推送规则也管助手被回执叫醒后说的（同 Friday 6a81f49c，Friday 仓库 qt/docs/ASSISTANT.md §5.1）：以前叫醒它的回执不管该不该推，
+/// 它说的都推，选了「不推」照样推。现在默认（只推要紧的）没人等着的会话做完了，核对的那句只留在助手页；「全部推」照推；
+/// 「不推」时它说的、「是否按下面的继续做」卡片都只留在助手页
+#[test]
+fn receipt_replies_follow_the_push_rule() {
+    let home = scratch("friday-push-rule");
+    let work = home.join("work");
+    std::fs::create_dir_all(work.join(".git")).unwrap();
+    write_session(&home, &work);
+    let brain = FakeBrain::new();
+    register(&home, &brain, &work);
+    let mut client = Client::start_with(&home, &work, &[("EDITH_FRIDAY_HUB_IDLE", "60")]);
+    let hello = client.send("hello", json!({ "protocol": 1 }));
+    let (mut gateway, mut resident) = (None, None);
+    for _ in 0..2 {
+        let mut link = brain.accept(15).expect("少了一条连接");
+        let reply = link.handshake(json!({ "name": "EDITH", "version": "test" }));
+        match reply["name"].as_str() {
+            Some("friday-client") => gateway = Some(link),
+            Some("friday") => resident = Some(link),
+            other => panic!("不认识的连接 {other:?}：{reply}"),
+        }
+    }
+    let (mut gateway, mut resident) = (gateway.unwrap(), resident.unwrap());
+    let list = gateway.wait_for(10, |message| message["method"] == "sessions.list").unwrap();
+    reply(&mut gateway, &list, json!([]));
+    let agents = gateway.wait_for(10, |message| message["method"] == "agents.list").unwrap();
+    reply(&mut gateway, &agents, json!([]));
+    assert!(client.reply(hello).get("error").is_none());
+    let config = client.request("assistant.settings.update", json!({ "enabled": true }))["config"].clone();
+    assert_eq!(config["pushRule"], "important", "默认只推要紧的");
+    // 订阅了助手才收得到日志、推送
+    client.request("assistant.subscribe", json!({ "count": 1 }));
+
+    let assistant = std::cell::RefCell::new(String::new());
+    // 等常驻那份把回执交给助手：回它的 sense，再替大脑报这一轮开始了
+    let woken = |resident: &mut Link, turn: &str| {
+        loop {
+            let message = resident
+                .wait_for(15, |message| message["method"] == "sessions.create" || message["method"] == "sense")
+                .expect("没叫醒助手");
+            if message["method"] == "sessions.create" {
+                let id = message["params"]["id"].as_str().unwrap().to_string();
+                let meta = json!({ "type": "meta", "id": id, "cwd": work.to_string_lossy(), "owner": "#assistant", "created": "2026-11-25T10:00:00+08:00" });
+                std::fs::write(sessions_dir(&home).join(format!("{id}.jsonl")), format!("{meta}\n")).unwrap();
+                *assistant.borrow_mut() = id;
+                reply(resident, &message, json!({}));
+                continue;
+            }
+            let session = assistant.borrow().clone();
+            assert_eq!(message["params"]["kind"], "receipt");
+            reply(resident, &message, json!({ "session": session, "disposition": "started", "turn": turn }));
+            push(resident, &session, turn, "turn.started", json!({ "text": "", "origin": { "kind": "receipt" } }));
+            std::thread::sleep(Duration::from_millis(300));
+            return;
+        }
+    };
+    // 助手说完这一轮：等日志里有了这句，再收一会儿，返回这期间推出去的（kind 和字）
+    let said = |client: &mut Client, resident: &mut Link, turn: &str, words: &str| -> Vec<(String, String)> {
+        let session = assistant.borrow().clone();
+        push(resident, &session, turn, "done", json!({ "answer": words, "stopped": false, "error": null }));
+        client.event("assistant.entry", |params| params["entry"]["text"] == words && params["entry"]["kind"] == "assistant");
+        std::thread::sleep(Duration::from_millis(500));
+        while let Ok(message) = client.messages.try_recv() {
+            client.backlog.push(message);
+        }
+        let mut pushed = Vec::new();
+        client.backlog.retain(|message| {
+            if message["method"] != "assistant.push" {
+                return true;
+            }
+            pushed.push((
+                message["params"]["kind"].as_str().unwrap_or("").to_string(),
+                message["params"]["text"].as_str().unwrap_or("").to_string(),
+            ));
+            false
+        });
+        pushed
+    };
+    let finished_turn = |resident: &mut Link, turn: &str, answer: &str| {
+        push(resident, SESSION, turn, "turn.started", json!({ "text": "整理一下笔记", "origin": { "kind": "user" } }));
+        push(resident, SESSION, turn, "done", json!({ "answer": answer, "stopped": false, "error": null }));
+    };
+
+    // 默认：用户自己开的、没人等着的那段做完了——照样叫醒核对，说的只留在助手页
+    client.drain();
+    finished_turn(&mut resident, "t1", "整理好了。");
+    woken(&mut resident, "a1");
+    let pushed = said(&mut client, &mut resident, "a1", "笔记整理好了");
+    assert!(pushed.is_empty(), "只推要紧的：没人等的核对那句不推：{pushed:?}");
+
+    // 全部推：回执、说的都推
+    client.request("assistant.settings.update", json!({ "pushRule": "all" }));
+    finished_turn(&mut resident, "t2", "补了两条。");
+    woken(&mut resident, "a2");
+    let pushed = said(&mut client, &mut resident, "a2", "笔记又补了两条");
+    assert!(pushed.contains(&("reply".to_string(), "笔记又补了两条".to_string())), "全部推：说的照推：{pushed:?}");
+    assert!(pushed.iter().any(|(kind, _)| kind == "receipt"), "全部推：回执也推：{pushed:?}");
+
+    // 不推：说的只留在助手页；关了自动接着做时「是否按下面的继续做」卡片挂在助手页，不推
+    client.request("assistant.settings.update", json!({ "pushRule": "none", "autoContinue": false }));
+    finished_turn(&mut resident, "t3", "正文好了。");
+    woken(&mut resident, "a3");
+    let act = json!({ "call": "c", "action": "send_to_session", "arguments": { "session": "#5d0c", "text": "还差目录，补上" },
+                      "session": assistant.borrow().clone(), "turn": "a3" });
+    let call = resident.start("act", act);
+    let offered = resident.reply_to(call, 10);
+    assert!(offered["result"]["text"].as_str().unwrap_or("").starts_with("没直接发：设置里关了「做完后自动接着做」"), "{offered}");
+    let pushed = said(&mut client, &mut resident, "a3", "笔记还差目录");
+    assert!(pushed.is_empty(), "不推：说的、卡片都不推：{pushed:?}");
+    let entries = client.request("assistant.subscribe", json!({ "count": 50 }))["entries"].as_array().unwrap().clone();
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry["data"]["question"]["proposal"] == "还差目录，补上" && entry["data"]["question"]["state"] == "pending"),
+        "卡片挂在助手页"
+    );
+}
+
 /// 被用户的新话打断时没回完的（同 Friday 859287d9，Friday 仓库 qt/docs/ASSISTANT.md §16.3.4；.51 那通电话：「你做那个做那个推期我」→
 /// 「每天12点清理系统磁盘」→「说你们两个」，每句都在助手还没出字时打断前一句，大脑只回了最后一句）：助手在回时用户又说一句，EDITH 停下那一轮、
 /// 带着新话重来——那一轮要回的几句列在新话前面的「[还没回完的]」里，连着打断的累加；还排着没开始的那一轮从大脑的队列里拿掉
