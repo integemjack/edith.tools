@@ -2274,6 +2274,99 @@ fn receipt_replies_follow_the_push_rule() {
     );
 }
 
+/// 助手设置里以前只存不读的几项（同 Friday，Friday 仓库 qt/docs/ASSISTANT.md §5.1、§9）：合并间隔（叫不醒大脑时做完的回执攒着、到了合成一条推；
+/// 同一个项目来了 3 条以上合并后过一次大脑）、打字和回执用的模型（textEngineID；语音、通话用大脑）、每次最多调用工具几轮（toolRounds，交给大脑的 sense 带上）
+#[test]
+fn assistant_settings_reach_receipts_and_the_brain() {
+    let home = scratch("friday-assistant-settings");
+    let work = home.join("work");
+    std::fs::create_dir_all(work.join(".git")).unwrap();
+    write_session(&home, &work);
+    let brain = FakeBrain::new();
+    register(&home, &brain, &work);
+    let mut client = Client::start_with(&home, &work, &[("EDITH_FRIDAY_HUB_IDLE", "60")]);
+    let hello = client.send("hello", json!({ "protocol": 1 }));
+    let (mut gateway, mut resident) = (None, None);
+    for _ in 0..2 {
+        let mut link = brain.accept(15).expect("少了一条连接");
+        let reply = link.handshake(json!({ "name": "EDITH", "version": "test" }));
+        match reply["name"].as_str() {
+            Some("friday-client") => gateway = Some(link),
+            Some("friday") => resident = Some(link),
+            other => panic!("不认识的连接 {other:?}：{reply}"),
+        }
+    }
+    let (mut gateway, mut resident) = (gateway.unwrap(), resident.unwrap());
+    let list = gateway.wait_for(10, |message| message["method"] == "sessions.list").unwrap();
+    reply(&mut gateway, &list, json!([]));
+    let agents = gateway.wait_for(10, |message| message["method"] == "agents.list").unwrap();
+    reply(&mut gateway, &agents, json!([]));
+    assert!(client.reply(hello).get("error").is_none());
+    let settings = json!({
+        "enabled": true, "pushRule": "all", "digestSeconds": 1, "autoWakesPerHour": 0,
+        "brainEngineID": "fast", "textEngineID": "strong", "toolRounds": 4,
+    });
+    let config = client.request("assistant.settings.update", settings)["config"].clone();
+    assert_eq!((config["digestSeconds"].as_i64(), config["textEngineID"].as_str()), (Some(1), Some("strong")));
+    client.request("assistant.subscribe", json!({ "count": 1 }));
+
+    let assistant = std::cell::RefCell::new(String::new());
+    // 等常驻那份把回执交给助手：回它的 sense，再替大脑报这一轮开始了；返回 sense 的参数
+    let woken = |resident: &mut Link, turn: &str| -> Value {
+        loop {
+            let message = resident
+                .wait_for(15, |message| message["method"] == "sessions.create" || message["method"] == "sense")
+                .expect("没叫醒助手");
+            if message["method"] == "sessions.create" {
+                let id = message["params"]["id"].as_str().unwrap().to_string();
+                let meta = json!({ "type": "meta", "id": id, "cwd": work.to_string_lossy(), "owner": "#assistant", "created": "2026-11-25T10:00:00+08:00" });
+                std::fs::write(sessions_dir(&home).join(format!("{id}.jsonl")), format!("{meta}\n")).unwrap();
+                *assistant.borrow_mut() = id;
+                reply(resident, &message, json!({}));
+                continue;
+            }
+            let session = assistant.borrow().clone();
+            reply(resident, &message, json!({ "session": session, "disposition": "started", "turn": turn }));
+            push(resident, &session, turn, "turn.started", json!({ "text": "", "origin": { "kind": "receipt" } }));
+            return message["params"].clone();
+        }
+    };
+    let finished_turn = |resident: &mut Link, turn: &str, answer: &str, stopped: bool| {
+        push(resident, SESSION, turn, "turn.started", json!({ "text": "整理一下笔记", "origin": { "kind": "user" } }));
+        push(resident, SESSION, turn, "done", json!({ "answer": answer, "stopped": stopped, "error": null }));
+    };
+
+    // 合并间隔：叫不醒大脑（每小时上限 0）时做完的两段回执攒着，间隔到了合成一条推
+    finished_turn(&mut resident, "t1", "第一段好了。", false);
+    finished_turn(&mut resident, "t2", "第二段也好了。", false);
+    let pushed = client.event_within(10, "assistant.push", |params| params["kind"] == "receipt");
+    let words = pushed["params"]["text"].as_str().unwrap_or("");
+    assert_eq!(words.matches("完成｜").count(), 2, "两条合成一条推：{words}");
+    assert!(words.contains("第一段好了") && words.contains("第二段也好了") && words.contains("\n\n"), "{words}");
+
+    // 叫得醒大脑：回执交给它的那一轮用「打字和回执」的模型，带上每次最多调用工具几轮
+    client.request("assistant.settings.update", json!({ "autoWakesPerHour": 30 }));
+    finished_turn(&mut resident, "t3", "第三段好了。", false);
+    let sense = woken(&mut resident, "a1");
+    assert_eq!(
+        (sense["kind"].as_str(), sense["engine"].as_str(), sense["toolRounds"].as_i64()),
+        (Some("receipt"), Some("strong"), Some(4)),
+        "{sense}"
+    );
+    let session = assistant.borrow().clone();
+    push(&mut resident, &session, "a1", "done", json!({ "answer": "（不说）", "stopped": false, "error": null }));
+
+    // 同一个项目这一阵来了 3 条（被停下的、没人等，本来只攒着）：合并后过一次大脑
+    for turn in ["t4", "t5", "t6"] {
+        finished_turn(&mut resident, turn, "", true);
+    }
+    let sense = woken(&mut resident, "a2");
+    let note = sense["text"].as_str().unwrap_or("");
+    assert!(note.contains("同一个项目这一阵来了 3 条回执："), "{note}");
+    assert_eq!(note.matches("已停止｜").count(), 3, "{note}");
+    assert_eq!(sense["engine"].as_str(), Some("strong"));
+}
+
 /// 被用户的新话打断时没回完的（同 Friday 859287d9，Friday 仓库 qt/docs/ASSISTANT.md §16.3.4；.51 那通电话：「你做那个做那个推期我」→
 /// 「每天12点清理系统磁盘」→「说你们两个」，每句都在助手还没出字时打断前一句，大脑只回了最后一句）：助手在回时用户又说一句，EDITH 停下那一轮、
 /// 带着新话重来——那一轮要回的几句列在新话前面的「[还没回完的]」里，连着打断的累加；还排着没开始的那一轮从大脑的队列里拿掉
