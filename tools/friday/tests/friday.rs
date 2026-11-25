@@ -2559,7 +2559,11 @@ fn quota_waits_show_on_the_board() {
         let reply = link.handshake(json!({ "name": "EDITH", "version": "test" }));
         match reply["name"].as_str() {
             Some("friday-client") => gateway = Some(link),
-            Some("friday") => resident = Some(link),
+            Some("friday") => {
+                // 真的大脑只推订了的事件：常驻那份要订 notice（等额度的说明在里面）
+                assert!(reply["receives"].as_array().unwrap().contains(&json!("notice")), "{reply}");
+                resident = Some(link)
+            }
             other => panic!("不认识的连接 {other:?}：{reply}"),
         }
     }

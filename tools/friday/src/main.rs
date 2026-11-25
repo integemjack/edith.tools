@@ -5487,8 +5487,9 @@ fn serve_initialize() -> Value {
             "description": "Friday 的内置浏览器（用户在浏览器卡片里看得见、能一起操作）、定时任务、自定义脚本工具",
         },
         "actions": actions,
-        // text、stats：语音会话的回复边写边念、插话时哪段不念了（voice）；input、tool、result：复盘记这一轮做了什么（learn）
-        "receives": ["turn.started", "input", "text", "tool", "result", "stats", "approval", "done"],
+        // text、stats：语音会话的回复边写边念、插话时哪段不念了（voice）；input、tool、result：复盘记这一轮做了什么（learn）；
+        // notice：等额度（带 quota）时助手的状态板标「等额度」（2026-11-26；没订的话大脑不推，239 实测时状态板一直是在跑）
+        "receives": ["turn.started", "input", "text", "tool", "result", "stats", "approval", "notice", "done"],
         "sessions": "all",
         "hooks": hooks::EVENTS,
         // 本地模型（power://llm）的真地址由这里给（能力协议 §6.6）
