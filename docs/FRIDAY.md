@@ -157,7 +157,7 @@ Friday 客户端 ──SSH──▶ edith-friday --attach（一条连接一个�
     （`urgency: interrupt`）；它的回复边写边进日志，回「（不说）」的标 silent。以「#短号」开头的话原样发给那段会话、不经过大脑。
   - **管会话的工具**是常驻那份的动作，只给助手会话（动作的 `sessions`）：`list_sessions`、`create_session`（在某个目录开会话、交任务）、`send_to_session`
     （默认排到下一轮，`interject` 补进正在做的这一轮；`extra: true` 是用户要的范围之外、它自己想到还可以做的，不直接发，见下面「做完的每一轮都核对」）、
-    `read_session`、`manage_session`（停下、关注、改名）、`post_detail`（给看的内容）；记事用 EDITH 的 `save_memory` / `search_memory`，定时用 `loop`。
+    `read_session`、`manage_session`（停下、关注、改名、改权限、删除）、`resolve_approval`（批准 / 拒绝会话里等确认的调用）、`post_detail`（给看的内容）；记事用 EDITH 的 `save_memory` / `search_memory`，定时用 `loop`。
     助手发给会话的话落款「助手」（`sense` 的 `from`）：会话里那句前面带转达说明。人设改了（这份升级了、名字换了）时第一次交话前用 `sessions.create`
     把助手会话的专用系统提示换成新的（旧的大脑不认，照旧用原来的）。
   - **状态板**：这台全部会话现在的样子（在跑 / 等确认 / 在问你 / 出错 / 空闲，在跑哪个工具、最后一句、短号、助手派的、用户在等的），代码维护，
@@ -187,8 +187,19 @@ Friday 客户端 ──SSH──▶ edith-friday --attach（一条连接一个�
       回完把说的部分（不含给看的细节，太长的截到 600 字附近的句尾）用能力层的「说话」合成（本地语音用助手的音色 `localVoice`、按语速），换成 16 kHz 单声道
       WAV、量整秒时长和 28 格波形，SChat 先传 `/upload/audio` 再发 `type: audio`（`{url, duration, wave}`）；别的聊天工具发不了语音就不发；合成不了的
       每个渠道提示一次。
-    权限一节的四个开关（删除前问我、在聊天工具里批准、助手自己批准、从聊天工具开 Full）在 EDITH 的助手上对应的功能本来就没有（没有删除、批准、改权限的工具），
-    开不开都一样。
+  - **权限**（设置 › 助手 › 权限 的四个开关，2026-11-25 补上，同 Friday；以前这几样功能 EDITH 的助手都没有）：
+    - **批准会话的工具调用**：状态板上等确认的那一件记着 `call`、`agent`；`resolve_approval {session, approve, event_id?}` 经那段会话的大脑
+      `approvals.resolve` 替用户答（edith 2026-11-25 起认；问着的 Friday 客户端收 `approve.cancel` 把待确认收掉；没开 Friday 时大脑在等能批准的
+      连上来，这时也能答）。只有用户这次明确说了才行：桌面端、语音说的算；聊天工具（含电话、P2P 文字）里说的要开「允许在聊天工具里批准」
+      （`approveFromChannels`，默认关）；回执叫醒的那一轮它自己批要开「允许助手自己批准」（`brainApproves`，默认关）。
+    - **聊天工具里点批准**：开了「允许在聊天工具里批准」时，「等确认」的回执上挂「批准 / 拒绝」（`ok:` / `no:` + 事件 id），助手说的话里说到正等着确认的会话
+      （说到的里只有一段在等）也挂；点了经助手去答，日志里记「谁在 SChat 里批准了 #短号 的工具调用」。没开时回执后面补一句去 Friday 里确认、怎么打开。
+    - **删除会话之前问我**（`confirmDestructive`，默认开）：`manage_session delete` 第一次回一个确认码（4 位），助手问过用户、用户在**之后的消息里**同意了
+      （确认码发出后用户又说过话、15 分钟内、同一段会话）再带 `confirm_token` 调才删；关了直接删。删交给它那个大脑 `sessions.remove`（分出去的各支、
+      定时任务、friday.json 里记的一起清），常驻那份推 `conversation.removed`，各网关的会话列表跟着变。不能删助手自己的会话。
+    - **从聊天工具开 Full 权限的会话**（`fullFromChannels`，默认关）：`create_session` 的 `permission_mode`、`manage_session set_permission` 的 `full`
+      从聊天工具里说的要它开着。改的权限记在 friday.json（同客户端的 `runner.setPermissionMode`），推 `conversation.changed`，下一次交话带上；
+      助手开的会话交任务时也照这段会话的权限模式、工作方式交（`with_prefs`，以前没带）。
   - **问的是派活的助手不算「在问你」**（同 Friday 2026-11-25，Friday 仓库 qt/docs/ASSISTANT.md §4.2 第 4 条）：最后那条回答回的那句是助手派 / 转达的
     （`relayed_origin`：`kind` 是 user、带落款，「· 原话」直达的除外；定时任务、子智能体交回的 `kind` 不是 user；干活时的补充跟着换）时，
     回答里的问句、「等你决定」问的是派活的助手：简报照常是完成、问句留在 `question`，交给助手的那段后面加

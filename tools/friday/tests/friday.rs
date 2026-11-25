@@ -2367,6 +2367,180 @@ fn assistant_settings_reach_receipts_and_the_brain() {
     assert_eq!(sense["engine"].as_str(), Some("strong"));
 }
 
+/// 设置 › 助手 › 权限的四个开关（2026-11-25 补上，同 Friday）：助手自己批准会话的工具调用（brainApproves，默认关：只有用户这次明确说了才批，
+/// 批的时候交给大脑 approvals.resolve）、从聊天工具开 / 改成 Full 权限的会话（fullFromChannels，默认关）、删除会话之前问我（confirmDestructive，默认开：
+/// 第一次拿确认码，发出之后用户又说过话才算）。改了的权限模式记在 friday.json，下一次交话带上
+#[test]
+fn assistant_permission_switches() {
+    let home = scratch("friday-assistant-permissions");
+    let work = home.join("work");
+    std::fs::create_dir_all(work.join(".git")).unwrap();
+    write_session(&home, &work);
+    let brain = FakeBrain::new();
+    register(&home, &brain, &work);
+    let mut client = Client::start_with(&home, &work, &[("EDITH_FRIDAY_HUB_IDLE", "60")]);
+    let hello = client.send("hello", json!({ "protocol": 1 }));
+    let (mut gateway, mut resident) = (None, None);
+    for _ in 0..2 {
+        let mut link = brain.accept(15).expect("少了一条连接");
+        let reply = link.handshake(json!({ "name": "EDITH", "version": "test" }));
+        match reply["name"].as_str() {
+            Some("friday-client") => gateway = Some(link),
+            Some("friday") => resident = Some(link),
+            other => panic!("不认识的连接 {other:?}：{reply}"),
+        }
+    }
+    let (mut gateway, mut resident) = (gateway.unwrap(), resident.unwrap());
+    let list = gateway.wait_for(10, |message| message["method"] == "sessions.list").unwrap();
+    reply(&mut gateway, &list, json!([]));
+    let agents = gateway.wait_for(10, |message| message["method"] == "agents.list").unwrap();
+    reply(&mut gateway, &agents, json!([]));
+    assert!(client.reply(hello).get("error").is_none());
+    let config = client.request("assistant.settings.update", json!({ "enabled": true }))["config"].clone();
+    assert_eq!(
+        (
+            config["brainApproves"].as_bool(),
+            config["approveFromChannels"].as_bool(),
+            config["fullFromChannels"].as_bool(),
+            config["confirmDestructive"].as_bool()
+        ),
+        (Some(false), Some(false), Some(false), Some(true)),
+        "默认保守"
+    );
+
+    let assistant = std::cell::RefCell::new(String::new());
+    // 交给助手的这一轮：回它的 sense，再替大脑报这一轮开始了（kind：receipt / user）；返回 sense 的参数
+    let take_turn = |resident: &mut Link, turn: &str, kind: &str| -> Value {
+        loop {
+            let message = resident
+                .wait_for(15, |message| message["method"] == "sessions.create" || message["method"] == "sense")
+                .expect("没交给助手");
+            if message["method"] == "sessions.create" {
+                let id = message["params"]["id"].as_str().unwrap().to_string();
+                let meta = json!({ "type": "meta", "id": id, "cwd": work.to_string_lossy(), "owner": "#assistant", "created": "2026-11-25T10:00:00+08:00" });
+                std::fs::write(sessions_dir(&home).join(format!("{id}.jsonl")), format!("{meta}\n")).unwrap();
+                *assistant.borrow_mut() = id;
+                reply(resident, &message, json!({}));
+                continue;
+            }
+            let session = assistant.borrow().clone();
+            assert_eq!(message["params"]["session"].as_str(), Some(session.as_str()));
+            reply(resident, &message, json!({ "session": session, "disposition": "started", "turn": turn }));
+            push(resident, &session, turn, "turn.started", json!({ "text": "", "origin": { "kind": kind } }));
+            std::thread::sleep(Duration::from_millis(300));
+            return message["params"].clone();
+        }
+    };
+    // 助手在这一轮里调一个动作：返回调用编号（回话另等：动作要先问大脑的，先回大脑）
+    let act = |resident: &mut Link, turn: &str, action: &str, arguments: Value| -> u64 {
+        let act = json!({ "call": "c", "action": action, "arguments": arguments, "session": assistant.borrow().clone(), "turn": turn });
+        resident.start("act", act)
+    };
+    let result = |resident: &mut Link, call: u64| -> (bool, String) {
+        let done = resident.reply_to(call, 10);
+        (done["result"]["ok"].as_bool().unwrap_or(false), done["result"]["text"].as_str().unwrap_or("").to_string())
+    };
+    let finish = |resident: &mut Link, turn: &str| {
+        let session = assistant.borrow().clone();
+        push(resident, &session, turn, "done", json!({ "answer": "（不说）", "stopped": false, "error": null }));
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let say = |client: &mut Client, words: &str, source: &str| client.send("assistant.say", json!({ "text": words, "source": source }));
+
+    // 1. 会话要确认：回执叫醒的这一轮助手想自己批——设置没允许不行；允许了交给大脑 approvals.resolve
+    push(&mut resident, SESSION, "t1", "turn.started", json!({ "text": "清理一下构建目录", "origin": { "kind": "user" } }));
+    let approval = json!({ "call": "call_1", "tool": "run_shell", "summary": "跑命令：rm -rf build", "agent": null, "waiting": true });
+    push(&mut resident, SESSION, "t1", "approval", approval);
+    let sense = take_turn(&mut resident, "a1", "receipt");
+    assert!(sense["text"].as_str().unwrap_or("").contains("等确认｜"), "{sense}");
+    let call = act(&mut resident, "a1", "resolve_approval", json!({ "session": "#5d0c", "approve": true }));
+    let (ok, words) = result(&mut resident, call);
+    assert!(!ok && words.starts_with("不能替用户批准"), "{words}");
+    client.request("assistant.settings.update", json!({ "brainApproves": true }));
+    let call = act(&mut resident, "a1", "resolve_approval", json!({ "session": "#5d0c", "approve": true }));
+    let resolve = resident.wait_for(10, |message| message["method"] == "approvals.resolve").expect("没交给大脑批");
+    assert_eq!(
+        (resolve["params"]["session"].as_str(), resolve["params"]["call"].as_str(), resolve["params"]["decision"].as_str()),
+        (Some(SESSION), Some("call_1"), Some("allow"))
+    );
+    reply(&mut resident, &resolve, json!({ "resolved": true }));
+    let (ok, words) = result(&mut resident, call);
+    assert!(ok && words.starts_with("已批准：") && words.contains("rm -rf build"), "{words}");
+    // 已经答了：再批说处理过了
+    let call = act(&mut resident, "a1", "resolve_approval", json!({ "session": "#5d0c", "approve": false }));
+    let (ok, words) = result(&mut resident, call);
+    assert!(!ok && words.contains("没有等确认的调用"), "{words}");
+    finish(&mut resident, "a1");
+    push(&mut resident, SESSION, "t1", "done", json!({ "answer": "清理好了", "stopped": false, "error": null }));
+    let _ = take_turn(&mut resident, "a1b", "receipt");
+    finish(&mut resident, "a1b");
+    client.request("assistant.settings.update", json!({ "brainApproves": false }));
+
+    // 2. 聊天工具里说的：改成 Full 要设置允许；改了的权限记下来，下一次交话带上
+    let asked = say(&mut client, "把 #5d0c 改成 full 权限", "schat-1");
+    take_turn(&mut resident, "a2", "user");
+    assert!(client.reply(asked).get("error").is_none());
+    let call = act(&mut resident, "a2", "manage_session", json!({ "session": "#5d0c", "action": "set_permission", "value": "full" }));
+    let (ok, words) = result(&mut resident, call);
+    assert!(!ok && words.starts_with("设置里不允许从聊天工具把会话改成 Full"), "{words}");
+    let call = act(&mut resident, "a2", "manage_session", json!({ "session": "#5d0c", "action": "set_permission", "value": "plan" }));
+    let (ok, words) = result(&mut resident, call);
+    assert!(ok && words.contains("权限改成了 plan"), "{words}");
+    let meta: Value = serde_json::from_slice(&std::fs::read(home.join("friday.json")).unwrap()).unwrap();
+    assert_eq!(meta["settings"][SESSION]["permissionMode"], "plan");
+    let call = act(&mut resident, "a2", "send_to_session", json!({ "session": "#5d0c", "text": "接着清理" }));
+    let sense =
+        resident.wait_for(10, |message| message["method"] == "sense" && message["params"]["session"] == SESSION).expect("没发给会话");
+    assert_eq!(sense["params"]["mode"], "plan", "{sense}");
+    reply(&mut resident, &sense, json!({ "session": SESSION, "disposition": "started", "turn": "t2" }));
+    assert!(result(&mut resident, call).0);
+    // 从聊天工具开 Full 权限的会话：要设置允许
+    let create = json!({ "task": "跑一遍测试", "directory": work.to_string_lossy(), "permission_mode": "full" });
+    let call = act(&mut resident, "a2", "create_session", create.clone());
+    let (ok, words) = result(&mut resident, call);
+    assert!(!ok && words.starts_with("设置里不允许从聊天工具开 Full 权限的会话"), "{words}");
+    client.request("assistant.settings.update", json!({ "fullFromChannels": true }));
+    let call = act(&mut resident, "a2", "create_session", create);
+    let created = resident.wait_for(10, |message| message["method"] == "sessions.create").expect("没开会话");
+    let opened = created["params"]["id"].as_str().unwrap().to_string();
+    reply(&mut resident, &created, json!({}));
+    let sense =
+        resident.wait_for(10, |message| message["method"] == "sense" && message["params"]["session"] == opened.as_str()).expect("没交任务");
+    assert_eq!(sense["params"]["mode"], "full", "{sense}");
+    reply(&mut resident, &sense, json!({ "session": opened, "disposition": "started", "turn": "n1" }));
+    let (ok, words) = result(&mut resident, call);
+    assert!(ok && words.starts_with("开了 "), "{words}");
+    finish(&mut resident, "a2");
+
+    // 3. 删除：第一次拿确认码；同一轮里马上带上不算（用户没再说话），用户说了「确定」之后带上才删
+    push(&mut resident, SESSION, "t2", "done", json!({ "answer": "清理完了", "stopped": false, "error": null }));
+    let _ = take_turn(&mut resident, "a2b", "receipt");
+    finish(&mut resident, "a2b");
+    let asked = say(&mut client, "把 #5d0c 删了", "desktop");
+    take_turn(&mut resident, "a3", "user");
+    assert!(client.reply(asked).get("error").is_none());
+    let code = |words: &str| words.split("confirm_token=").nth(1).map(|rest| rest.chars().take(4).collect::<String>()).unwrap_or_default();
+    let call = act(&mut resident, "a3", "manage_session", json!({ "session": "#5d0c", "action": "delete" }));
+    let (ok, words) = result(&mut resident, call);
+    assert!(!ok && words.starts_with("删除要用户确认") && code(&words).len() == 4, "{words}");
+    let first = code(&words);
+    let call = act(&mut resident, "a3", "manage_session", json!({ "session": "#5d0c", "action": "delete", "confirm_token": first }));
+    let (ok, words) = result(&mut resident, call);
+    assert!(!ok && words.starts_with("删除要用户确认"), "用户没再说话不算：{words}");
+    let second = code(&words);
+    finish(&mut resident, "a3");
+    let asked = say(&mut client, "确定", "desktop");
+    take_turn(&mut resident, "a4", "user");
+    assert!(client.reply(asked).get("error").is_none());
+    let call = act(&mut resident, "a4", "manage_session", json!({ "session": "#5d0c", "action": "delete", "confirm_token": second }));
+    let removed = resident.wait_for(10, |message| message["method"] == "sessions.remove").expect("没交给大脑删");
+    assert_eq!(removed["params"]["id"], SESSION);
+    reply(&mut resident, &removed, json!({ "removed": true }));
+    let (ok, words) = result(&mut resident, call);
+    assert!(ok && words.starts_with("已删除 "), "{words}");
+    finish(&mut resident, "a4");
+}
+
 /// 被用户的新话打断时没回完的（同 Friday 859287d9，Friday 仓库 qt/docs/ASSISTANT.md §16.3.4；.51 那通电话：「你做那个做那个推期我」→
 /// 「每天12点清理系统磁盘」→「说你们两个」，每句都在助手还没出字时打断前一句，大脑只回了最后一句）：助手在回时用户又说一句，EDITH 停下那一轮、
 /// 带着新话重来——那一轮要回的几句列在新话前面的「[还没回完的]」里，连着打断的累加；还排着没开始的那一轮从大脑的队列里拿掉
