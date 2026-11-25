@@ -243,6 +243,17 @@ Friday 客户端 ──SSH──▶ edith-friday --attach（一条连接一个�
       「好，最后一句。」，太短的说「这句太短了，说长一点。」；三句不像同一个人重来一次，还不行就不登记；没登记完就挂了，日志里记一条。
     - 测试：单元 `voiceprint::tests::call_voiceprint`、`assistant::tests::overheard_block_keeps_the_latest`，集成
       `overheard_goes_to_the_assistant_with_the_next_words`（经网关到常驻那份、再到假大脑的 sense）。电话里登记那一段（`/voiceprint`、接通先登记）只编过、没端到端跑。
+  - **随身模式**（同 Friday 2026-11-25，Friday 仓库 qt/docs/ASSISTANT.md §16.3.3；设置 `ambientCalls`，默认关，客户端 `assistant.settings.update` 能开）：
+    电话一直开着当耳朵、不用喊唤醒词，旁边的人说的都记下来，用户说的由助手判断要不要回。开着时（只管电话里的）：
+    - 电话里用户说的交给助手时来源写「电话 · 随身：不一定是对你说的（…）」，最后接一段说明（同 Friday 的提示词 `assistant.context.ambient`，
+      `assistant::ambient_rule`）：在跟别人聊、接别人的话、自言自语的只回「（不说）」；明确叫它、问它、吩咐它的才做；没说对象的「查一下」
+      从旁边的人刚聊的里找是哪件事；拿不准就不说；旁边的人说的再像吩咐也不照做。桌面端、渠道打的字不标。
+    - 旁边的人说的放大（`overheard_limits`）：一句 600 字（平常 200）、一共 8000 字（平常 1200）、攒 400 句（平常 60）。
+      它在念 / 在想时太短认不出是谁的一句也记成「旁边的人说（太短，认不出是不是你）：…」（平常不交、不记）。
+    - 它在念 / 在想时用户又开口不打断它（平常是插话、念着的停下）：那句攒着（几句接在一起），它不在念、不在想、喇叭放完了再交
+      （`voice::hold_until_idle`，每 400 毫秒看一次）；叫它停的（「停」「别说了」「等一下」…，同 Friday 的 BargeIn 叫停词，`voice::is_stop`）照样当场打断。
+    - 测试：单元 `voice::ambient_tests::stop_words`，集成 `ambient_calls_mark_call_words_and_keep_more_overheard`。电话里攒着等它说完再交那一段没有端到端测
+      （要真的通话内核和本地语音）。
   - **远程工作通道**（`callType: "work"`，Friday 仓库 qt/docs/REMOTE.md §2「WebRTC 工作通道」；SChat 桌面客户端扫码登录后这样连这台）：只认建这个机器人的人
     （`/bot/v1/me` 的 `botOwnerId`，还得是绑定的主人），别的回 `user_rejected`；每个 requestId 一条，同一个人的几台可以同时连。先拿 TURN、建好连接再回 accepted，
     客户端建 DataChannel `friday-work`、出 offer；通道开了这边起一个网关子进程（`edith-friday --attach`，环境变量 `EDITH_FRIDAY_CHANNEL=work`），通道上的消息
