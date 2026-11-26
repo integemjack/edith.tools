@@ -1,7 +1,8 @@
 //! edith-friday：测试一头扮 Friday 客户端（标准输入 / 输出讲 Friday 远程协议），一头扮 EDITH 大脑（support 的假套接字，登记在 instances/ 里）
 
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::net::TcpStream;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
@@ -18,11 +19,49 @@ struct Client {
     messages: Receiver<Value>,
     backlog: Vec<Value>,
     next: u64,
+    home: PathBuf,
 }
 
+/// 测试完（包括断言失败）网关和它起的常驻那份都收掉：常驻那份是网关另起的、不跟着网关退，
+/// 开着助手（assistant.settings.update enabled）或终端没关时它一直不算闲，以前每跑一遍全部测试就留下几个
 impl Drop for Client {
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        self.close_gateway();
+        stop_resident(&self.home);
+    }
+}
+
+/// 请这个测试的常驻那份退（serve.retire：照常收尾、删 serve.json）；10 秒还没退（有后台命令在跑会等它跑完）就强杀
+fn stop_resident(home: &Path) {
+    let registry = home.join("friday").join("serve.json");
+    let Ok(bytes) = std::fs::read(&registry) else { return };
+    let entry: Value = serde_json::from_slice(&bytes).unwrap_or_default();
+    if let Some(address) = entry["address"].as_str().and_then(|address| address.parse().ok())
+        && let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_secs(1))
+    {
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let _ = writeln!(stream, "{}", json!({ "jsonrpc": "2.0", "method": "auth", "params": { "token": entry["token"] } }));
+        let _ = writeln!(stream, "{}", json!({ "jsonrpc": "2.0", "id": 1, "method": "serve.retire", "params": {} }));
+        // 等它回了再断开
+        let mut line = String::new();
+        let _ = BufReader::new(stream).read_line(&mut line);
+    }
+    if edith_tools_support::wait_until(10, || !registry.exists()) {
+        return;
+    }
+    let Some(pid) = entry["pid"].as_u64() else { return };
+    if cfg!(windows) {
+        let _ = Command::new("taskkill")
+            .args(["/F", "/PID", &pid.to_string(), "/FI", "IMAGENAME eq edith-friday.exe"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    } else {
+        // 确认这个进程号还是 edith-friday 再杀
+        let command = Command::new("ps").args(["-o", "command=", "-p", &pid.to_string()]).output();
+        if command.is_ok_and(|output| String::from_utf8_lossy(&output.stdout).contains("edith-friday")) {
+            let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+        }
     }
 }
 
@@ -54,7 +93,14 @@ impl Client {
                 }
             }
         });
-        Client { child, stdin: Some(stdin), messages, backlog: Vec::new(), next: 0 }
+        Client { child, stdin: Some(stdin), messages, backlog: Vec::new(), next: 0, home: home.to_path_buf() }
+    }
+
+    /// 只关网关（客户端走了）、常驻那份留着：看它自己按空闲退
+    fn close_gateway(&mut self) {
+        self.stdin.take();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 
     fn send(&mut self, method: &str, params: Value) -> u64 {
@@ -1248,7 +1294,7 @@ fn terminals_live_in_the_resident_part() {
     assert!(client.reply(close).get("error").is_none());
     client.event("terminals", |params| params["terminals"].as_array().unwrap().is_empty());
     // 客户端走了、没有在跑的终端：闲 2 秒就退，登记删掉
-    drop(client);
+    client.close_gateway();
     assert!(edith_tools_support::wait_until(15, || !home.join("friday").join("serve.json").exists()), "常驻的那份没退");
 }
 
@@ -1505,7 +1551,7 @@ fn browser_tabs_live_in_the_resident_part() {
     let close = client.send("browser.close", json!({ "tab": tab }));
     assert!(client.reply(close).get("error").is_none());
     client.event("browser", |params| params["tabs"].as_array().unwrap().iter().all(|item| item["id"] != json!(tab)));
-    drop(client);
+    client.close_gateway();
     assert!(edith_tools_support::wait_until(15, || !home.join("friday").join("serve.json").exists()), "常驻的那份没退");
 }
 
