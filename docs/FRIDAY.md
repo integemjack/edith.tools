@@ -56,6 +56,8 @@ Friday 客户端 ──SSH──▶ edith-friday --attach（一条连接一个�
   报 `resident`（不算有人连着，大脑闲够了照样退）。没有网关连着、没有在跑的终端、没在干活的大脑，闲半小时自己退，下次用到再起。
   `EDITH_FRIDAY_HUB=off` 不用它（终端、浏览器用不了）。
 - **终端**：常驻的那份开伪终端跑 shell（macOS / Linux 的 posix_openpt，Windows 的 ConPTY），客户端断了照常跑，接上来重放最近 512 KB 的输出。
+  `term.open` 不要求这段会话已经有了（同 Friday 的服务端）：客户端的新对话发第一句话前只在客户端，照样开——目录取客户端给的 `workingDirectory`、
+  再是会话记着的、再是默认目录，终端记在客户端给的会话 id 下（之后用同一个 id 建出会话还是它的）。
 - **智能体的终端**（0.12，同 Friday v2.88）：常驻的那份在大脑里开 `run_in_terminal` / `read_terminal` / `close_terminal`（模型那边叫 `friday__*`，
   批准同 run_shell：删除类自动模式也问）。shell 只跑这条命令（Unix `$SHELL -l -i -c`、Windows PowerShell `-EncodedCommand`），屏幕第一行写一行淡色的 `$ 命令`，
   Unix 上环境里另外带 `DISABLE_AUTO_UPDATE=true`（同 Friday 2026-11-24：`-i` 读 rc，装了 oh-my-zsh、它的更新检查到期时会在 shell 开头问

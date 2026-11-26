@@ -2816,15 +2816,18 @@ fn terminal_request(method: &str, params: &Value) -> Reply {
     let hub = hub().map_err(|error| (NOT_ALLOWED, error))?;
     let forward = |target: &str, request: Value| hub.request(target, request, Duration::from_secs(30)).map_err(|error| (NOT_FOUND, error));
     if method == "term.open" {
-        // 在这段会话的工作目录开（没发过话的空白会话也行：它记着工作目录）
-        let session = session_param(params, "conversationID")?;
+        // 在这段会话的工作目录开（没发过话的空白会话也行：它记着工作目录）。客户端的新对话发第一句话前只在客户端、这里还没有：
+        // 照样开（同 Friday 的服务端），目录用客户端给的、再没有用默认的；终端记在客户端给的会话 id 下，之后用同一个 id 建出会话时
+        // 还是它的。以前这里要求会话已经有了，新对话里点终端回「没有这段会话」、开不出来
+        let conversation = lower(&text_param(params, "conversationID")?);
+        let known = find_session(&conversation).map(|session| session.cwd).filter(|cwd| !cwd.is_empty());
         let directory = params["workingDirectory"]
             .as_str()
             .filter(|dir| !dir.is_empty())
             .map(str::to_string)
-            .or_else(|| (!session.cwd.is_empty()).then(|| session.cwd.clone()))
+            .or(known)
             .unwrap_or_else(default_directory);
-        let mut request = json!({ "id": id, "session": session.id, "cwd": directory, "cols": params["cols"], "rows": params["rows"] });
+        let mut request = json!({ "id": id, "session": conversation, "cwd": directory, "cols": params["cols"], "rows": params["rows"] });
         if let Some(command) = params["command"].as_str() {
             request["command"] = json!(command);
         }

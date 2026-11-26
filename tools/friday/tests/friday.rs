@@ -1233,6 +1233,20 @@ fn terminals_live_in_the_resident_part() {
     client.event("terminals", |params| params["terminals"].as_array().unwrap().is_empty());
     let missing = client.send("term.write", json!({ "id": "T1", "data": "" }));
     assert_eq!(client.reply(missing)["error"]["code"], 3);
+    // 客户端的新对话（还没发过话，这里没有这段、也没 conversation.create）：照样开（同 Friday 的服务端），记在客户端给的会话 id 下
+    let fresh = "0CE2989A-E74E-402A-8B64-F839BB58C464";
+    let open = client.send(
+        "term.open",
+        json!({ "id": "T2", "conversationID": fresh, "cols": 80, "rows": 24, "workingDirectory": work.to_string_lossy() }),
+    );
+    let opened = client.reply(open);
+    assert!(opened.get("error").is_none(), "{opened}");
+    let listed = client.event("terminals", |params| params["terminals"].as_array().unwrap().iter().any(|terminal| terminal["id"] == "T2"));
+    assert_eq!(listed["params"]["terminals"].as_array().unwrap().len(), 1, "{listed}");
+    assert_eq!(listed["params"]["terminals"][0]["conversationID"], json!(fresh));
+    let close = client.send("term.close", json!({ "id": "T2" }));
+    assert!(client.reply(close).get("error").is_none());
+    client.event("terminals", |params| params["terminals"].as_array().unwrap().is_empty());
     // 客户端走了、没有在跑的终端：闲 2 秒就退，登记删掉
     drop(client);
     assert!(edith_tools_support::wait_until(15, || !home.join("friday").join("serve.json").exists()), "常驻的那份没退");
