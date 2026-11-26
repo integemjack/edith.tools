@@ -1966,6 +1966,16 @@ fn inferred_thinking(base_url: &str, sends_enable_thinking: bool) -> &'static st
     }
 }
 
+/// 2026-11-26 能不能看图（同 Friday 的 EngineConfig::applyingVisionDefault，规则在 friday-core 读引擎表的 normalize）：
+/// 确认过 / 手动设过的（visionChecked 是「接口地址|模型名」/「manual|接口地址|模型名」）照 supportsVision，没定的在线模型先当能看
+/// （第一次带图用到时确认：大脑记下接口拒收的，看图能力拒收了也记），本地大模型（power://）照 supportsVision。返回（能不能看，定了没有）
+fn engine_vision(engine: &Value) -> (bool, bool) {
+    match friday_core::engines::normalize(vec![engine.clone()]).pop() {
+        Some(config) => (config.supports_vision, config.vision_settled()),
+        None => (engine["supportsVision"] != false, false),
+    }
+}
+
 /// EDITH 用的模型 → Friday 的 EngineConfig：顶层那个（baseURL / model，环境变量盖掉）id 是 edith；config.json 的 engines 本来就是 Friday 的格式
 fn engines() -> Vec<Value> {
     let config = read_json_file(&config_path());
@@ -1975,19 +1985,27 @@ fn engines() -> Vec<Value> {
     let base =
         std::env::var("EDITH_BASE_URL").ok().filter(|base| !base.is_empty()).or_else(|| config["baseURL"].as_str().map(str::to_string));
     if let Some(model) = model.filter(|model| !model.is_empty()) {
-        let base = base.unwrap_or_default();
-        list.push(json!({
+        // 大脑读顶层的时候去掉结尾的 /（visionChecked 按它记）
+        let base = base.unwrap_or_default().trim_end_matches('/').to_string();
+        let checked = config["visionChecked"].as_str().unwrap_or("");
+        let (vision, _) = engine_vision(&json!({ "baseURL": base, "model": model,
+            "supportsVision": config["supportsVision"].as_bool().unwrap_or(false), "visionChecked": checked }));
+        let mut engine = json!({
             "id": ENGINE_ID,
             "title": format!("EDITH · {model}"),
             "baseURL": base,
             "apiKeySecret": "EDITH_API_KEY",
             "model": model,
-            "supportsVision": config["supportsVision"].as_bool().unwrap_or(false),
+            "supportsVision": vision,
             "supportsTools": true,
             "sendsEnableThinking": false,
             "extraBody": config["extraBody"].as_str().unwrap_or(""),
             "thinking": config["thinking"].as_str().unwrap_or_else(|| inferred_thinking(&base, false)),
-        }));
+        });
+        if !checked.is_empty() {
+            engine["visionChecked"] = json!(checked);
+        }
+        list.push(engine);
     }
     for entry in config["engines"].as_array().into_iter().flatten().filter(|entry| entry["id"].is_string()) {
         let mut engine = entry.clone();
@@ -2003,6 +2021,8 @@ fn engines() -> Vec<Value> {
                 engine[key] = json!(default);
             }
         }
+        // 没定的在线模型先当能看（同大脑读进来的）
+        engine["supportsVision"] = json!(engine_vision(&engine).0);
         list.push(engine);
     }
     list
@@ -2112,6 +2132,7 @@ fn engines_request(method: &str, params: &Value) -> Reply {
                     ("baseURL", "baseURL"),
                     ("model", "model"),
                     ("supportsVision", "supportsVision"),
+                    ("visionChecked", "visionChecked"),
                     ("extraBody", "extraBody"),
                     ("thinking", "thinking"),
                 ] {
@@ -9915,7 +9936,8 @@ mod agent_powers {
     /// 它报的能选的思考档（引擎的 effortLevels）→ 可选的档位（同 friday.core 的 effort_thinking_levels）：关 + 它报的（按从低到高）；
     /// 报的是空的（不分档，如 Haiku）= 只能开 / 关
     pub fn levels(efforts: &[Value]) -> Vec<&'static str> {
-        let known: Vec<&'static str> = ["low", "medium", "high", "xhigh", "max"].into_iter().filter(|level| efforts.iter().any(|e| e == level)).collect();
+        let known: Vec<&'static str> =
+            ["low", "medium", "high", "xhigh", "max"].into_iter().filter(|level| efforts.iter().any(|e| e == level)).collect();
         if known.is_empty() { vec!["off", "medium"] } else { std::iter::once("off").chain(known).collect() }
     }
 
@@ -10216,10 +10238,14 @@ mod agent_powers {
             // 旧版的桥不报：不传
             assert_eq!(thinking_hint("high", &json!({})), None);
             let engine = engine_json(&KINDS[0], &json!({ "id": "opus[1m]", "name": "Opus (1M context)", "description": "Opus 5 with 1M context", "efforts": ["low", "max"] })).unwrap();
-            assert_eq!((engine["title"].as_str(), engine["effortLevels"].clone(), engine["summary"].as_str()),
-                       (Some("Claude Code · Opus (1M context)"), json!(["low", "max"]), Some("Opus 5 with 1M context")));
+            assert_eq!(
+                (engine["title"].as_str(), engine["effortLevels"].clone(), engine["summary"].as_str()),
+                (Some("Claude Code · Opus (1M context)"), json!(["low", "max"]), Some("Opus 5 with 1M context"))
+            );
             assert!(engine.get("group").is_none());
-            let older = engine_json(&KINDS[0], &json!({ "id": "claude-opus-4-7", "name": "Opus 4.7", "group": "overflow", "efforts": ["low"] })).unwrap();
+            let older =
+                engine_json(&KINDS[0], &json!({ "id": "claude-opus-4-7", "name": "Opus 4.7", "group": "overflow", "efforts": ["low"] }))
+                    .unwrap();
             assert_eq!((older["title"].as_str(), older["group"].as_str()), (Some("Claude Code · Opus 4.7"), Some("overflow")));
             assert!(kind_for_base("power://claudecode").is_some() && kind_for_base("power://opencode").is_none());
         }
@@ -16228,6 +16254,25 @@ mod services {
         engine_list()
     }
 
+    /// 2026-11-26 看图能力用这个对话模型时接口说不收图（同 Friday 的 VisionProbes::refused）：config.json 里记成看不了
+    /// （supportsVision false、visionChecked「接口地址|模型名」），它不再是看图的候选；大脑读进来也是看不了，不再给它图
+    pub fn refuse_vision(id: &str) -> bool {
+        let path = crate::config_path();
+        let mut config = crate::read_json_file(&path);
+        let Some(engine) = config["engines"].as_array_mut().and_then(|list| list.iter_mut().find(|engine| engine["id"] == json!(id)))
+        else {
+            return false;
+        };
+        let checked = format!("{}|{}", engine["baseURL"].as_str().unwrap_or(""), engine["model"].as_str().unwrap_or(""));
+        engine["supportsVision"] = json!(false);
+        engine["visionChecked"] = json!(checked);
+        if crate::write_json_file(&path, &config).is_err() {
+            return false;
+        }
+        crate::notify_all_clients("engines.changed", json!({}));
+        true
+    }
+
     /// 新对话默认的大脑：config.json 的 defaultEngine；没选过、选的关掉了是第一个开着的
     pub fn default_engine() -> Option<Value> {
         let list = engine_list();
@@ -21069,6 +21114,8 @@ mod caps {
         created: Option<i64>,
         preferred: bool,
         automatic: bool,
+        /// 2026-11-26 看图 / 看视频用的对话模型确认过能看图（还没确认的先当能看，排在确认过的后面）
+        confirmed: bool,
     }
 
     impl Candidate {
@@ -21082,11 +21129,12 @@ mod caps {
         }
     }
 
-    /// 自动挑的先后：本地 → 默认对话模型那家 → 名字带 flash → 发布时间新 → 版本号大 → 名字
+    /// 自动挑的先后：本地 → 确认过能看图的（看图 / 看视频，同 Friday 2026-11-26）→ 默认对话模型那家 → 名字带 flash → 发布时间新 → 版本号大 → 名字
     fn auto_order(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
         let flash = |candidate: &Candidate| candidate.title.to_lowercase().contains("flash");
         b.local
             .cmp(&a.local)
+            .then(b.confirmed.cmp(&a.confirmed))
             .then(b.preferred.cmp(&a.preferred))
             .then_with(|| flash(b).cmp(&flash(a)))
             .then_with(|| b.created.unwrap_or(0).cmp(&a.created.unwrap_or(0)))
@@ -21221,7 +21269,7 @@ mod caps {
             }
         }
         for engine in crate::services::engines() {
-            if engine["supportsVision"] == true && engine["disabled"] != true && !crate::agent_powers::is_agent(&engine) {
+            if crate::engine_vision(&engine).0 && engine["disabled"] != true && !crate::agent_powers::is_agent(&engine) {
                 refresh_listing(&text_of(&engine, "baseURL"), crate::services::engine_secret(&engine).as_deref(), force);
             }
         }
@@ -21290,13 +21338,15 @@ mod caps {
                 created: None,
                 preferred: false,
                 automatic: true,
+                confirmed: false,
             })
             .collect();
         let (preferred_engines, preferred_connection) = preferred_service();
         if uses_engines(kind) {
             for engine in crate::services::engines() {
-                // Claude Code 的模型交给它自己的智能体做，不能当看图的模型用
-                if engine["supportsVision"] != true || engine["disabled"] == true || crate::agent_powers::is_agent(&engine) {
+                // Claude Code 的模型交给它自己的智能体做，不能当看图的模型用；2026-11-26 没定的在线模型先当能看（用到时确认）
+                let (vision, confirmed) = crate::engine_vision(&engine);
+                if !vision || engine["disabled"] == true || crate::agent_powers::is_agent(&engine) {
                     continue;
                 }
                 let secret = crate::services::engine_secret(&engine);
@@ -21315,6 +21365,7 @@ mod caps {
                     created,
                     preferred: preferred_engines.contains(&id),
                     automatic: !local,
+                    confirmed,
                 });
             }
         } else {
@@ -21334,6 +21385,7 @@ mod caps {
                         created: None,
                         preferred,
                         automatic: true,
+                        confirmed: false,
                     }),
                     Some((base, secret)) => {
                         for (model, created) in listing(&base, secret.as_deref()).unwrap_or_default() {
@@ -21346,6 +21398,7 @@ mod caps {
                                     created,
                                     preferred,
                                     automatic: true,
+                                    confirmed: false,
                                 });
                             }
                         }
@@ -21372,6 +21425,7 @@ mod caps {
                 created: None,
                 preferred: false,
                 automatic: false,
+                confirmed: false,
             });
         }
         result
@@ -21819,6 +21873,27 @@ mod caps {
             }
             Err(error) => error,
         };
+        // 2026-11-26 挑中的对话模型说不收图（智谱 coding 端点 glm-5.3 的 1210 这类，同 Friday 的 VisionRefusedError）：记成看不了
+        // （它不再是候选），自动挑的换下一个再看一次；用户选的告诉它换一个
+        if let Target::Engine(engine, _) = &target
+            && friday_core::chat_request::image_refusal(i64::from(error.status), &error.message)
+        {
+            let title = kind_title(&request.kind);
+            crate::serve_log("caps", &format!("{title}用的「{label}」看不了图（{}）", error.message));
+            let marked = crate::services::refuse_vision(&text_of(engine, "id"));
+            let picked = choice_of(&request.kind).as_deref() == Some(candidate.id.as_str());
+            if marked && !picked && automatic_order(candidates(&request.kind)).iter().all(|next| next.id != candidate.id) {
+                changed();
+                return run_model(request);
+            }
+            let advice = if picked {
+                format!("。这是用户在 设置 › 工具 › {title} 里选的模型：告诉用户换一个能看图的模型")
+            } else {
+                String::new()
+            };
+            changed();
+            return (false, format!("「{title}」的提供方「{label}」当前不可用：这个模型看不了图（{}）{advice}", error.message), Vec::new());
+        }
         let Some(reason) = unusable(&error) else { return (false, error.message, Vec::new()) };
         if candidate.local {
             return match &target {
@@ -21972,6 +22047,36 @@ mod caps {
     #[cfg(test)]
     mod job_tests {
         use super::*;
+
+        /// 2026-11-26 看图：没定的在线模型先当能看、确认过的照记的；自动挑时本地之后先挑确认过能看图的（同 Friday）
+        #[test]
+        fn unsettled_vision_and_confirmed_first() {
+            let base = "https://x/v1";
+            assert_eq!(crate::engine_vision(&json!({ "baseURL": base, "model": "m", "supportsVision": false })), (true, false));
+            assert_eq!(crate::engine_vision(&json!({ "baseURL": base, "model": "m" })), (true, false));
+            let checked = json!({ "baseURL": base, "model": "m", "supportsVision": false, "visionChecked": "https://x/v1|m" });
+            assert_eq!(crate::engine_vision(&checked), (false, true));
+            let seen = json!({ "baseURL": base, "model": "m", "supportsVision": true, "visionChecked": "manual|https://x/v1|m" });
+            assert_eq!(crate::engine_vision(&seen), (true, true));
+            assert_eq!(crate::engine_vision(&json!({ "baseURL": "power://llm", "model": "q", "supportsVision": false })), (false, false));
+            let candidate = |id: &str, local: bool, preferred: bool, confirmed: bool| Candidate {
+                id: id.into(),
+                title: id.into(),
+                group: "g".into(),
+                local,
+                created: None,
+                preferred,
+                automatic: true,
+                confirmed,
+            };
+            let order = automatic_order(vec![
+                candidate("preferred", false, true, false),
+                candidate("confirmed", false, false, true),
+                candidate("local", true, false, false),
+            ]);
+            let ids: Vec<&str> = order.iter().map(|candidate| candidate.id.as_str()).collect();
+            assert_eq!(ids, ["local", "confirmed", "preferred"]);
+        }
 
         /// check_job 等多久：不给 300、限在 0–600，整数值的小数和纯数字文字都认
         #[test]
@@ -23918,7 +24023,12 @@ mod voice {
                 // 别人聊的那件事一句不落，用户一句「查一下」它才知道是什么（同 Friday）
                 Some(_) if busy => {
                     if call && crate::assistant::ambient() {
-                        crate::assistant::overheard(said, &source, "太短，认不出是不是你", json!({ "durationMs": duration, "heard": said }));
+                        crate::assistant::overheard(
+                            said,
+                            &source,
+                            "太短，认不出是不是你",
+                            json!({ "durationMs": duration, "heard": said }),
+                        );
                     }
                     return;
                 }
@@ -23938,9 +24048,38 @@ mod voice {
 
     /// 叫它停的话（同 Friday 的 BargeIn 叫停词，可以叠着说：「停停停」「等等等」）
     const STOPS: &[&str] = &[
-        "停", "停下", "停一下", "停停", "停止", "等一下", "等下", "等等", "等会", "等会儿", "等一等", "别说了", "不用说了", "不要说了",
-        "别念了", "不用念了", "闭嘴", "安静", "安静点", "打住", "算了", "够了", "好了好了", "行了行了", "可以了", "好了可以了",
-        "stop", "wait", "holdon", "enough", "shutup", "okstop",
+        "停",
+        "停下",
+        "停一下",
+        "停停",
+        "停止",
+        "等一下",
+        "等下",
+        "等等",
+        "等会",
+        "等会儿",
+        "等一等",
+        "别说了",
+        "不用说了",
+        "不要说了",
+        "别念了",
+        "不用念了",
+        "闭嘴",
+        "安静",
+        "安静点",
+        "打住",
+        "算了",
+        "够了",
+        "好了好了",
+        "行了行了",
+        "可以了",
+        "好了可以了",
+        "stop",
+        "wait",
+        "holdon",
+        "enough",
+        "shutup",
+        "okstop",
     ];
 
     /// 整句（只看字母、数字、汉字，英文不分大小写）是不是叫它停：表里的词，或者表里一个词叠几遍
@@ -23955,7 +24094,9 @@ mod voice {
         }
         (1..=4.min(words.len() / 2)).any(|length| {
             let unit: String = words[..length].iter().collect();
-            words.len().is_multiple_of(length) && STOPS.contains(&unit.as_str()) && words.chunks(length).all(|chunk| chunk == &words[..length])
+            words.len().is_multiple_of(length)
+                && STOPS.contains(&unit.as_str())
+                && words.chunks(length).all(|chunk| chunk == &words[..length])
         })
     }
 
@@ -29646,7 +29787,9 @@ mod assistant {
         let ambient_on = ambient();
         let heard_before = if kind == "user" {
             let lines: Vec<String> = std::mem::take(&mut *OVERHEARD.lock().unwrap()).into_iter().map(|(_, line)| line).collect();
-            Some(overheard_block(&lines, overheard_limits(ambient_on).1)).filter(|block| !block.is_empty()).map(|block| format!("{block}\n\n"))
+            Some(overheard_block(&lines, overheard_limits(ambient_on).1))
+                .filter(|block| !block.is_empty())
+                .map(|block| format!("{block}\n\n"))
         } else {
             None
         };

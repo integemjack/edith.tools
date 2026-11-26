@@ -118,8 +118,13 @@ Friday 客户端 ──SSH──▶ edith-friday --attach（一条连接一个�
   结果存在 `~/.edith/friday/media/`。提供方包（`.fridayprovider`，脚本提供方）导入、导出、重测、删，脚本照 Friday 的格式跑。
   - **工具选模型**（0.14，同 Friday v2.96）：看图 / 看视频 / 生图 / 生视频 / 说话 / 听录音在 设置 › 工具 里直接选已添加服务里的模型
     （`capabilities.state` 的 `toolModels`，`capabilities.setModel` / `refreshModels`，选的记在 `~/.edith/friday/tool-models.json`）。
-    看图用标了 `supportsVision` 的对话模型直接发图；生图等按服务的模型列表（`/models`，带发布时间，存 `service-models.json`）按名字认。
-    没选是自动：本地提供方优先，再挑默认对话模型那家的、名字带 flash 的、发布最新的。在线服务的条目只当连接（接口地址、密钥名），
+    看图用能看图的对话模型直接发图；生图等按服务的模型列表（`/models`，带发布时间，存 `service-models.json`）按名字认。
+    没选是自动：本地提供方优先，再挑确认过能看图的（看图 / 看视频）、默认对话模型那家的、名字带 flash 的、发布最新的。
+  - **能不能看图用到时才确认**（2026-11-26，同 Friday）：引擎表里没定的在线模型（`visionChecked` 不是「接口地址|模型名」/「manual|…」，
+    存的 `supportsVision: false` 也算没定）推给客户端时、当看图候选时一律当能看（`engine_vision`，规则在 friday-core），顶层那个同样处理，
+    `engines.update` 改顶层时带上 `visionChecked`；看图能力用的对话模型接口说不收图（`chat_request::image_refusal`，如智谱 coding 端点 glm-5.3 的 1210）
+    就在 `config.json` 里记成看不了（`services::refuse_vision`：`supportsVision: false`、`visionChecked`，推 `engines.changed`），它不再是候选，
+    自动挑的换下一个接着看，用户选的告诉它换一个；对话里带图被拒的由大脑记（edith 同日）。在线服务的条目只当连接（接口地址、密钥名），
     不再写死模型（旧的启动时去掉）；某个模型报余额不足 / 没权限 / 不存在只记下它、自动挑时跳过，不停掉整家服务。
 - **在线服务商**（`services.*`，设置 › 服务与密钥）：服务目录同 Friday，一个密钥一家服务；接入时对话模型进 EDITH 的 `config.json`、别的进能力提供方，
   同一家第二个账号是「id#n」、密钥名 X_n，不在目录里的 OpenAI 兼容服务认成 custom-…；拉模型列表（`/models`），余额和套餐用量按接口地址认

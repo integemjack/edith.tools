@@ -201,7 +201,7 @@ dependencies = [
 [[package]]
 name = "friday-core"
 version = "0.1.0"
-source = "git+https://github.com/integemjack/friday.core?rev=4126240666396d772a101034455934af3d856a60#4126240666396d772a101034455934af3d856a60"
+source = "git+https://github.com/integemjack/friday.core?rev=32ab7496f8d46c713ec787d604e2791aaf20bf8e#32ab7496f8d46c713ec787d604e2791aaf20bf8e"
 dependencies = [
  "chrono",
  "fancy-regex",

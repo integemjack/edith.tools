@@ -1555,19 +1555,24 @@ fn fake_service() -> (String, RequestLog) {
                 0, 0, 13, 73, 68, 65, 84, 120, 218, 99, 252, 207, 192, 80, 15, 0, 4, 133, 1, 128, 132, 169, 140, 33, 0, 0, 0, 0, 73, 69,
                 78, 68, 174, 66, 96, 130,
             ];
+            // gw-text-flash 像智谱 coding 端点的 glm-5.3（2026-11-26 实测）：带图就回 400 1210
+            let refuses =
+                path == "/v1/chat/completions" && seen.lock().unwrap().last().is_some_and(|(_, body)| body["model"] == "gw-text-flash");
             let reply = match path.as_str() {
+                _ if refuses => json!({ "error": { "code": "1210", "message": "messages.content.type 参数非法，取值范围 ['text']" } }),
                 "/v1/models" => json!({ "data": [
                     { "id": "gw-vl-flash", "created": 200 }, { "id": "gw-image-old", "created": 100 },
-                    { "id": "gw-image-new", "created": 300 }, { "id": "gw-chat" },
+                    { "id": "gw-image-new", "created": 300 }, { "id": "gw-chat" }, { "id": "gw-text-flash", "created": 500 },
                 ] }),
                 "/v1/chat/completions" => json!({ "choices": [{ "message": { "role": "assistant", "content": "图里是一只猫" } }] }),
                 "/v1/images/generations" => json!({ "data": [{ "b64_json": base64::engine::general_purpose::STANDARD.encode(png) }] }),
                 _ => json!({ "error": { "message": "no such path" } }),
             }
             .to_string();
+            let status = if refuses { "400 Bad Request" } else { "200 OK" };
             let _ = write!(
                 stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
                 reply.len()
             );
         }
@@ -1682,6 +1687,89 @@ fn tool_models_pick_from_services() {
     assert_eq!(file["models"]["imageGeneration"], "openaicompatible|gw-image-old", "{file}");
 }
 
+/// 2026-11-26 看图用到时才确认（同 Friday）：没定的在线模型先当能看、能当看图的模型挑；挑中的接口说不收图（智谱 coding 端点
+/// glm-5.3 的 1210）就在 config.json 里记成看不了、不再是候选，自动挑的换下一个接着看
+#[test]
+fn vision_refusal_marks_the_engine_and_moves_on() {
+    let home = scratch("friday-vision-refusal");
+    let work = home.join("work");
+    std::fs::create_dir_all(work.join(".git")).unwrap();
+    write_session(&home, &work);
+    let (base, log) = fake_service();
+    // 存的是 false、没确认过（以前没实测过的）→ 先当能看；名字带 flash、发布时间更新，自动挑先挑它
+    let text_only = json!({ "id": "text-only", "title": "纯文字", "baseURL": base, "model": "gw-text-flash", "apiKeySecret": "FAKE_KEY", "supportsVision": false });
+    let vl = json!({ "id": "fake-vl", "title": "假服务", "baseURL": base, "model": "gw-vl-flash", "apiKeySecret": "FAKE_KEY", "supportsVision": true });
+    std::fs::write(home.join("config.json"), json!({ "engines": [text_only, vl], "defaultEngine": "text-only" }).to_string()).unwrap();
+    std::fs::write(home.join("secrets.json"), json!({ "FAKE_KEY": "k" }).to_string()).unwrap();
+    let image = work.join("cat.png");
+    std::fs::write(
+        &image,
+        base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let brain = FakeBrain::new();
+    register(&home, &brain, &work);
+    let mut client = Client::start_with(&home, &work, &[("EDITH_FRIDAY_HUB_IDLE", "2"), ("NO_PROXY", "*"), ("no_proxy", "*")]);
+    let hello = client.send("hello", json!({ "protocol": 1 }));
+    let (mut gateway, mut resident) = (None, None);
+    for _ in 0..2 {
+        let mut link = brain.accept(15).expect("少了一条连接");
+        let reply = link.handshake(json!({ "name": "EDITH", "version": "test" }));
+        match reply["name"].as_str() {
+            Some("friday-client") => gateway = Some(link),
+            Some("friday") => resident = Some(link),
+            other => panic!("不认识的连接 {other:?}：{reply}"),
+        }
+    }
+    let (mut gateway, mut resident) = (gateway.unwrap(), resident.unwrap());
+    let list = gateway.wait_for(10, |message| message["method"] == "sessions.list").unwrap();
+    reply(&mut gateway, &list, json!([]));
+    let agents = gateway.wait_for(10, |message| message["method"] == "agents.list").unwrap();
+    reply(&mut gateway, &agents, json!([]));
+    let hello = client.reply(hello);
+    assert!(hello.get("error").is_none(), "{hello}");
+    let vision = |client: &mut Client| {
+        let models = client.request("capabilities.state", json!({}))["toolModels"].clone();
+        models.as_array().unwrap().iter().find(|item| item["kind"] == "vision").cloned().unwrap()
+    };
+    let before = vision(&mut client);
+    assert_eq!(before["current"]["id"], "engine:text-only", "{before}");
+    // 客户端看到的引擎表：没定的也是能看
+    let shown_vision = |shown: &Value, id: &str| {
+        shown["engines"]
+            .as_array()
+            .and_then(|list| list.iter().find(|engine| engine["id"] == id))
+            .map(|engine| engine["supportsVision"].clone())
+    };
+    let shown = hello["result"]["state"]["engines"].clone();
+    assert_eq!(shown_vision(&shown, "text-only"), Some(json!(true)), "{shown}");
+
+    let params = json!({ "call": "c1", "action": "analyze_image", "arguments": { "image": image.to_string_lossy(), "question": "图里是什么" },
+        "session": SESSION, "turn": "t0" });
+    resident.send(json!({ "jsonrpc": "2.0", "id": 1, "method": "act", "params": params }));
+    let seen = resident.wait_for(60, |message| message["id"] == 1).expect("动作没回")["result"].clone();
+    assert!(
+        seen["text"].as_str().is_some_and(|text| text.contains("图里是一只猫") && text.contains("（用的是 假服务 · gw-vl-flash）")),
+        "{seen}"
+    );
+    let asked: Vec<Value> =
+        log.lock().unwrap().iter().filter(|(path, _)| path == "/v1/chat/completions").map(|(_, body)| body["model"].clone()).collect();
+    assert_eq!(asked, vec![json!("gw-text-flash"), json!("gw-vl-flash")]);
+    // 记在 config.json（大脑读进来也是看不了）；不再是看图的候选
+    let config: Value = serde_json::from_str(&std::fs::read_to_string(home.join("config.json")).unwrap()).unwrap();
+    let marked = config["engines"].as_array().unwrap().iter().find(|engine| engine["id"] == "text-only").cloned().unwrap();
+    assert_eq!((marked["supportsVision"].clone(), marked["visionChecked"].clone()), (json!(false), json!(format!("{base}|gw-text-flash"))));
+    let after = vision(&mut client);
+    assert_eq!(after["current"]["id"], "engine:fake-vl", "{after}");
+    assert!(after["candidates"].as_array().unwrap().iter().all(|candidate| candidate["id"] != "engine:text-only"), "{after}");
+    // 客户端的引擎表跟着推（看不了）
+    client.event("engines", |params| shown_vision(params, "text-only") == Some(json!(false)));
+}
+
 /// Friday 的 Claude Code 能力（power://claudecode）：大脑的 external 事件画成只显示的工具行（Claude Code 工具的中文名和图标），
 /// 存档里回答上的 x_edith_tools 按 offset 插回文字中间；等确认的行点允许 = 在对话里回一句「允许」，之后那行定成已允许
 #[test]
@@ -1724,8 +1812,7 @@ fn agent_tool_rows_and_approval() {
     assert_eq!(tool["external"], true, "{tool}");
 
     // 做完：存档里的回答带 x_edith_tools，第二个工具停在等确认
-    let shell =
-        json!({ "id": "cc_2", "name": "Bash", "input": { "command": "rm a.txt" }, "status": "waiting", "output": "", "offset": 4 });
+    let shell = json!({ "id": "cc_2", "name": "Bash", "input": { "command": "rm a.txt" }, "status": "waiting", "output": "", "offset": 4 });
     let stored = [
         json!({ "role": "user", "content": "看看 a.txt 再删掉" }),
         json!({
@@ -1793,7 +1880,8 @@ fn agent_question_answered_from_card() {
         { "question": "报告用什么语言？", "header": "语言", "options": [{ "label": "中文" }, { "label": "英文" }] },
         { "question": "要哪些附件？", "header": "附件", "multiple": true, "options": [{ "label": "表格" }, { "label": "摘要" }] }
     ]});
-    let question = json!({ "id": "cc_q", "name": "AskUserQuestion", "input": input, "status": "waiting", "output": "等你回答", "offset": 0 });
+    let question =
+        json!({ "id": "cc_q", "name": "AskUserQuestion", "input": input, "status": "waiting", "output": "等你回答", "offset": 0 });
     let stored = [
         json!({ "role": "user", "content": "先问我两个问题" }),
         json!({ "role": "assistant", "content": "", "x_edith_tools": [question] }),
@@ -1947,7 +2035,11 @@ fn ambient_calls_mark_call_words_and_keep_more_overheard() {
         let create = resident.wait_for(15, |message| message["method"] == "sessions.create").expect("没建助手会话");
         reply(&mut resident, &create, json!({}));
         let sense = resident.wait_for(15, |message| message["method"] == "sense").expect("没交给助手");
-        reply(&mut resident, &sense, json!({ "session": sense["params"]["session"], "disposition": "started", "turn": format!("turn-{words}") }));
+        reply(
+            &mut resident,
+            &sense,
+            json!({ "session": sense["params"]["session"], "disposition": "started", "turn": format!("turn-{words}") }),
+        );
         assert!(client.reply(said).get("error").is_none());
         sense["params"]["text"].as_str().unwrap_or("").to_string()
     };
