@@ -1513,6 +1513,60 @@ fn browser_tabs_live_in_the_resident_part() {
 type RequestLog = std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>;
 
 /// 假的 OpenAI 兼容服务：/models 带发布时间、看图回一句、生图回一张图；记下每个请求
+/// 看图核对的小图（edith-friday 画的 5×7 点阵四位数，一格 12 像素、四周留 3 格）照图读出数字
+fn read_probe(body: &Value) -> String {
+    use std::io::Read;
+    const GLYPHS: [[&str; 7]; 10] = [
+        ["01110", "10001", "10011", "10101", "11001", "10001", "01110"],
+        ["00100", "01100", "00100", "00100", "00100", "00100", "01110"],
+        ["01110", "10001", "00001", "00010", "00100", "01000", "11111"],
+        ["11111", "00010", "00100", "00010", "00001", "10001", "01110"],
+        ["00010", "00110", "01010", "10010", "11111", "00010", "00010"],
+        ["11111", "10000", "11110", "00001", "00001", "10001", "01110"],
+        ["00110", "01000", "10000", "11110", "10001", "10001", "01110"],
+        ["11111", "00001", "00010", "00100", "01000", "01000", "01000"],
+        ["01110", "10001", "10001", "01110", "10001", "10001", "01110"],
+        ["01110", "10001", "10001", "01111", "00001", "00010", "01100"],
+    ];
+    let url = body["messages"][0]["content"]
+        .as_array()
+        .and_then(|parts| parts.iter().find_map(|part| part["image_url"]["url"].as_str()))
+        .unwrap_or("");
+    let data = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, url.split_once(',').map_or("", |(_, data)| data))
+        .unwrap_or_default();
+    let (mut position, mut idat, mut width) = (8, Vec::new(), 0usize);
+    while position + 8 <= data.len() {
+        let length = u32::from_be_bytes(data[position..position + 4].try_into().unwrap()) as usize;
+        let payload = &data[position + 8..position + 8 + length];
+        match &data[position + 4..position + 8] {
+            b"IHDR" => width = u32::from_be_bytes(payload[..4].try_into().unwrap()) as usize,
+            b"IDAT" => idat.extend_from_slice(payload),
+            _ => {}
+        }
+        position += 12 + length;
+    }
+    let mut raw = Vec::new();
+    let _ = flate2::read::ZlibDecoder::new(&idat[..]).read_to_end(&mut raw);
+    let pixel = |x: usize, y: usize| raw.get(y * (width + 1) + 1 + x).copied().unwrap_or(255);
+    let (scale, margin) = (12, 3);
+    let digits = (width / scale + 1).saturating_sub(margin * 2) / 6;
+    (0..digits)
+        .map(|index| {
+            let rows: Vec<String> = (0..7)
+                .map(|row| {
+                    (0..5)
+                        .map(|column| {
+                            let (x, y) = ((margin + index * 6 + column) * scale + 6, (margin + row) * scale + 6);
+                            if pixel(x, y) == 0 { '1' } else { '0' }
+                        })
+                        .collect()
+                })
+                .collect();
+            GLYPHS.iter().position(|glyph| glyph.iter().zip(&rows).all(|(a, b)| a == b)).map_or('?', |digit| (b'0' + digit as u8) as char)
+        })
+        .collect()
+}
+
 fn fake_service() -> (String, RequestLog) {
     use base64::Engine as _;
     use std::io::Read;
@@ -1555,21 +1609,39 @@ fn fake_service() -> (String, RequestLog) {
                 0, 0, 13, 73, 68, 65, 84, 120, 218, 99, 252, 207, 192, 80, 15, 0, 4, 133, 1, 128, 132, 169, 140, 33, 0, 0, 0, 0, 73, 69,
                 78, 68, 174, 66, 96, 130,
             ];
+            let last = seen.lock().unwrap().last().map(|(_, body)| body.clone()).unwrap_or(Value::Null);
+            let chat = path == "/v1/chat/completions";
+            let model = last["model"].as_str().unwrap_or("").to_string();
             // gw-text-flash 像智谱 coding 端点的 glm-5.3（2026-11-26 实测）：带图就回 400 1210
-            let refuses =
-                path == "/v1/chat/completions" && seen.lock().unwrap().last().is_some_and(|(_, body)| body["model"] == "gw-text-flash");
+            let refuses = chat && model == "gw-text-flash";
+            // gw-busy-flash 像智谱免费的 glm-4.6v-flash（2026-11-26 实测）：一直回 429 1305「访问量过大」
+            let busy = chat && model == "gw-busy-flash";
+            // 看图核对（写着四位数的小图）：能看图的照图读出数字；gw-drop-flash 的接口把图悄悄丢了，只好说看不到
+            let probing = chat && last.to_string().contains("4-digit number");
             let reply = match path.as_str() {
                 _ if refuses => json!({ "error": { "code": "1210", "message": "messages.content.type 参数非法，取值范围 ['text']" } }),
+                _ if busy => json!({ "error": { "code": "1305", "message": "该模型当前访问量过大，请您稍后再试" } }),
+                _ if probing => {
+                    let answer = if model == "gw-drop-flash" { "我看不到图片。".to_string() } else { read_probe(&last) };
+                    json!({ "choices": [{ "message": { "role": "assistant", "content": answer } }] })
+                }
                 "/v1/models" => json!({ "data": [
                     { "id": "gw-vl-flash", "created": 200 }, { "id": "gw-image-old", "created": 100 },
                     { "id": "gw-image-new", "created": 300 }, { "id": "gw-chat" }, { "id": "gw-text-flash", "created": 500 },
+                    { "id": "gw-busy-flash", "created": 600 }, { "id": "gw-drop-flash", "created": 550 },
                 ] }),
                 "/v1/chat/completions" => json!({ "choices": [{ "message": { "role": "assistant", "content": "图里是一只猫" } }] }),
                 "/v1/images/generations" => json!({ "data": [{ "b64_json": base64::engine::general_purpose::STANDARD.encode(png) }] }),
                 _ => json!({ "error": { "message": "no such path" } }),
             }
             .to_string();
-            let status = if refuses { "400 Bad Request" } else { "200 OK" };
+            let status = if refuses {
+                "400 Bad Request"
+            } else if busy {
+                "429 Too Many Requests"
+            } else {
+                "200 OK"
+            };
             let _ = write!(
                 stream,
                 "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
@@ -1756,18 +1828,133 @@ fn vision_refusal_marks_the_engine_and_moves_on() {
         seen["text"].as_str().is_some_and(|text| text.contains("图里是一只猫") && text.contains("（用的是 假服务 · gw-vl-flash）")),
         "{seen}"
     );
-    let asked: Vec<Value> =
-        log.lock().unwrap().iter().filter(|(path, _)| path == "/v1/chat/completions").map(|(_, body)| body["model"].clone()).collect();
-    assert_eq!(asked, vec![json!("gw-text-flash"), json!("gw-vl-flash")]);
+    let (asked, probed) = chat_models(&log);
+    assert_eq!(asked, vec!["gw-text-flash", "gw-vl-flash"]);
+    // gw-vl-flash 还没确认：看完再发一张写着四位数的小图核对，读对了记能看
+    assert_eq!(probed, vec!["gw-vl-flash"]);
     // 记在 config.json（大脑读进来也是看不了）；不再是看图的候选
     let config: Value = serde_json::from_str(&std::fs::read_to_string(home.join("config.json")).unwrap()).unwrap();
     let marked = config["engines"].as_array().unwrap().iter().find(|engine| engine["id"] == "text-only").cloned().unwrap();
     assert_eq!((marked["supportsVision"].clone(), marked["visionChecked"].clone()), (json!(false), json!(format!("{base}|gw-text-flash"))));
+    let confirmed = config["engines"].as_array().unwrap().iter().find(|engine| engine["id"] == "fake-vl").cloned().unwrap();
+    assert_eq!(
+        (confirmed["supportsVision"].clone(), confirmed["visionChecked"].clone()),
+        (json!(true), json!(format!("{base}|gw-vl-flash")))
+    );
     let after = vision(&mut client);
     assert_eq!(after["current"]["id"], "engine:fake-vl", "{after}");
     assert!(after["candidates"].as_array().unwrap().iter().all(|candidate| candidate["id"] != "engine:text-only"), "{after}");
     // 客户端的引擎表跟着推（看不了）
     client.event("engines", |params| shown_vision(params, "text-only") == Some(json!(false)));
+}
+
+/// 假服务收到的对话请求用的模型：看图的、看图核对的（写着四位数的小图）分开
+fn chat_models(log: &RequestLog) -> (Vec<String>, Vec<String>) {
+    let (mut asked, mut probed) = (Vec::new(), Vec::new());
+    for (path, body) in log.lock().unwrap().iter().filter(|(path, _)| path == "/v1/chat/completions") {
+        let _ = path;
+        let model = body["model"].as_str().unwrap_or("").to_string();
+        if body.to_string().contains("4-digit number") { probed.push(model) } else { asked.push(model) }
+    }
+    (asked, probed)
+}
+
+/// 2026-11-26 看图能力自动挑的对话模型（同 Friday）：忙（智谱免费 glm-4.6v-flash 的 429 1305「访问量过大」）而还有别的能换时
+/// 限流只等一会儿（测试里 2 秒，真用是 20 秒），记下忙、换下一个；挑中的接口收了图、核对却读不出图里的数字（接口悄悄丢了图）
+/// 就记成看不了、换下一个；最后用的那个核对读对了，记成能看
+#[test]
+fn busy_and_dropping_vision_models_are_skipped() {
+    let home = scratch("friday-vision-busy");
+    let work = home.join("work");
+    std::fs::create_dir_all(work.join(".git")).unwrap();
+    write_session(&home, &work);
+    let (base, log) = fake_service();
+    let engine = |id: &str, model: &str| json!({ "id": id, "title": "假服务", "baseURL": base, "model": model, "apiKeySecret": "FAKE_KEY", "supportsVision": true });
+    // 自动挑的先后：busy（默认对话模型）→ drop（发布时间更新）→ fake-vl
+    let engines = [engine("busy", "gw-busy-flash"), engine("drop", "gw-drop-flash"), engine("fake-vl", "gw-vl-flash")];
+    std::fs::write(home.join("config.json"), json!({ "engines": engines, "defaultEngine": "busy" }).to_string()).unwrap();
+    std::fs::write(home.join("secrets.json"), json!({ "FAKE_KEY": "k" }).to_string()).unwrap();
+    let image = work.join("cat.png");
+    std::fs::write(
+        &image,
+        base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let brain = FakeBrain::new();
+    register(&home, &brain, &work);
+    let mut client = Client::start_with(
+        &home,
+        &work,
+        &[("EDITH_FRIDAY_HUB_IDLE", "2"), ("NO_PROXY", "*"), ("no_proxy", "*"), ("EDITH_FRIDAY_BUSY_PATIENCE", "2")],
+    );
+    let hello = client.send("hello", json!({ "protocol": 1 }));
+    let (mut gateway, mut resident) = (None, None);
+    for _ in 0..2 {
+        let mut link = brain.accept(15).expect("少了一条连接");
+        let reply = link.handshake(json!({ "name": "EDITH", "version": "test" }));
+        match reply["name"].as_str() {
+            Some("friday-client") => gateway = Some(link),
+            Some("friday") => resident = Some(link),
+            other => panic!("不认识的连接 {other:?}：{reply}"),
+        }
+    }
+    let (mut gateway, mut resident) = (gateway.unwrap(), resident.unwrap());
+    let list = gateway.wait_for(10, |message| message["method"] == "sessions.list").unwrap();
+    reply(&mut gateway, &list, json!([]));
+    let agents = gateway.wait_for(10, |message| message["method"] == "agents.list").unwrap();
+    reply(&mut gateway, &agents, json!([]));
+    assert!(client.reply(hello).get("error").is_none());
+    let vision = |client: &mut Client| {
+        let models = client.request("capabilities.state", json!({}))["toolModels"].clone();
+        models.as_array().unwrap().iter().find(|item| item["kind"] == "vision").cloned().unwrap()
+    };
+    // 模型列表拉到了（发布时间排先后要它）
+    assert!(edith_tools_support::wait_until(20, || vision(&mut client)["current"]["id"] == "engine:busy"), "{}", vision(&mut client));
+
+    let started = std::time::Instant::now();
+    let params = json!({ "call": "c1", "action": "analyze_image", "arguments": { "image": image.to_string_lossy(), "question": "图里是什么" },
+        "session": SESSION, "turn": "t0" });
+    resident.send(json!({ "jsonrpc": "2.0", "id": 1, "method": "act", "params": params }));
+    let seen = resident.wait_for(60, |message| message["id"] == 1).expect("动作没回")["result"].clone();
+    assert!(
+        seen["text"].as_str().is_some_and(|text| text.contains("图里是一只猫") && text.contains("（用的是 假服务 · gw-vl-flash）")),
+        "{seen}"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(30), "等太久了：{:?}", started.elapsed());
+    let (asked, probed) = chat_models(&log);
+    // 忙的那个：等了一回限流再试一次，到头了换；丢图的那个看完核对读不出数字，换
+    assert_eq!(asked, vec!["gw-busy-flash", "gw-busy-flash", "gw-drop-flash", "gw-vl-flash"]);
+    assert_eq!(probed, vec!["gw-drop-flash", "gw-vl-flash"]);
+    let config: Value = serde_json::from_str(&std::fs::read_to_string(home.join("config.json")).unwrap()).unwrap();
+    let saved = |id: &str| {
+        let engine = config["engines"].as_array().unwrap().iter().find(|engine| engine["id"] == id).cloned().unwrap();
+        (engine["supportsVision"].clone(), engine["visionChecked"].clone())
+    };
+    assert_eq!(saved("drop"), (json!(false), json!(format!("{base}|gw-drop-flash"))));
+    assert_eq!(saved("fake-vl"), (json!(true), json!(format!("{base}|gw-vl-flash"))));
+    assert_eq!(saved("busy"), (json!(true), Value::Null), "忙不算看不了");
+    // 对话模型看图不带 max_tokens（同 Friday；glm-4v-flash 只收 1–1024）
+    assert!(
+        log.lock().unwrap().iter().filter(|(path, _)| path == "/v1/chat/completions").all(|(_, body)| body.get("max_tokens").is_none()),
+        "{:?}",
+        log.lock().unwrap()
+    );
+    // 之后自动挑：确认过能看的在前，忙的排到后面，丢图的不再是候选
+    let after = vision(&mut client);
+    assert_eq!(after["current"]["id"], "engine:fake-vl", "{after}");
+    assert!(after["candidates"].as_array().unwrap().iter().all(|candidate| candidate["id"] != "engine:drop"), "{after}");
+    // 再看一次：直接用确认过的，不再核对
+    let params = json!({ "call": "c2", "action": "analyze_image", "arguments": { "image": image.to_string_lossy(), "question": "再看看" },
+        "session": SESSION, "turn": "t0" });
+    resident.send(json!({ "jsonrpc": "2.0", "id": 2, "method": "act", "params": params }));
+    let again = resident.wait_for(60, |message| message["id"] == 2).expect("动作没回")["result"].clone();
+    assert!(again["text"].as_str().is_some_and(|text| text.contains("gw-vl-flash")), "{again}");
+    let (asked, probed) = chat_models(&log);
+    assert_eq!((asked.len(), probed.len()), (5, 2), "{asked:?} {probed:?}");
 }
 
 /// Friday 的 Claude Code 能力（power://claudecode）：大脑的 external 事件画成只显示的工具行（Claude Code 工具的中文名和图标），

@@ -123,8 +123,12 @@ Friday 客户端 ──SSH──▶ edith-friday --attach（一条连接一个�
   - **能不能看图用到时才确认**（2026-11-26，同 Friday）：引擎表里没定的在线模型（`visionChecked` 不是「接口地址|模型名」/「manual|…」，
     存的 `supportsVision: false` 也算没定）推给客户端时、当看图候选时一律当能看（`engine_vision`，规则在 friday-core），顶层那个同样处理，
     `engines.update` 改顶层时带上 `visionChecked`；看图能力用的对话模型接口说不收图（`chat_request::image_refusal`，如智谱 coding 端点 glm-5.3 的 1210）
-    就在 `config.json` 里记成看不了（`services::refuse_vision`：`supportsVision: false`、`visionChecked`，推 `engines.changed`），它不再是候选，
-    自动挑的换下一个接着看，用户选的告诉它换一个；对话里带图被拒的由大脑记（edith 同日）。在线服务的条目只当连接（接口地址、密钥名），
+    就在 `config.json` 里记成看不了（`services::remember_vision`：`supportsVision`、`visionChecked`，推 `engines.changed`），它不再是候选，
+    自动挑的换下一个接着看，用户选的告诉它换一个；对话里带图被拒的由大脑记（edith 同日）。看图能力第一次用一个没定的对话模型、接口收了图：
+    看完再发一张写着随机四位数的 5×7 点阵小图核对（`caps::probe`，最多 60 秒；读对了记能看、自动挑时排在前面，读不对按拒收处理、换下一个；
+    没测出来 10 分钟内不再测）。自动挑的还有别的能换时，被限流只等 20 秒（没别的累计最多 150 秒），限流 / 几小时的用量上限 / 超时 / 连不上 / 服务繁忙
+    算忙：记下（10 分钟内自动挑时排到后面，`busy`），换下一个再看——智谱免费的 glm-4.6v-flash 常回 429 1305「访问量过大」，实测约 14 秒换成
+    glm-4v-flash；用户选的不换。排序：本地 → 不忙 → 确认过能看图 → 原来的先后。对话模型看图不带 `max_tokens`（同 Friday；glm-4v-flash 只收 1–1024）。在线服务的条目只当连接（接口地址、密钥名），
     不再写死模型（旧的启动时去掉）；某个模型报余额不足 / 没权限 / 不存在只记下它、自动挑时跳过，不停掉整家服务。
 - **在线服务商**（`services.*`，设置 › 服务与密钥）：服务目录同 Friday，一个密钥一家服务；接入时对话模型进 EDITH 的 `config.json`、别的进能力提供方，
   同一家第二个账号是「id#n」、密钥名 X_n，不在目录里的 OpenAI 兼容服务认成 custom-…；拉模型列表（`/models`），余额和套餐用量按接口地址认

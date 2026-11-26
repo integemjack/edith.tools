@@ -16254,9 +16254,10 @@ mod services {
         engine_list()
     }
 
-    /// 2026-11-26 看图能力用这个对话模型时接口说不收图（同 Friday 的 VisionProbes::refused）：config.json 里记成看不了
-    /// （supportsVision false、visionChecked「接口地址|模型名」），它不再是看图的候选；大脑读进来也是看不了，不再给它图
-    pub fn refuse_vision(id: &str) -> bool {
+    /// 2026-11-26 看图能力确认了这个对话模型能不能看图（同 Friday 的 VisionProbes）：接口说不收图、核对出看不了（接口悄悄丢了图）、
+    /// 核对读对了图里的数字——config.json 里记下（supportsVision、visionChecked「接口地址|模型名」）：看不了的不再是看图的候选，
+    /// 大脑读进来也是看不了、不再给它图；能看的自动挑时排在前面。推 engines.changed
+    pub fn remember_vision(id: &str, sees: bool) -> bool {
         let path = crate::config_path();
         let mut config = crate::read_json_file(&path);
         let Some(engine) = config["engines"].as_array_mut().and_then(|list| list.iter_mut().find(|engine| engine["id"] == json!(id)))
@@ -16264,7 +16265,7 @@ mod services {
             return false;
         };
         let checked = format!("{}|{}", engine["baseURL"].as_str().unwrap_or(""), engine["model"].as_str().unwrap_or(""));
-        engine["supportsVision"] = json!(false);
+        engine["supportsVision"] = json!(sees);
         engine["visionChecked"] = json!(checked);
         if crate::write_json_file(&path, &config).is_err() {
             return false;
@@ -18923,6 +18924,8 @@ mod caps {
         choices: Map<String, Value>,
         /// v2.96 出过「用不了」的错（余额不足、没权限、模型不存在）的候选及原因：自动挑时跳过（这次运行里记着，改了选择就清掉）
         unusable: HashMap<String, String>,
+        /// 2026-11-26 自动挑的看图模型刚才忙（限流、超时、连不上）的时刻：10 分钟内自动挑时排到后面（这次运行里记着，同 Friday 的 busyModels）
+        busy: HashMap<String, std::time::Instant>,
     }
 
     static REGISTRY: LazyLock<Mutex<Registry>> = LazyLock::new(|| {
@@ -18935,6 +18938,7 @@ mod caps {
             availability: Map::new(),
             choices: Map::new(),
             unusable: HashMap::new(),
+            busy: HashMap::new(),
         })
     });
 
@@ -19778,10 +19782,11 @@ mod caps {
 
     /// 看图 / 看视频（抽帧后当多张图）。video_list：百炼兼容模式的 {"type":"video","video":[帧…]}
     fn describe(base: &str, key: Option<&str>, model: &str, request: &Request, video_list: bool) -> Result<String, Error> {
-        describe_with(base, key, model, request, video_list, None)
+        describe_with(base, key, model, request, video_list, None, Some(2048))
     }
 
-    /// extra：本机大模型（power://llm）要带的 x_friday
+    /// extra：本机大模型（power://llm）要带的 x_friday；max_tokens：不给就不带（用接口的默认值：对话模型看图同 Friday 的 EngineVision——
+    /// 智谱 glm-4v-flash 只收 1–1024，带 2048 回 400 1210「max_tokens参数非法」）
     fn describe_with(
         base: &str,
         key: Option<&str>,
@@ -19789,6 +19794,7 @@ mod caps {
         request: &Request,
         video_list: bool,
         extra: Option<Value>,
+        max_tokens: Option<i64>,
     ) -> Result<String, Error> {
         let mut content = Vec::new();
         for input in &request.inputs {
@@ -19810,7 +19816,10 @@ mod caps {
             request.prompt.clone()
         };
         content.push(json!({ "type": "text", "text": text }));
-        let mut body = json!({ "model": model, "messages": [{ "role": "user", "content": content }], "max_tokens": 2048 });
+        let mut body = json!({ "model": model, "messages": [{ "role": "user", "content": content }] });
+        if let Some(max_tokens) = max_tokens {
+            body["max_tokens"] = json!(max_tokens);
+        }
         if let Some(extra) = extra {
             body["x_friday"] = extra;
         }
@@ -21432,12 +21441,54 @@ mod caps {
     }
 
     /// 自动挑的顺序（出过「用不了」的错的排除）
+    /// 2026-11-26 本地提供方之后，刚才忙（限流、超时、连不上）的排到后面，再按 auto_order（确认过能看图的在前……，同 Friday）
     fn automatic_order(all: Vec<Candidate>) -> Vec<Candidate> {
-        let unusable = with(|registry| registry.unusable.clone());
+        let (unusable, busy) = with(|registry| (registry.unusable.clone(), busy_ids(registry)));
         let mut order: Vec<Candidate> =
             all.into_iter().filter(|candidate| candidate.automatic && !unusable.contains_key(&candidate.id)).collect();
-        order.sort_by(auto_order);
+        order.sort_by(|a, b| b.local.cmp(&a.local).then(busy.contains(&a.id).cmp(&busy.contains(&b.id))).then_with(|| auto_order(a, b)));
         order
+    }
+
+    /// 忙的记多久
+    const BUSY_FOR: Duration = Duration::from_secs(600);
+
+    fn busy_ids(registry: &Registry) -> std::collections::HashSet<String> {
+        registry.busy.iter().filter(|(_, at)| at.elapsed() < BUSY_FOR).map(|(id, _)| id.clone()).collect()
+    }
+
+    fn is_busy(id: &str) -> bool {
+        with(|registry| busy_ids(registry).contains(id))
+    }
+
+    /// 2026-11-26 对话模型看图时的「忙」（同 Friday 的 isBusyError）：限流（等到头了）、几小时的用量上限、等太久没回、连不上、服务繁忙、
+    /// 回的不是预期的格式——换一个模型多半就好；用不了（余额、权限、模型不存在）、拒收图不算
+    fn busy_error(error: &Error) -> bool {
+        if friday_core::chat_request::image_refusal(i64::from(error.status), &error.message) || unusable(error).is_some() {
+            return false;
+        }
+        match error.status {
+            0 => ["连不上", "读 ", "响应格式不符合预期"].iter().any(|start| error.message.starts_with(start)),
+            429 => !matches!(
+                friday_core::quota::classify(429, &error.message),
+                Some(friday_core::quota::Limit::Balance | friday_core::quota::Limit::Denied)
+            ),
+            status => BUSY_STATUSES.contains(&status),
+        }
+    }
+
+    /// 服务繁忙的状态码（同 Friday 的 OpenAIChatEngine.busyStatuses）
+    const BUSY_STATUSES: [u16; 5] = [500, 502, 503, 504, 529];
+    /// 没有别的模型能换时，被限流最多累计等多久（Friday 看图一次限时 180 秒）
+    const RATE_LIMIT_PATIENCE: Duration = Duration::from_secs(150);
+
+    /// 还有别的模型能换时，被限流最多等多久（到头了算忙、换下一个；同 Friday 的 EngineVision.busyPatience）。
+    /// EDITH_FRIDAY_BUSY_PATIENCE（秒）只给测试用
+    fn busy_patience() -> Duration {
+        std::env::var("EDITH_FRIDAY_BUSY_PATIENCE")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .map_or(Duration::from_secs(20), Duration::from_secs_f64)
     }
 
     /// 现在用哪个：设置里选的（还在就用它）；没选或选的不在了按自动的顺序挑第一个没出过错的
@@ -21857,9 +21908,37 @@ mod caps {
             Err(error) => return (false, error.message, Vec::new()),
         };
         let label = candidate.label();
+        // 2026-11-26 自动挑的（没指定、设置里没选）对话模型还有别的能换：限流只等一会儿，忙（限流、超时、连不上）就记下、换下一个再看
+        // （没确认过的模型也是候选了，挑中的可能正被限流；同 Friday）
+        let automatic = request.provider.is_none() && choice_of(&request.kind).as_deref() != Some(candidate.id.as_str());
+        let others: Vec<Candidate> = match &target {
+            Target::Engine(..) if automatic => automatic_order(candidates(&request.kind))
+                .into_iter()
+                .filter(|next| next.id != candidate.id && !is_busy(&next.id))
+                .collect(),
+            _ => Vec::new(),
+        };
+        // 核对出这个模型其实看不了图（接口把图悄悄丢了）的原因
+        let mut dropped: Option<String> = None;
         let result = match &target {
             Target::Engine(engine, key) => {
-                engine_describe(engine, key.as_deref(), &request).map(|text| Outcome::Text(format!("{text}\n（用的是 {label}）")))
+                let patience = if others.is_empty() { RATE_LIMIT_PATIENCE } else { busy_patience() };
+                engine_describe(engine, key.as_deref(), &request, patience).and_then(|text| {
+                    // 2026-11-26 这个模型能不能看图还没确认：发一张写着四位数的小图核对一次，核对出看不了（刚才的描述是猜的）按拒收处理
+                    match probe::confirm(engine, key.as_deref()) {
+                        Some(false) => {
+                            let reason = "核对发现接口把图悄悄丢了，模型其实没看到图".to_string();
+                            dropped = Some(reason.clone());
+                            Err(Error::new(reason))
+                        }
+                        confirmed => {
+                            if confirmed == Some(true) && crate::services::remember_vision(&text_of(engine, "id"), true) {
+                                changed();
+                            }
+                            Ok(Outcome::Text(format!("{text}\n（用的是 {label}）")))
+                        }
+                    }
+                })
             }
             Target::Entry(chosen, secrets) => perform(&request, chosen, secrets),
         };
@@ -21873,14 +21952,23 @@ mod caps {
             }
             Err(error) => error,
         };
-        // 2026-11-26 挑中的对话模型说不收图（智谱 coding 端点 glm-5.3 的 1210 这类，同 Friday 的 VisionRefusedError）：记成看不了
-        // （它不再是候选），自动挑的换下一个再看一次；用户选的告诉它换一个
+        // 2026-11-26 忙（限流等到头了、超时、连不上）而还有别的能换：记下（10 分钟内排到后面），换下一个再看
+        if matches!(target, Target::Engine(..)) && dropped.is_none() && !others.is_empty() && busy_error(&error) {
+            with(|registry| registry.busy.insert(candidate.id.clone(), std::time::Instant::now()));
+            crate::serve_log(
+                "caps",
+                &format!("{}用的「{label}」忙，换 {}（{}）", kind_title(&request.kind), others[0].label(), error.message),
+            );
+            return run_model(request);
+        }
+        // 2026-11-26 挑中的对话模型说不收图（智谱 coding 端点 glm-5.3 的 1210 这类，同 Friday 的 VisionRefusedError），或核对出它
+        // 其实看不了（接口把图悄悄丢了）：记成看不了（它不再是候选），自动挑的换下一个再看一次；用户选的告诉它换一个
         if let Target::Engine(engine, _) = &target
-            && friday_core::chat_request::image_refusal(i64::from(error.status), &error.message)
+            && (dropped.is_some() || friday_core::chat_request::image_refusal(i64::from(error.status), &error.message))
         {
             let title = kind_title(&request.kind);
             crate::serve_log("caps", &format!("{title}用的「{label}」看不了图（{}）", error.message));
-            let marked = crate::services::refuse_vision(&text_of(engine, "id"));
+            let marked = crate::services::remember_vision(&text_of(engine, "id"), false);
             let picked = choice_of(&request.kind).as_deref() == Some(candidate.id.as_str());
             if marked && !picked && automatic_order(candidates(&request.kind)).iter().all(|next| next.id != candidate.id) {
                 changed();
@@ -21916,8 +22004,9 @@ mod caps {
         (false, format!("「{title}」的提供方「{label}」当前不可用：{reason}{advice}"), Vec::new())
     }
 
-    /// 能看图的对话模型看图 / 看视频（本机的大模型先拿到真地址）
-    fn engine_describe(engine: &Value, key: Option<&str>, request: &Request) -> Result<String, Error> {
+    /// 能看图的对话模型看图 / 看视频（本机的大模型先拿到真地址）。2026-11-26 被限流时等一会儿重发、累计最多等 patience
+    /// （到头了报 429「被限流，等了…」：还有别的能换时 run_model 换下一个）；服务繁忙、连不上的最多再试两次（同 Friday 的 EngineVision）
+    fn engine_describe(engine: &Value, key: Option<&str>, request: &Request, patience: Duration) -> Result<String, Error> {
         let (mut base, model) = (text_of(engine, "baseURL"), text_of(engine, "model"));
         let mut key = key.map(str::to_string);
         let mut extra = None;
@@ -21927,7 +22016,228 @@ mod caps {
             key = Some(text_of(&point, "apiKey")).filter(|key| !key.is_empty());
             extra = point["body"].get("x_friday").cloned();
         }
-        describe_with(&base, key.as_deref(), &model, request, false, extra)
+        let (mut waited, mut limits, mut failures) = (Duration::ZERO, 0, 0);
+        loop {
+            let error = match describe_with(&base, key.as_deref(), &model, request, false, extra.clone(), None) {
+                Ok(text) => return Ok(text),
+                Err(error) => error,
+            };
+            if friday_core::chat_request::image_refusal(i64::from(error.status), &error.message) || unusable(&error).is_some() {
+                return Err(error);
+            }
+            let limit = friday_core::quota::classify(i64::from(error.status), &error.message);
+            let wait = if error.status == 429 && matches!(limit, None | Some(friday_core::quota::Limit::RateLimit)) {
+                limits += 1;
+                let wait = Duration::from_secs_f64(friday_core::chat_request::rate_limit_delay(limits, None, 0).max(1.0));
+                if waited + wait > patience {
+                    return Err(Error {
+                        status: 429, message: format!("被限流，等了 {} 秒还没好：{}", waited.as_secs(), error.message)
+                    });
+                }
+                wait
+            } else if failures < 2 && error.status != 429 && !error.message.starts_with("响应格式不符合预期") && busy_error(&error)
+            {
+                failures += 1;
+                Duration::from_secs_f64(friday_core::chat_request::retry_delay(failures, None))
+            } else {
+                return Err(error);
+            };
+            waited += wait;
+            std::thread::sleep(wait);
+        }
+    }
+
+    /// 2026-11-26 能不能看图用到时才确认（同 Friday 的 VisionProbe / VisionProbes）：看图能力第一次用一个还没确认的对话模型、
+    /// 接口收了图，发一张写着随机四位数的小图核对一次（个别兼容接口会把图悄悄丢掉，模型只好瞎猜）——读对了能看、读不对看不了；
+    /// 接口拒收图（再发纯文字对照能过）看不了；额度、限流、连不上：没测出来，10 分钟内不再测
+    mod probe {
+        use std::collections::HashMap;
+        use std::sync::{LazyLock, Mutex};
+        use std::time::{Duration, Instant};
+
+        use serde_json::{Value, json};
+
+        use super::{BUSY_STATUSES, text_of};
+        use crate::capnet::{self, Error};
+
+        /// 让模型读数字的提示（中英文都给：有的模型只认一种；同 Friday）
+        pub const PROMPT: &str =
+            "图片里写着一个四位数，只回答这个数字，不要别的。What 4-digit number is written in the image? Reply with the digits only.";
+        const CONTROL_PROMPT: &str = "只回答 OK。Reply with OK only.";
+        /// 一次核对最多等多久（Friday 的看图能力等核对最多 60 秒）
+        const TIMEOUT: u64 = 60;
+        const RETRY_AFTER: Duration = Duration::from_secs(600);
+
+        /// 没测出来的（引擎 id → 到这个时刻之前不再测）
+        static FAILURES: LazyLock<Mutex<HashMap<String, Instant>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+        #[derive(Debug, Clone, PartialEq)]
+        pub enum Verdict {
+            Vision,
+            TextOnly(String),
+            Unknown(String),
+        }
+
+        /// 要不要核对：在线的（不是本机的大模型）、还没定、10 分钟内没测出来过
+        fn needed(engine: &Value) -> bool {
+            let base = text_of(engine, "baseURL");
+            let online = base.starts_with("http://") || base.starts_with("https://");
+            online
+                && !crate::engine_vision(engine).1
+                && FAILURES.lock().unwrap().get(&text_of(engine, "id")).is_none_or(|until| *until <= Instant::now())
+        }
+
+        /// 看图能力刚用这个模型看完：要核对就核对一次。Some(true) 能看、Some(false) 看不了，不用核对或没测出来是 None
+        pub fn confirm(engine: &Value, key: Option<&str>) -> Option<bool> {
+            if !needed(engine) {
+                return None;
+            }
+            let verdict = run(&text_of(engine, "baseURL"), key, &text_of(engine, "model"), &random_code());
+            crate::serve_log("caps", &format!("看图核对 {}：{verdict:?}", text_of(engine, "model")));
+            match verdict {
+                Verdict::Vision => Some(true),
+                Verdict::TextOnly(_) => Some(false),
+                Verdict::Unknown(_) => {
+                    FAILURES.lock().unwrap().insert(text_of(engine, "id"), Instant::now() + RETRY_AFTER);
+                    None
+                }
+            }
+        }
+
+        pub fn run(base: &str, key: Option<&str>, model: &str, code: &str) -> Verdict {
+            use base64::Engine;
+            let url = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(png(code)));
+            match ask(base, key, model, PROMPT, Some(&url)) {
+                Ok(reply) if reads_code(&reply, code) => Verdict::Vision,
+                Ok(reply) => {
+                    let shown: String = strip_think(&reply).trim().chars().take(80).collect();
+                    Verdict::TextOnly(format!("没读出图里的数字 {code}（回的是「{shown}」）"))
+                }
+                Err(error) if friday_core::chat_request::image_refusal(i64::from(error.status), &error.message) => {
+                    Verdict::TextOnly(error.message)
+                }
+                Err(error)
+                    if (400..600).contains(&error.status)
+                        && !BUSY_STATUSES.contains(&error.status)
+                        && ![401, 403, 429].contains(&error.status) =>
+                {
+                    match ask(base, key, model, CONTROL_PROMPT, None) {
+                        Ok(_) => Verdict::TextOnly(format!("接口不收图片（{}）", error.message)),
+                        Err(control) => Verdict::Unknown(format!("模型本身用不了：{}", control.message)),
+                    }
+                }
+                Err(error) => Verdict::Unknown(error.message),
+            }
+        }
+
+        /// 发一次（不带工具、温度 0），回正文
+        fn ask(base: &str, key: Option<&str>, model: &str, prompt: &str, image: Option<&str>) -> Result<String, Error> {
+            let content = match image {
+                Some(url) => json!([{ "type": "image_url", "image_url": { "url": url } }, { "type": "text", "text": prompt }]),
+                None => json!(prompt),
+            };
+            // 不带 max_tokens（同 Friday 的核对：各家上限不一样，glm-4v-flash 只收 1–1024）
+            let body = json!({ "model": model, "messages": [{ "role": "user", "content": content }], "temperature": 0 });
+            let object = capnet::json("POST", &capnet::endpoint(base, "chat/completions")?, &capnet::bearer(key), Some(&body), TIMEOUT)?;
+            if let Some(message) = capnet::string_at(&object, "choices.0.message.content") {
+                return Ok(message);
+            }
+            if let Some(parts) = capnet::at(&object, "choices.0.message.content").and_then(Value::as_array) {
+                return Ok(parts.iter().filter_map(|part| part["text"].as_str()).collect());
+            }
+            Err(Error::malformed(&capnet::describe(&object)))
+        }
+
+        fn strip_think(text: &str) -> String {
+            static THINK: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?s)<think>.*?</think>").unwrap());
+            THINK.replace_all(text, "").into_owned()
+        }
+
+        /// 回复里有没有这个数：去掉思考，取每段连续数字和全部数字连起来，长度相同、最多差一位就算读对（同 Friday）
+        pub fn reads_code(reply: &str, code: &str) -> bool {
+            let normalized: String = strip_think(reply)
+                .chars()
+                .map(|c| if ('０'..='９').contains(&c) { char::from(b'0' + (c as u32 - '０' as u32) as u8) } else { c })
+                .collect();
+            let mut candidates: Vec<String> =
+                normalized.split(|c: char| !c.is_ascii_digit()).filter(|part| !part.is_empty()).map(str::to_string).collect();
+            let all: String = normalized.chars().filter(char::is_ascii_digit).collect();
+            if all.len() <= 6 {
+                candidates.push(all);
+            }
+            candidates
+                .iter()
+                .any(|candidate| candidate.len() == code.len() && candidate.chars().zip(code.chars()).filter(|(a, b)| a != b).count() <= 1)
+        }
+
+        /// 随机四位数：首位不是 0，四位不全一样
+        pub fn random_code() -> String {
+            loop {
+                let bytes = uuid::Uuid::new_v4().into_bytes();
+                let code = (1000 + u16::from_le_bytes([bytes[0], bytes[1]]) % 9000).to_string();
+                if code.chars().collect::<std::collections::HashSet<_>>().len() > 1 {
+                    return code;
+                }
+            }
+        }
+
+        /// 5×7 点阵数字（同 Friday 两端、EDITH 大脑画的是同一张图）
+        pub const GLYPHS: [[&str; 7]; 10] = [
+            ["01110", "10001", "10011", "10101", "11001", "10001", "01110"],
+            ["00100", "01100", "00100", "00100", "00100", "00100", "01110"],
+            ["01110", "10001", "00001", "00010", "00100", "01000", "11111"],
+            ["11111", "00010", "00100", "00010", "00001", "10001", "01110"],
+            ["00010", "00110", "01010", "10010", "11111", "00010", "00010"],
+            ["11111", "10000", "11110", "00001", "00001", "10001", "01110"],
+            ["00110", "01000", "10000", "11110", "10001", "10001", "01110"],
+            ["11111", "00001", "00010", "00100", "01000", "01000", "01000"],
+            ["01110", "10001", "10001", "01110", "10001", "10001", "01110"],
+            ["01110", "10001", "10001", "01111", "00001", "00010", "01100"],
+        ];
+        /// 一格多少像素、四周留几格
+        pub const SCALE: usize = 12;
+        pub const MARGIN: usize = 3;
+
+        /// 白底黑字的 8 位灰度 PNG
+        pub fn png(code: &str) -> Vec<u8> {
+            use std::io::Write;
+            let digits: Vec<usize> = code.chars().filter_map(|c| c.to_digit(10)).map(|d| d as usize).collect();
+            let columns = (digits.len() * 6).saturating_sub(1) + MARGIN * 2;
+            let (width, height) = (columns * SCALE, (7 + MARGIN * 2) * SCALE);
+            let mut raw = Vec::with_capacity((width + 1) * height);
+            for y in 0..height {
+                raw.push(0);
+                let row = (y / SCALE).checked_sub(MARGIN).filter(|row| *row < 7);
+                for x in 0..width {
+                    let black = row.zip((x / SCALE).checked_sub(MARGIN)).is_some_and(|(row, column)| {
+                        let (index, offset) = (column / 6, column % 6);
+                        index < digits.len() && offset < 5 && GLYPHS[digits[index]][row].as_bytes()[offset] == b'1'
+                    });
+                    raw.push(if black { 0 } else { 255 });
+                }
+            }
+            let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            let _ = encoder.write_all(&raw);
+            let compressed = encoder.finish().unwrap_or_default();
+            let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+            let mut chunk = |kind: &[u8], data: &[u8]| {
+                png.extend_from_slice(&(data.len() as u32).to_be_bytes());
+                let mut crc = flate2::Crc::new();
+                crc.update(kind);
+                crc.update(data);
+                png.extend_from_slice(kind);
+                png.extend_from_slice(data);
+                png.extend_from_slice(&crc.sum().to_be_bytes());
+            };
+            let mut header = Vec::new();
+            header.extend_from_slice(&(width as u32).to_be_bytes());
+            header.extend_from_slice(&(height as u32).to_be_bytes());
+            header.extend_from_slice(&[8, 0, 0, 0, 0]);
+            chunk(b"IHDR", &header);
+            chunk(b"IDAT", &compressed);
+            chunk(b"IEND", &[]);
+            png
+        }
     }
 
     /// 结果交回去：文字直接给；文件存下来；异步任务记下来（生图等一会儿）。source：用的是哪个，provider：任务记的提供方 id
@@ -22076,6 +22386,62 @@ mod caps {
             ]);
             let ids: Vec<&str> = order.iter().map(|candidate| candidate.id.as_str()).collect();
             assert_eq!(ids, ["local", "confirmed", "preferred"]);
+        }
+
+        /// 2026-11-26 看图自动挑（同 Friday）：刚才忙的排到后面（10 分钟内）；哪些错算忙；核对用的小图读得回来
+        #[test]
+        fn busy_models_go_last_and_the_probe_image_reads_back() {
+            let candidate = |id: &str, local: bool, preferred: bool, confirmed: bool| Candidate {
+                id: id.into(),
+                title: id.into(),
+                group: "g".into(),
+                local,
+                created: None,
+                preferred,
+                automatic: true,
+                confirmed,
+            };
+            with(|registry| {
+                registry.busy.insert("busy-now".into(), std::time::Instant::now());
+                let long_ago = std::time::Instant::now().checked_sub(Duration::from_secs(700));
+                if let Some(long_ago) = long_ago {
+                    registry.busy.insert("busy-before".into(), long_ago);
+                }
+            });
+            let order = automatic_order(vec![
+                candidate("busy-now", false, true, true),
+                candidate("busy-before", false, false, false),
+                candidate("plain", false, false, false),
+                candidate("local", true, false, false),
+            ]);
+            let ids: Vec<&str> = order.iter().map(|candidate| candidate.id.as_str()).collect();
+            assert_eq!(ids, ["local", "busy-before", "plain", "busy-now"]);
+            assert!(is_busy("busy-now") && !is_busy("busy-before") && !is_busy("plain"));
+
+            let busy = |status: u16, body: &str| busy_error(&Error::http(status, body));
+            assert!(busy(429, r#"{"error":{"code":"1305","message":"该模型当前访问量过大，请您稍后再试"}}"#));
+            assert!(busy(429, r#"{"error":{"code":"1308","message":"已达到 5 小时的使用上限"}}"#), "几小时的用量上限：换一个");
+            assert!(!busy(429, r#"{"error":{"code":"1113","message":"余额不足"}}"#), "余额不足是用不了，不是忙");
+            assert!(busy(503, "busy") && !busy(400, "bad") && !busy(401, "bad key"));
+            assert!(!busy(400, r#"{"error":{"code":"1210","message":"messages.content.type 参数非法，取值范围 ['text']"}}"#));
+            assert!(busy_error(&Error::new("连不上 x：timeout")) && busy_error(&Error::malformed("{}")));
+            assert!(!busy_error(&Error::new("缺少参数 image")));
+
+            assert!(probe::reads_code("4729", "4729") && probe::reads_code("是 4 7 2 9", "4729") && probe::reads_code("４７２３", "4729"));
+            assert!(!probe::reads_code("我看不到图片", "4729") && !probe::reads_code("<think>4729</think>不知道", "4729"));
+            let code = probe::random_code();
+            assert!(code.len() == 4 && !code.starts_with('0'), "{code}");
+            let png = probe::png("4729");
+            assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+            let width = u32::from_be_bytes(png[16..20].try_into().unwrap()) as usize;
+            assert_eq!(width, 29 * probe::SCALE);
+            // IDAT 解开：「4」第一行 00010 的第 4 格是黑的、第 1 格是白的
+            let length = u32::from_be_bytes(png[33..37].try_into().unwrap()) as usize;
+            let mut raw = Vec::new();
+            std::io::Read::read_to_end(&mut flate2::read::ZlibDecoder::new(&png[41..41 + length]), &mut raw).unwrap();
+            let y = probe::MARGIN * probe::SCALE + 6;
+            let pixel = |column: usize| raw[y * (width + 1) + 1 + (probe::MARGIN + column) * probe::SCALE + 6];
+            assert_eq!((pixel(3), pixel(0)), (0, 255));
         }
 
         /// check_job 等多久：不给 300、限在 0–600，整数值的小数和纯数字文字都认
