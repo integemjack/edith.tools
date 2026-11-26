@@ -22049,7 +22049,7 @@ mod caps {
 
     /// 2026-11-26 能不能看图用到时才确认（同 Friday 的 VisionProbe / VisionProbes）：看图能力第一次用一个还没确认的对话模型、
     /// 接口收了图，发一张写着随机四位数的小图核对一次（个别兼容接口会把图悄悄丢掉，模型只好瞎猜）——读对了能看、读不对看不了；
-    /// 接口拒收图（再发纯文字对照能过）看不了；额度、限流、连不上：没测出来，10 分钟内不再测
+    /// 接口拒收图（再发纯文字对照能过）看不了；被限流的在时限里等着重发；额度、到时限还在限流、连不上：没测出来，10 分钟内不再测
     mod probe {
         use std::collections::HashMap;
         use std::sync::{LazyLock, Mutex};
@@ -22064,7 +22064,7 @@ mod caps {
         pub const PROMPT: &str =
             "图片里写着一个四位数，只回答这个数字，不要别的。What 4-digit number is written in the image? Reply with the digits only.";
         const CONTROL_PROMPT: &str = "只回答 OK。Reply with OK only.";
-        /// 一次核对最多等多久（Friday 的看图能力等核对最多 60 秒）
+        /// 一次核对最多等多久（Friday 的看图能力等核对最多 60 秒；被限流时等着重发也算在里面）
         const TIMEOUT: u64 = 60;
         const RETRY_AFTER: Duration = Duration::from_secs(600);
 
@@ -22130,7 +22130,8 @@ mod caps {
             }
         }
 
-        /// 发一次（不带工具、温度 0），回正文
+        /// 发一次（不带工具、温度 0），回正文。2026-11-26 被限流（不是额度、余额用完）的在 TIMEOUT 里等一会儿重发（同 Friday 的核对；
+        /// 239 上实测智谱免费模型核对时常回 429 1305，一次就放弃的话多半测不出来）
         fn ask(base: &str, key: Option<&str>, model: &str, prompt: &str, image: Option<&str>) -> Result<String, Error> {
             let content = match image {
                 Some(url) => json!([{ "type": "image_url", "image_url": { "url": url } }, { "type": "text", "text": prompt }]),
@@ -22138,7 +22139,30 @@ mod caps {
             };
             // 不带 max_tokens（同 Friday 的核对：各家上限不一样，glm-4v-flash 只收 1–1024）
             let body = json!({ "model": model, "messages": [{ "role": "user", "content": content }], "temperature": 0 });
-            let object = capnet::json("POST", &capnet::endpoint(base, "chat/completions")?, &capnet::bearer(key), Some(&body), TIMEOUT)?;
+            let endpoint = capnet::endpoint(base, "chat/completions")?;
+            let deadline = Instant::now() + Duration::from_secs(TIMEOUT);
+            let mut limits = 0;
+            let object = loop {
+                let left = deadline.saturating_duration_since(Instant::now()).as_secs().max(1);
+                match capnet::json("POST", &endpoint, &capnet::bearer(key), Some(&body), left) {
+                    Ok(object) => break object,
+                    Err(error)
+                        if error.status == 429
+                            && matches!(
+                                friday_core::quota::classify(429, &error.message),
+                                None | Some(friday_core::quota::Limit::RateLimit)
+                            ) =>
+                    {
+                        limits += 1;
+                        let wait = Duration::from_secs_f64(friday_core::chat_request::rate_limit_delay(limits, None, 0).max(1.0));
+                        if Instant::now() + wait >= deadline {
+                            return Err(error);
+                        }
+                        std::thread::sleep(wait);
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
             if let Some(message) = capnet::string_at(&object, "choices.0.message.content") {
                 return Ok(message);
             }
@@ -22386,6 +22410,46 @@ mod caps {
             ]);
             let ids: Vec<&str> = order.iter().map(|candidate| candidate.id.as_str()).collect();
             assert_eq!(ids, ["local", "confirmed", "preferred"]);
+        }
+
+        /// 2026-11-26 239 上实测：智谱免费模型核对时第一次回 429 1305，以前直接算没测出来——现在时限里等一会儿重发
+        #[test]
+        fn rate_limited_probe_retries() {
+            use std::io::{BufRead, BufReader, Read, Write};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = std::thread::spawn(move || {
+                let mut served = 0;
+                for (status, body) in [
+                    ("429 Too Many Requests", r#"{"error":{"code":"1305","message":"该模型当前访问量过大，请您稍后再试"}}"#),
+                    ("200 OK", r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"4729"}}]}"#),
+                ] {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut length = 0;
+                    loop {
+                        let mut line = String::new();
+                        reader.read_line(&mut line).unwrap();
+                        if line.trim().is_empty() {
+                            break;
+                        }
+                        if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                            length = value.trim().parse().unwrap();
+                        }
+                    }
+                    let mut request = vec![0; length];
+                    reader.read_exact(&mut request).unwrap();
+                    let reply = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(reply.as_bytes()).unwrap();
+                    served += 1;
+                }
+                served
+            });
+            assert_eq!(probe::run(&format!("http://127.0.0.1:{port}/v1"), None, "rate-limited", "4729"), probe::Verdict::Vision);
+            assert_eq!(server.join().unwrap(), 2, "限流的那次之后重发了一次");
         }
 
         /// 2026-11-26 看图自动挑（同 Friday）：刚才忙的排到后面（10 分钟内）；哪些错算忙；核对用的小图读得回来
